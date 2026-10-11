@@ -459,7 +459,7 @@ def run_admin_shots(sh: Shooter, base: str, port: int):
     sh.settle()
     chart = box_of(page.locator(".chart-card"))
     sh.shot("adm-01-overview.png",
-            {"x": 0, "y": 0, "width": 1366, "height": chart["y"] + chart["height"] + 5},
+            {"x": 0, "y": 0, "width": 1366, "height": chart["y"] + chart["height"] + 3},
             [T(1, tabs(), pad=3, off=(-19, -7)),
              T(2, page.locator("#presets"), pad=3, off=(-15, -21)),
              T(3, page.locator("#live"), pad=6, off=(-40, -7)),
@@ -496,8 +496,8 @@ def run_admin_shots(sh: Shooter, base: str, port: int):
             {"x": 28, "y": top, "width": 1300, "height": l["y"] + l["height"] + 12 - top},
             [T(1, employees, pad=3, off=(-10, -3)),
              T(2, reason, pad=3, off=(-10, -3)),
-             T(3, pad_box(region_sec, 9, 9, 9, 5), pad=0, off=(-10, -3)),
-             T(4, pad_box(top_sec, 9, 9, 9, 5), pad=0, off=(-10, -3)),
+             T(3, pad_box(region_sec, 9, 9, 9, 5), pad=0, off=(-20, -8)),
+             T(4, pad_box(top_sec, 9, 9, 9, 5), pad=0, off=(-20, -8)),
              T(5, latest, pad=3, off=(-10, -3))],
             description="Overview tab, lower part: Employees table (click a row to see their calls) and, on the right, Calls by reason, Calls by region, Top branches and Latest calls (long lists shortened with ··· so all cards fit).",
             legend=["1 = Employees table", "2 = Calls by reason", "3 = Calls by region", "4 = Top branches", "5 = Latest calls"])
