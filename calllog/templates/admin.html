@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Administration · Call Log{% endblock %}
+{% block body %}
+{% include "_topbar.html" %}
+<nav class="tabs" role="tablist" aria-label="Sections" id="tabs">
+  <button role="tab" data-tab="overview" type="button">Overview</button>
+  <button role="tab" data-tab="records" type="button">Records</button>
+  <button role="tab" data-tab="employees" type="button">Employees</button>
+  <button role="tab" data-tab="audit" type="button">Audit log</button>
+  <button role="tab" data-tab="export" type="button">Export</button>
+  <span class="grow"></span>
+  <span class="live" id="live" role="status"><i class="live-dot"></i><span id="liveText">Connecting…</span></span>
+</nav>
+
+<div class="filters" id="filters" hidden>
+  <div class="segmented" id="presets" role="group" aria-label="Date range">
+    <button type="button" data-preset="today">Today</button>
+    <button type="button" data-preset="yesterday">Yesterday</button>
+    <button type="button" data-preset="week">Last 7 days</button>
+    <button type="button" data-preset="month">This month</button>
+    <button type="button" data-preset="custom">Custom</button>
+  </div>
+  <label class="inline-field">From <input type="date" id="fFrom"></label>
+  <label class="inline-field">To <input type="date" id="fTo"></label>
+  <span class="filter-group" data-for="records">
+    <select id="fUser" aria-label="Employee"><option value="">All employees</option></select>
+    <select id="fDept" aria-label="Department"><option value="">All departments</option></select>
+    <select id="fReason" aria-label="Reason"><option value="">All reasons</option></select>
+    <input type="search" id="fQuery" class="search" placeholder="Search IP, note, name" aria-label="Search records">
+  </span>
+  <span class="filter-group" data-for="audit">
+    <input type="search" id="aActor" class="search" placeholder="User" aria-label="Filter by user">
+    <select id="aAction" aria-label="Action"><option value="">All actions</option></select>
+    <input type="search" id="aQuery" class="search" placeholder="Search log" aria-label="Search the log">
+  </span>
+</div>
+
+<main class="page" id="app">
+  <section id="tab-overview" class="tab-panel" hidden></section>
+  <section id="tab-records" class="tab-panel" hidden></section>
+  <section id="tab-employees" class="tab-panel" hidden></section>
+  <section id="tab-audit" class="tab-panel" hidden></section>
+  <section id="tab-export" class="tab-panel" hidden></section>
+</main>
+<div id="toast" role="status" aria-live="polite"></div>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='common.js') }}"></script>
+<script src="{{ url_for('static', filename='admin.js') }}"></script>
+{% endblock %}

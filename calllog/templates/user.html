@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}My calls · Call Log{% endblock %}
+{% block body %}
+{% include "_topbar.html" %}
+<main class="page" id="app">
+  <section class="profile">
+    <div class="avatar" id="avatar" aria-hidden="true"></div>
+    <div class="profile-text">
+      <h1 id="pName" class="bidi" dir="auto">&nbsp;</h1>
+      <p class="muted"><span id="pId"></span> <span class="sep">·</span> <bdi id="pDept"></bdi></p>
+    </div>
+    <div class="datenav" role="group" aria-label="Choose day">
+      <button class="btn btn-ghost btn-icon" id="prevDay" aria-label="Previous day" type="button"></button>
+      <input type="date" id="dayInput" aria-label="Date">
+      <button class="btn btn-ghost btn-icon" id="nextDay" aria-label="Next day" type="button"></button>
+      <button class="btn btn-ghost" id="todayBtn" type="button">Today</button>
+    </div>
+  </section>
+
+  <div class="grid-main">
+    <section class="card entry" id="entryCard" aria-labelledby="entryTitle">
+      <h2 id="entryTitle">Log a call</h2>
+      <label class="field big" for="ipInput">IP phone that received the call</label>
+      <input id="ipInput" class="ip-input" inputmode="numeric" autocomplete="off" maxlength="10"
+             placeholder="e.g. 75942" autofocus aria-describedby="ipHelp">
+      <p class="field-error" id="ipHelp" role="alert" hidden></p>
+      <p class="field big" id="reasonLabel">Reason for the call <span class="hint">(click to save)</span></p>
+      <div class="reasons" id="reasons" role="group" aria-labelledby="reasonLabel"></div>
+      <details class="note-box">
+        <summary>Add a note</summary>
+        <textarea id="noteInput" rows="2" maxlength="300" placeholder="Optional note for this call"></textarea>
+      </details>
+    </section>
+
+    <section class="stats" aria-label="Statistics for the day">
+      <div class="kpis">
+        <div class="tile hero"><span class="tile-label" id="totalLabel">Calls today</span><strong id="kTotal">0</strong>
+          <span class="tile-sub" id="kRange">&nbsp;</span></div>
+        <div class="tile"><span class="tile-label"><i class="dot s-resolved"></i>Resolved</span><strong id="kResolved">0</strong><span class="tile-sub" id="sResolved"></span></div>
+        <div class="tile"><span class="tile-label"><i class="dot s-transferred"></i>Transferred</span><strong id="kTransferred">0</strong><span class="tile-sub" id="sTransferred"></span></div>
+        <div class="tile"><span class="tile-label"><i class="dot s-ticket_inquiry"></i>Ticket Inquiry</span><strong id="kTicket">0</strong><span class="tile-sub" id="sTicket"></span></div>
+      </div>
+      <div class="card chart-card">
+        <div class="card-head">
+          <h2>Calls by hour</h2>
+          <div class="legend" id="legend"></div>
+          <button class="btn btn-ghost btn-sm" id="viewToggle" type="button">View as table</button>
+        </div>
+        <div class="chart" id="chart"></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Calls by reason</h2></div>
+        <div id="reasonBars"></div>
+      </div>
+    </section>
+  </div>
+
+  <section class="card">
+    <div class="card-head">
+      <h2 id="recordsTitle">Today's calls</h2>
+      <input type="search" id="searchInput" class="search" placeholder="Search IP phone or note" aria-label="Search calls">
+      <span class="grow"></span>
+      <label class="inline-field">Download
+        <select id="dlScope" aria-label="Download range">
+          <option value="day">this day</option>
+          <option value="month">this month</option>
+        </select>
+      </label>
+      <a class="btn btn-ghost btn-sm" id="dlXlsx" href="#">Excel</a>
+      <a class="btn btn-ghost btn-sm" id="dlCsv" href="#">CSV</a>
+    </div>
+    <div class="table-wrap">
+      <table class="data" id="recordsTable">
+        <thead><tr><th>Time</th><th>IP phone</th><th>Reason</th><th>Status</th><th>Note</th><th class="actions-col"><span class="sr-only">Actions</span></th></tr></thead>
+        <tbody id="recordsBody"></tbody>
+      </table>
+    </div>
+    <p class="empty" id="emptyMsg" hidden></p>
+  </section>
+</main>
+<div id="toast" role="status" aria-live="polite"></div>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='common.js') }}"></script>
+<script src="{{ url_for('static', filename='user.js') }}"></script>
+{% endblock %}

@@ -1,0 +1,12 @@
+<header class="topbar">
+  <div class="brand"><img class="logo" src="{{ url_for('static', filename='nbe-logo.svg') }}" alt="NBE" width="32" height="32"><span>NBE <span class="brand-sub">Call Log</span></span>{% if current_user.role == 'admin' %}<span class="badge">Admin</span>{% endif %}</div>
+  <div class="topbar-right">
+    {% block topbar_extra %}{% endblock %}
+    <span class="who" dir="auto">{{ current_user.name }}</span>
+    <a class="link" href="{{ url_for('pages.password') }}">Password</a>
+    <form method="post" action="{{ url_for('pages.logout') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button class="link" type="submit">Sign out</button>
+    </form>
+  </div>
+</header>
