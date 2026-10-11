@@ -10,3 +10,5 @@ venv/
 /libs/
 /config.json
 /server.log*
+/dist/
+/docs/out/

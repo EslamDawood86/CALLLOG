@@ -203,7 +203,7 @@
     const id = `bp${++pickerSeq}`;
     const input = h("input", { type: "text", class: "bp-input", role: "combobox", autocomplete: "off", spellcheck: "false", dir: "ltr",
       "aria-autocomplete": "list", "aria-expanded": "false", "aria-controls": `${id}-list`, "aria-label": "Branch the call came from",
-      placeholder: "Type the branch number or name — leave empty if not a branch" });
+      placeholder: "Branch number or name" });
     const list = h("ul", { class: "bp-list", id: `${id}-list`, role: "listbox", hidden: true });
     const clearBtn = h("button", { type: "button", class: "bp-clear", "aria-label": "Clear branch", hidden: true, tabindex: "-1" }, "×");
     const el = h("div", { class: "bp" }, input, clearBtn, list);

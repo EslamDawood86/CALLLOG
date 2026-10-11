@@ -1,0 +1,43 @@
+NBE CALL LOG - READ ME FIRST
+============================
+
+WHAT IS IN THIS ZIP
+  program\   the application. Copy EVERYTHING inside this folder into the shared folder
+             \\10.104.46.34\calllog   (so that  \\10.104.46.34\calllog\run.py  exists).
+  guides\    the user guides (Word and PDF), in English and in Arabic:
+             - NBE-CallLog-User-Guide-EN / -AR : setup steps, employee guide, administrator guide
+             - Employee-Quick-Card             : one page for every employee
+
+QUICK STEPS (the guide explains each one with pictures)
+  1. Copy the contents of the "program" folder into \\10.104.46.34\calllog
+  2. On the PC that will run it, install Python 3.9 or newer from python.org
+     (tick "Add python.exe to PATH").
+  3. Double-click run.py in the shared folder.  (The first start needs internet once.)
+  4. Write down the administrator password shown in the black window.  User ID: admin
+  5. Open the address shown in the window, sign in as admin and choose a new password.
+  6. Employees > Add employee (or Import from Excel / CSV) to create the employee accounts.
+
+  To let other PCs open it, start with:   python \\10.104.46.34\calllog\run.py --share
+  To keep it running by itself (and up to date), use Windows Task Scheduler - see the guide.
+
+--------------------------------------------------------------------------------
+
+NBE CALL LOG - اقرأني أولاً
+============================
+
+محتويات هذا الملف
+  program\   البرنامج نفسه. انسخ كل ما داخل هذا المجلد إلى المجلد المشترك
+             \\10.104.46.34\calllog   (بحيث يظهر الملف  \\10.104.46.34\calllog\run.py).
+  guides\    أدلة الاستخدام (Word و PDF) بالعربية والإنجليزية.
+
+خطوات سريعة (الدليل يشرح كل خطوة بالصور)
+  1. انسخ محتويات مجلد program إلى \\10.104.46.34\calllog
+  2. على الجهاز الذي سيشغل البرنامج ثبّت Python 3.9 أو أحدث من python.org
+     (فعّل خيار Add python.exe to PATH).
+  3. اضغط مرتين على الملف run.py داخل المجلد المشترك. (أول تشغيل يحتاج إنترنت مرة واحدة.)
+  4. اكتب كلمة مرور المدير التي تظهر في النافذة السوداء.  اسم المستخدم: admin
+  5. افتح العنوان المكتوب في النافذة، سجّل الدخول كـ admin واختر كلمة مرور جديدة.
+  6. من تبويب Employees: Add employee (أو Import) لإنشاء حسابات الموظفين.
+
+  للسماح لأجهزة أخرى بالدخول شغّل:   python \\10.104.46.34\calllog\run.py --share
+  للتشغيل التلقائي استخدم Windows Task Scheduler - انظر الدليل.
