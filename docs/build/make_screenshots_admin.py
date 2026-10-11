@@ -16,7 +16,7 @@ What it does, by itself, from nothing:
   5. draws the two plain diagrams (setup-01, setup-02) from HTML/CSS,
   6. stops every server it started.
 
-Nothing here creates or mentions a .bat/.cmd/.ps1/.vbs file: the program is only ever started with python run.py.
+The program is only ever started with  python run.py ...  (no launcher files of any kind).
 """
 from __future__ import annotations
 
@@ -153,7 +153,10 @@ def capture_console_text(port: int, work: Path) -> str:
     finally:
         stop_program(proc)
     text = log.read_text(encoding="utf-8", errors="replace").replace("\r\n", "\n")
-    text = text.replace(str(data), UNC + r"\data")         # the only edit: the long scratch path
+    text = text.replace(str(data), UNC + r"\data")         # the long scratch path -> the share path
+    # the picture must match the numbers used in the guide: port 8080 and an example LAN address
+    text = re.sub(r"http://[0-9.]+:%d" % port, "http://192.168.1.20:8080", text)
+    text = text.replace("http://localhost:%d" % port, "http://localhost:8080")
     shutil.rmtree(data, ignore_errors=True)
     return text.rstrip("\n")
 
@@ -330,7 +333,7 @@ body{margin:0;background:#f9f9f7;color:#0b0b0b;font:16px/1.35 __FONT__}
 .clients .hd{background:#e6f2ee;color:#006a4e}
 .pcs{display:flex;gap:10px}
 .url{font:700 14px __MONO__;color:#7a3d00;background:#fff3e6;border:1.5px solid #ee7203;border-radius:8px;padding:7px 10px;white-space:nowrap}
-.cmd{font:600 14px __MONO__;color:#e8e8e8;background:#0c0c0c;border-radius:8px;padding:8px 12px;white-space:nowrap}
+.runcmd{font:600 14px __MONO__;color:#e8e8e8;background:#0c0c0c;border-radius:8px;padding:8px 12px;white-space:nowrap}
 .chip{display:flex;align-items:center;gap:10px;width:100%;border:1px solid #d9d8d0;background:#fcfcfb;border-radius:10px;padding:9px 12px;white-space:nowrap}
 .chip b{font-weight:700}.chip span{color:#52514e;font-size:14.5px}
 .chips{display:grid;gap:10px;width:100%}
@@ -344,7 +347,7 @@ body{margin:0;background:#f9f9f7;color:#0b0b0b;font:16px/1.35 __FONT__}
  <div class="card clients"><div class="hd">Employees' browsers</div><div class="bd">
    <div class="pcs">__PC____PC____PC__</div><div class="url">http://&lt;server-pc&gt;:8080</div></div></div>
  <div class="arrow"><div class="lbl">pages</div><div class="line"></div></div>
- <div class="card"><div class="hd">PC that runs run.py</div><div class="bd">__PCBIG__<div class="cmd">python run.py --service</div></div></div>
+ <div class="card"><div class="hd">PC that runs run.py</div><div class="bd">__PCBIG__<div class="runcmd">python run.py --service</div></div></div>
  <div class="arrow"><div class="lbl">reads/writes files</div><div class="line"></div></div>
  <div class="card"><div class="hd">Shared folder<small>__UNC__</small></div><div class="bd"><div class="chips">
    <div class="chip">__FOLDER__<div><b>program</b> <span>(run.py, calllog/)</span></div></div>
@@ -722,7 +725,7 @@ def main():
                 sh.render_html("setup-03-first-run-window.png", console_html(console_text), 880,
                                targets_fn=lambda pg: [T(1, pg.locator("#pw"), pad=0, off=(-36, -2)),
                                                       T(2, pg.locator("#addr"), pad=0, off=(-36, -2))],
-                               description="The real first-run output of python run.py --share in a dark Command Prompt window (long scratch path replaced by the share path).",
+                               description="The real first-run output of python run.py --share in a dark Command Prompt window (long scratch path replaced by the share path; port and address replaced by the guide's example values 8080 / 192.168.1.20).",
                                legend=["1 = administrator password line", "2 = address line (Other PCs open)"])
             browser.close()
     finally:

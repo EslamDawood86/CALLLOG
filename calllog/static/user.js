@@ -84,6 +84,7 @@
     $("#nextDay").disabled = isToday;
     $("#todayBtn").disabled = isToday;
     el.entry.hidden = !isToday;      // calls are logged live, so only "today" accepts new entries
+    $(".grid-main").classList.toggle("no-entry", !isToday);   // without the entry card the numbers use the full width
   }
 
   function updateDownloadLinks() {

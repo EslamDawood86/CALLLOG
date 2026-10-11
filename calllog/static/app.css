@@ -135,6 +135,7 @@ a { color: var(--accent-text); }
 .datenav { margin-left: auto; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .grid-main { display: grid; grid-template-columns: minmax(300px, 400px) minmax(0, 1fr); gap: 18px; align-items: start; }
 @media (max-width: 900px) { .grid-main { grid-template-columns: 1fr; } .page { padding: 14px; } }
+.grid-main.no-entry { grid-template-columns: minmax(0, 1fr); }
 .stats { display: grid; gap: 18px; min-width: 0; }
 
 /* ---------- forms & buttons ---------- */
