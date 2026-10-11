@@ -4,11 +4,14 @@ import io
 import re
 from collections import Counter
 
+import hashlib
+import json
+
 from flask import Blueprint, current_app, g, jsonify, request
 
-from . import auth, stats
+from . import auth, branches as branch_list, overview as overview_data, stats
 from .queries import (ApiError, clean_ip_phone, clean_note, clean_reason,
-                      decorate, filtered_records, json_body, paginate, parse_day, parse_range,
+                      decorate, filtered_raw, json_body, paginate, parse_day, parse_range,
                       reasons_by_key)
 from .security import generate_password, hash_password, password_problem
 from .storage import (STATUSES, STATUS_LABELS, StorageError, iso_now, new_record_id, norm_uid,
@@ -59,17 +62,43 @@ def day_payload(day, uid):
     users = auth.store().users()
     reasons = reasons_by_key()
     recs = auth.store().day_records(day, uid)
-    rows = [decorate(r, users, reasons) for r in recs]
+    rows = [decorate(r, users, reasons) for r in reversed(recs)]    # reversed: among equal seconds the later call comes first
     rows.sort(key=lambda r: r["time"], reverse=True)
     editable = edit_window_open(day)
     for row in rows:
         row["editable"] = editable
     summary = stats.summarize(recs, reasons)
     return {
-        "date": day, "server_time": iso_now(auth.now()), "records": rows,
+        "date": day, "today": auth.today(), "server_time": iso_now(auth.now()), "records": rows,
         "stats": {**{k: summary[k] for k in ("total", "first_call", "last_call", "by_reason", *STATUSES)},
                   "hourly": stats.buckets(recs, reasons, "hour")},
     }
+
+
+# ------------------------------------------------------------------ branches
+def branch_fields(branch_id):
+    """The branch snapshot stored on a call. Empty = the caller is not a branch (sector / other)."""
+    if not branch_id:
+        return {"branch": "", "branch_name": "", "region": ""}
+    entry = auth.store().branch_by_id(str(branch_id))
+    if not entry:
+        raise ApiError("That branch is not in the list. Reload the page and choose it again.")
+    return {"branch": entry["code"], "branch_name": entry["name"], "region": entry["region"]}
+
+
+def branch_label(rec):
+    return f"{rec['branch']} · {rec['branch_name']}" if rec.get("branch") else ""
+
+
+@bp.get("/branches")
+@auth.login_required
+def list_branches():
+    items = auth.store().branches()
+    body = json.dumps({"branches": items}, ensure_ascii=False, separators=(",", ":"))
+    resp = current_app.response_class(body, mimetype="application/json")
+    resp.set_etag(hashlib.sha1(body.encode("utf-8")).hexdigest())
+    resp.headers["Cache-Control"] = "no-cache"      # the browser re-validates; unchanged list = tiny 304
+    return resp.make_conditional(request)
 
 
 @bp.get("/records")
@@ -90,17 +119,18 @@ def create_record():
     ip_phone = clean_ip_phone(body.get("ip_phone"))
     reason = clean_reason(body.get("reason"))
     note = clean_note(body.get("note"))
+    branch = branch_fields(body.get("branch"))
     stamp = auth.now().replace(microsecond=0)
     day = stamp.date().isoformat()
     rec = {
         "id": new_record_id(day, g.user["user_id"]), "user_id": g.user["user_id"],
         "date": day, "time": stamp.time().isoformat(), "ip_phone": ip_phone,
-        "reason": reason, "note": note, "created_at": iso_now(stamp),
+        "reason": reason, "note": note, **branch, "created_at": iso_now(stamp),
         "updated_at": None, "updated_by": None,
     }
     auth.store().add_record(rec)
     auth.audit("record_created", target=rec["id"],
-               details={"ip_phone": ip_phone, "reason": reason, "note": note})
+               details={"ip_phone": ip_phone, "reason": reason, "note": note, "branch": branch_label(rec)})
     return jsonify(record=decorate(rec, auth.store().users(), reasons_by_key())), 201
 
 
@@ -132,12 +162,14 @@ def update_record(rid):
         changes["reason"] = clean_reason(body["reason"])
     if "note" in body:
         changes["note"] = clean_note(body["note"])
+    if "branch" in body:
+        changes.update(branch_fields(body["branch"]))
     if not changes:
         raise ApiError("Nothing to change.")
     current = auth.store().get_record(rid)
     if not current:
         raise ApiError("Record not found.", 404)
-    changes = {k: v for k, v in changes.items() if current.get(k) != v}
+    changes = {k: v for k, v in changes.items() if current.get(k, "") != v}
     if not changes:
         return jsonify(record=decorate(current, auth.store().users(), reasons_by_key()))
     result = auth.store().update_record(rid, {
@@ -145,8 +177,10 @@ def update_record(rid):
     if not result:
         raise ApiError("Record not found.", 404)
     before, after = result
+    audit_keys = {("branch" if k in ("branch", "branch_name", "region") else k) for k in changes}
+    view = lambda rec: {k: (branch_label(rec) if k == "branch" else rec.get(k)) for k in audit_keys}
     auth.audit("record_updated", target=rid, details={
-        "owner": owner, "before": {k: before.get(k) for k in changes}, "after": changes})
+        "owner": owner, "before": view(before), "after": view(after)})
     return jsonify(record=decorate(after, auth.store().users(), reasons_by_key()))
 
 
@@ -158,8 +192,8 @@ def delete_record(rid):
     if not removed:
         raise ApiError("Record not found.", 404)
     auth.audit("record_deleted", target=rid, details={
-        "owner": owner, **{k: removed.get(k) for k in
-                           ("date", "time", "ip_phone", "reason", "note")}})
+        "owner": owner, "branch": branch_label(removed), **{k: removed.get(k) for k in
+                                                           ("date", "time", "ip_phone", "reason", "note")}})
     return jsonify(ok=True)
 
 
@@ -168,35 +202,43 @@ def delete_record(rid):
 @auth.admin_required
 def overview():
     d_from, d_to = parse_range()
-    reasons = reasons_by_key()
-    users = auth.store().users()
-    recs = auth.store().records_between(d_from, d_to)
-    rows = stats.per_employee(users, recs, reasons)
-    totals = stats.summarize(recs, reasons)
-    kind = "hour" if d_from == d_to else "day"
-    recent = sorted(recs, key=lambda r: (r["date"], r["time"]), reverse=True)[:10]
-    employees = [u for u in users.values() if u["role"] == "user" and u.get("active", True)]
-    return jsonify(
-        range={"from": d_from, "to": d_to}, server_time=iso_now(auth.now()),
-        totals={k: totals[k] for k in ("total", *STATUSES)} | {
-            "active_employees": sum(1 for r in rows if r["total"] > 0),
-            "employees": len(employees)},
-        chart={"kind": kind, "buckets": stats.buckets(recs, reasons, kind, d_from, d_to)},
-        by_reason=totals["by_reason"], employees=rows,
-        recent=[decorate(r, users, reasons) for r in recent],
-        departments=sorted({u.get("department", "") for u in employees if u.get("department")}),
-    )
+
+    def compute():
+        reasons = reasons_by_key()
+        users = auth.store().users()
+        data = overview_data.merged(d_from, d_to)
+        totals = data["totals"]
+        rows = stats.employee_rows(users, data["users"])
+        kind = "hour" if d_from == d_to else "day"
+        employees = [u for u in users.values() if u["role"] == "user" and u.get("active", True)]
+        branch_rows = stats.branch_rows(data["branches"])
+        with_branch = sum(r["total"] for r in branch_rows)
+        return dict(
+            range={"from": d_from, "to": d_to},
+            totals={k: totals[k] for k in ("total", *STATUSES)} | {
+                "active_employees": sum(1 for r in rows if r["total"] > 0), "employees": len(employees)},
+            chart={"kind": kind, "buckets": stats.chart_buckets(data["rollups"], kind, d_from, d_to)},
+            by_reason=data["by_reason"], employees=rows,
+            recent=[decorate(r, users, reasons) for r in overview_data.recent_calls(d_from, d_to)],
+            departments=sorted({u.get("department", "") for u in employees if u.get("department")}),
+            branches={"by_region": stats.per_region(branch_rows), "top": branch_rows[:10],
+                      "with_branch": with_branch, "without_branch": totals["total"] - with_branch,
+                      "distinct": len(branch_rows)},
+        )
+
+    data = auth.store().memo(("overview", d_from, d_to), compute)
+    return jsonify(**data, server_time=iso_now(auth.now()))
 
 
 @bp.get("/admin/records")
 @auth.admin_required
 def admin_records():
     d_from, d_to = parse_range()
-    rows = filtered_records(d_from, d_to, request.args)
-    for row in rows:
-        row["editable"] = True
-    return jsonify(**paginate(rows), range={"from": d_from, "to": d_to},
-                   server_time=iso_now(auth.now()))
+    rows = filtered_raw(d_from, d_to, request.args)
+    page = paginate(rows)
+    users, reasons = auth.store().users(), reasons_by_key()
+    page["items"] = [{**decorate(r, users, reasons), "editable": True} for r in page["items"]]
+    return jsonify(**page, range={"from": d_from, "to": d_to}, server_time=iso_now(auth.now()))
 
 
 @bp.get("/admin/users")
@@ -311,15 +353,15 @@ _HEADER_ALIASES = {
 }
 
 
-def _read_rows(upload):
-    """Rows of a .csv or .xlsx upload as lists of strings."""
+def _read_rows(upload, prefer_sheets=()):
+    """Rows of a .csv or .xlsx upload as lists of strings (for .xlsx: the preferred sheet, else the first)."""
     filename = (upload.filename or "").lower()
     raw = upload.read()
     if filename.endswith(".xlsx"):
         from openpyxl import load_workbook
         wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
-        return [["" if c is None else str(c).strip() for c in row]
-                for row in wb.worksheets[0].iter_rows(values_only=True)]
+        sheet = next((ws for ws in wb.worksheets if ws.title.strip().lower() in prefer_sheets), wb.worksheets[0])
+        return [["" if c is None else str(c).strip() for c in row] for row in sheet.iter_rows(values_only=True)]
     if filename.endswith(".csv"):
         text = raw.decode("utf-8-sig", errors="replace")
         try:
@@ -382,6 +424,26 @@ def import_users():
     credentials = [c for c in credentials if c["user_id"] in created_ids]
     auth.audit("users_imported", details={"created": len(created), "skipped": len(skipped)})
     return jsonify(created=len(created), skipped=skipped, credentials=credentials)
+
+
+# -------------------------------------------------------------- branch list import
+@bp.post("/admin/branches/import")
+@auth.admin_required
+def import_branches():
+    upload = request.files.get("file")
+    if not upload:
+        raise ApiError("Choose a file to import.")
+    rows = _read_rows(upload, prefer_sheets=("الفروع", "branches", "branch"))
+    try:
+        entries, report = branch_list.parse_rows(rows)
+    except ValueError as exc:
+        raise ApiError(str(exc))
+    if not entries:
+        raise ApiError("No branches were found in the file.")
+    previous = len(auth.store().branches())
+    auth.store().replace_branches(entries)
+    auth.audit("branches_imported", details={"count": len(entries), "previous": previous, **report})
+    return jsonify(count=len(entries), previous=previous, **report)
 
 
 # ======================================================================== audit

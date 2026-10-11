@@ -5,7 +5,9 @@ from werkzeug.security import check_password_hash, generate_password_hash
 MIN_PASSWORD_LENGTH = 8
 # No look-alike characters (0/O, 1/l/I) so temporary passwords can be read out over the phone.
 _ALPHABET = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-PBKDF2_ITERATIONS = 600_000   # slow on purpose; tests lower it
+# Slow on purpose, but not so slow that ~60 people signing in at 08:00 queue up (about 0.1 s per sign-in on a
+# modern PC). Existing hashes keep working: the count is stored inside each hash. Tests lower it.
+PBKDF2_ITERATIONS = 260_000
 _DUMMY_HASH = generate_password_hash("not-a-real-password", method="pbkdf2:sha256")
 
 

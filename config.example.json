@@ -1,0 +1,9 @@
+{
+  "data_dir": "data",
+  "host": "127.0.0.1",
+  "port": 8080,
+  "user_edit_days": null,
+  "ip_phone_regex": "^\\d{3,10}$",
+  "session_hours": 12,
+  "threads": 16
+}

@@ -6,6 +6,7 @@
   <button role="tab" data-tab="overview" type="button">Overview</button>
   <button role="tab" data-tab="records" type="button">Records</button>
   <button role="tab" data-tab="employees" type="button">Employees</button>
+  <button role="tab" data-tab="branches" type="button">Branches</button>
   <button role="tab" data-tab="audit" type="button">Audit log</button>
   <button role="tab" data-tab="export" type="button">Export</button>
   <span class="grow"></span>
@@ -25,8 +26,9 @@
   <span class="filter-group" data-for="records">
     <select id="fUser" aria-label="Employee"><option value="">All employees</option></select>
     <select id="fDept" aria-label="Department"><option value="">All departments</option></select>
+    <select id="fRegion" aria-label="Region"><option value="">All regions</option></select>
     <select id="fReason" aria-label="Reason"><option value="">All reasons</option></select>
-    <input type="search" id="fQuery" class="search" placeholder="Search IP, note, name" aria-label="Search records">
+    <input type="search" id="fQuery" class="search" placeholder="Search IP, branch, note, name" aria-label="Search records">
   </span>
   <span class="filter-group" data-for="audit">
     <input type="search" id="aActor" class="search" placeholder="User" aria-label="Filter by user">
@@ -39,6 +41,7 @@
   <section id="tab-overview" class="tab-panel" hidden></section>
   <section id="tab-records" class="tab-panel" hidden></section>
   <section id="tab-employees" class="tab-panel" hidden></section>
+  <section id="tab-branches" class="tab-panel" hidden></section>
   <section id="tab-audit" class="tab-panel" hidden></section>
   <section id="tab-export" class="tab-panel" hidden></section>
 </main>

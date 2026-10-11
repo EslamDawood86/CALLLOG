@@ -7,3 +7,6 @@ venv/
 /data/
 /local_data/
 *.tmp
+/libs/
+/config.json
+/server.log*

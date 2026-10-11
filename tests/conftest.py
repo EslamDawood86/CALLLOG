@@ -36,8 +36,8 @@ class Browser:
                 self.csrf = s.get("csrf")
         return resp
 
-    def api(self, method, url, json=None, **kw):
-        headers = {"X-CSRF-Token": self.csrf} if self.csrf else {}
+    def api(self, method, url, json=None, headers=None, **kw):
+        headers = {**({"X-CSRF-Token": self.csrf} if self.csrf else {}), **(headers or {})}
         return self.client.open(url, method=method, json=json, headers=headers, **kw)
 
     def get(self, url, **kw):

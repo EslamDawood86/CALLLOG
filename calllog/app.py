@@ -33,11 +33,14 @@ def bootstrap_admin(store, clock):
     if store.users():
         return None
     password = generate_password()
-    store.create_user({
-        "user_id": "admin", "name": "Administrator", "department": "", "role": "admin",
-        "password_hash": hash_password(password), "active": True,
-        "must_change_password": True, "created_at": iso_now(clock()), "last_login": None,
-    })
+    try:
+        store.create_user({
+            "user_id": "admin", "name": "Administrator", "department": "", "role": "admin",
+            "password_hash": hash_password(password), "active": True,
+            "must_change_password": True, "created_at": iso_now(clock()), "last_login": None,
+        })
+    except StorageError:  # another PC created it a moment ago
+        return None
     return password
 
 

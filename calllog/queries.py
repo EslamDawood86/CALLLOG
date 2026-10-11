@@ -84,6 +84,7 @@ def decorate(rec, users, reasons):
     reason = reasons.get(rec["reason"], {})
     status = reason.get("status", "other")
     return {
+        "branch": "", "branch_name": "", "region": "",   # calls from a sector / other caller have no branch
         **rec,
         "name": user.get("name", rec["user_id"]),
         "department": user.get("department", ""),
@@ -95,27 +96,43 @@ def decorate(rec, users, reasons):
     }
 
 
-def filtered_records(d_from, d_to, args):
-    """Records in range, newest first, narrowed by user_id / department / reason / q."""
-    users = auth.store().users()
-    reasons = reasons_by_key()
+def filtered_raw(d_from, d_to, args):
+    """Raw records in range, newest first, narrowed by user / department / reason / region / q.
+
+    Shared for ~2 s between admins asking the same thing - never modify the list."""
     uid = norm_uid(args.get("user_id")) or None
     department = (args.get("department") or "").strip()
     reason = args.get("reason") or ""
+    region = (args.get("region") or "").strip()
     q = (args.get("q") or "").strip().lower()
-    out = []
-    for rec in auth.store().records_between(d_from, d_to, uid):
-        if reason and rec["reason"] != reason:
-            continue
-        row = decorate(rec, users, reasons)
-        if department and row["department"] != department:
-            continue
-        if q and not (q in rec["ip_phone"] or q in (rec.get("note") or "").lower()
-                      or q in row["name"].lower() or q in rec["user_id"]):
-            continue
-        out.append(row)
-    out.sort(key=lambda r: (r["date"], r["time"]), reverse=True)
-    return out
+
+    def compute():
+        users = auth.store().users()
+        out = []
+        for rec in auth.store().records_between(d_from, d_to, uid):
+            if reason and rec["reason"] != reason:
+                continue
+            if region and rec.get("region") != region:
+                continue
+            user = users.get(rec["user_id"], {})
+            if department and user.get("department") != department:
+                continue
+            if q and not (q in rec["ip_phone"] or q in (rec.get("note") or "").lower()
+                          or q in user.get("name", "").lower() or q in rec["user_id"]
+                          or q in rec.get("branch", "") or q in rec.get("branch_name", "")):
+                continue
+            out.append(rec)
+        out.reverse()                     # equal seconds: later-saved call first (the sort below is stable)
+        out.sort(key=lambda r: (r["date"], r["time"]), reverse=True)
+        return out
+
+    return auth.store().memo(("records", d_from, d_to, uid, department, reason, region, q), compute)
+
+
+def filtered_records(d_from, d_to, args):
+    """Like filtered_raw, with display fields added (used by the exports)."""
+    users, reasons = auth.store().users(), reasons_by_key()
+    return [decorate(r, users, reasons) for r in filtered_raw(d_from, d_to, args)]
 
 
 def paginate(items, default_size=50):

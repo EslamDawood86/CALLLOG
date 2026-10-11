@@ -8,15 +8,16 @@ from openpyxl import Workbook
 from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Alignment, Font, PatternFill
 
-from . import auth, stats
+from . import auth, overview as overview_data, stats
 from .queries import ApiError, filtered_records, parse_range, reasons_by_key
 from .storage import norm_uid
 
 bp = Blueprint("exports", __name__)
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-RECORD_HEAD = ["Date", "Time", "User ID", "Employee", "Department", "IP Phone",
-               "Action Taken", "Action (English)", "Status", "Note", "Edited at"]
+RECORD_HEAD = ["Date", "Time", "User ID", "Employee", "Department", "IP Phone", "Branch No.", "Branch",
+               "Region", "Action Taken", "Action (English)", "Status", "Note", "Edited at"]
+BRANCH_HEAD = ["Branch No.", "Branch", "Region", "Total calls", "Resolved", "Transferred", "Ticket Inquiry"]
 SUMMARY_HEAD = ["User ID", "Employee", "Department", "Total calls", "Resolved", "Transferred",
                 "Ticket Inquiry", "First call", "Last call"]
 AUDIT_HEAD = ["Time", "User ID", "User", "Action", "Target", "Details", "From address"]
@@ -25,17 +26,21 @@ _FORMULA_STARTS = ("=", "+", "-", "@", "\t", "\r")
 
 def _record_row(r):
     return [r["date"], r["time"], r["user_id"], r["name"], r["department"], r["ip_phone"],
-            r["reason_ar"], r["reason_en"], r["status_label"], r.get("note") or "",
-            r.get("updated_at") or ""]
+            r["branch"], r["branch_name"], r["region"], r["reason_ar"], r["reason_en"],
+            r["status_label"], r.get("note") or "", r.get("updated_at") or ""]
 
 
 def _summary_rows(d_from, d_to):
-    reasons = reasons_by_key()
-    rows = stats.per_employee(auth.store().users(),
-                              auth.store().records_between(d_from, d_to), reasons)
+    rows = stats.employee_rows(auth.store().users(), overview_data.merged(d_from, d_to)["users"])
     return [[r["user_id"], r["name"], r["department"], r["total"], r["resolved"],
              r["transferred"], r["ticket_inquiry"], r["first_call"] or "", r["last_call"] or ""]
             for r in rows]
+
+
+def _branch_rows(d_from, d_to):
+    rows = stats.branch_rows(overview_data.merged(d_from, d_to)["branches"])
+    return [[r["code"], r["name"], r["region"], r["total"], r["resolved"], r["transferred"],
+             r["ticket_inquiry"]] for r in rows]
 
 
 def _audit_rows(d_from, d_to):
@@ -120,7 +125,8 @@ def _fmt(value):
 
 
 SHEET_TITLES = {"records": "Calls", "report": "Calls", "my-calls": "My calls", "audit": "Audit log"}
-RECORD_WIDTHS = [12, 10, 12, 26, 24, 12, 28, 30, 16, 36, 20]
+RECORD_WIDTHS = [12, 10, 12, 26, 24, 12, 11, 26, 30, 28, 30, 16, 36, 20]
+BRANCH_WIDTHS = [11, 30, 34, 12, 11, 13, 14]
 SUMMARY_WIDTHS = [12, 26, 24, 12, 11, 13, 14, 20, 20]
 
 
@@ -141,7 +147,8 @@ def report():
     d_from, d_to = parse_range()
     rows = [_record_row(r) for r in filtered_records(d_from, d_to, {})]
     summary = ("Summary", SUMMARY_HEAD, _summary_rows(d_from, d_to), SUMMARY_WIDTHS)
-    return _send("report", "xlsx", d_from, d_to, RECORD_HEAD, rows, RECORD_WIDTHS, extra=[summary])
+    by_branch = ("By branch", BRANCH_HEAD, _branch_rows(d_from, d_to), BRANCH_WIDTHS)
+    return _send("report", "xlsx", d_from, d_to, RECORD_HEAD, rows, RECORD_WIDTHS, extra=[summary, by_branch])
 
 
 @bp.get("/audit.<fmt>")

@@ -2,19 +2,19 @@
 /* Administrator dashboard. One shared date range scopes every tab; the open tab re-fetches every 5 s. */
 (function () {
   const { h, $, api, toast, modal, confirmDialog, icon, editRecord, deleteRecord, rowActions, statusChip, trimHours,
-    legend, chartWithToggle, bidi, reasonBars, fmtNum, hhmm, fmtDay, addDays, pct, agoText, STATUSES, STATUS_NAMES } = CL;
+    legend, chartWithToggle, bidi, reasonBars, barRows, fmtNum, hhmm, fmtDay, addDays, pct, agoText, STATUSES, STATUS_NAMES } = CL;
 
-  const TABS = ["overview", "records", "employees", "audit", "export"];
+  const TABS = ["overview", "records", "employees", "branches", "audit", "export"];
   const REFRESH_MS = 5000;
   const state = {
-    reasons: [], reasonByKey: {}, today: "", tab: "overview", preset: "today", from: "", to: "",
+    reasons: [], reasonByKey: {}, branches: [], today: "", tab: "overview", preset: "today", from: "", to: "",
     rec: { page: 1 }, audit: { page: 1 }, sort: { key: "total", dir: -1 }, users: [], seen: {}, busy: false,
   };
   const AUDIT_LABELS = {
     login: "Signed in", logout: "Signed out", login_failed: "Failed sign-in", login_blocked: "Sign-in blocked (too many attempts)",
     password_changed: "Changed own password", record_created: "Logged a call", record_updated: "Edited a call",
     record_deleted: "Deleted a call", user_created: "Created user", user_updated: "Updated user",
-    password_reset: "Reset a password", users_imported: "Imported users", export: "Exported data",
+    password_reset: "Reset a password", users_imported: "Imported users", branches_imported: "Imported the branch list", export: "Exported data",
   };
   const panel = (name) => $(`#tab-${name}`);
 
@@ -80,17 +80,27 @@
     if (location.hash !== "#" + name) history.replaceState(null, "", "#" + name);
     document.querySelectorAll("#tabs [role=tab]").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tab === name)));
     TABS.forEach((t) => (panel(t).hidden = t !== name));
-    $("#filters").hidden = name === "employees";
+    $("#filters").hidden = name === "employees" || name === "branches";
     document.querySelectorAll(".filter-group").forEach((g) => (g.hidden = g.dataset.for !== name));
     refresh(true);
   }
 
-  const loaders = { overview: loadOverview, records: loadRecords, employees: loadEmployees, audit: loadAudit, export: renderExport };
+  /** How often the open tab re-fetches. Past days cannot change, so they are checked rarely; the share stays quiet. */
+  function pollDelay() {
+    if (state.tab === "export" || state.tab === "branches") return Infinity;
+    if (state.tab === "employees") return 30000;
+    if (state.tab !== "audit" && state.to < state.today) return 60000;
+    if (state.tab === "audit") return 10000;
+    return state.from === state.to ? REFRESH_MS : 15000;
+  }
+
+  const loaders = { overview: loadOverview, records: loadRecords, employees: loadEmployees, branches: loadBranches, audit: loadAudit, export: renderExport };
 
   async function refresh(force) {
     if (state.busy) return;
     state.busy = true;
     const tab = state.tab;
+    state.lastRefresh = Date.now();
     try {
       const serverTime = await loaders[tab](!!force);
       if (serverTime) setLive(true, `Live · updated ${serverTime.slice(11, 19)}`);
@@ -171,10 +181,23 @@
         h("div", { class: "card" }, h("div", { class: "card-head" }, h("h2", {}, "Employees"), h("span", { class: "hint" }, "click a row to see their calls")), employees),
         h("div", { class: "side-stack" },
           h("div", { class: "card" }, h("div", { class: "card-head" }, h("h2", {}, "Calls by reason")), reasonBars(state.reasons, d.by_reason)),
+          branchCards(d.branches),
           h("div", { class: "card" }, h("div", { class: "card-head" }, h("h2", {}, "Latest calls"), h("span", { class: "hint" }, "live")), feed))));
     renderChart();
     state.departments = d.departments;
     fillDepartments();
+  }
+
+  /** Where the calls came from: regions and the busiest branches. Calls from sectors/others have no branch. */
+  function branchCards(b) {
+    const regions = b.by_region.length
+      ? barRows(b.by_region.map((r) => ({ label: r.region, value: r.total }))) : h("p", { class: "empty" }, "No branch calls in this period.");
+    const top = b.top.length ? h("ol", { class: "top-list" }, b.top.map((t) => h("li", {},
+      h("span", {}, h("strong", {}, t.code), "  ", bidi(t.name)), h("span", { class: "hint" }, t.region), h("strong", {}, fmtNum(t.total)))))
+      : h("p", { class: "empty" }, "No branch calls in this period.");
+    const note = b.without_branch ? h("p", { class: "hint" }, `${fmtNum(b.without_branch)} call${b.without_branch === 1 ? "" : "s"} came from sectors or other callers (no branch).`) : null;
+    return h("div", { class: "card" }, h("div", { class: "card-head" }, h("h2", {}, "Calls by region")), regions,
+      h("div", { class: "card-head spaced" }, h("h2", {}, "Top branches"), h("span", { class: "hint" }, `${b.distinct} branch${b.distinct === 1 ? "" : "es"} called`)), top, note);
   }
 
   function sortBy(key, d) {
@@ -190,7 +213,7 @@
   // --------------------------------------------------------------- records
   function recFilters() {
     const f = state.rec;
-    return { from: state.from, to: state.to, user_id: f.user_id || "", department: f.department || "", reason: f.reason || "", q: f.q || "" };
+    return { from: state.from, to: state.to, user_id: f.user_id || "", department: f.department || "", region: f.region || "", reason: f.reason || "", q: f.q || "" };
   }
 
   async function loadRecords(force) {
@@ -204,13 +227,14 @@
     const single = d.range.from === d.range.to;
     const exportQS = qs(recFilters());
     const table = d.items.length ? h("div", { class: "table-wrap" }, h("table", { class: "data" },
-      h("thead", {}, h("tr", {}, h("th", {}, single ? "Time" : "Date / time"), h("th", {}, "Employee"), h("th", {}, "Department"), h("th", {}, "IP phone"),
+      h("thead", {}, h("tr", {}, h("th", {}, single ? "Time" : "Date / time"), h("th", {}, "Employee"), h("th", {}, "Department"), h("th", {}, "IP phone"), h("th", {}, "Branch"),
         h("th", {}, "Reason"), h("th", {}, "Note"), h("th", { class: "actions-col" }, h("span", { class: "sr-only" }, "Actions")))),
       h("tbody", {}, d.items.map((r) => h("tr", {},
         h("td", { class: "nowrap" }, single ? hhmm(r.time) : `${r.date} ${hhmm(r.time)}`, h("span", { class: "hint" }, r.time.slice(5))),
         h("td", {}, bidi(r.name), h("span", { class: "hint" }, `  ${r.user_id}`)),
         h("td", {}, bidi(r.department)),
         h("td", { class: "ip" }, r.ip_phone),
+        h("td", { class: "branch-cell" }, r.branch ? [h("strong", {}, r.branch), bidi(r.branch_name), h("div", { class: "hint" }, r.region)] : h("span", { class: "branch-none" }, "—")),
         h("td", {}, statusChip(r.status, r.reason_ar)),
         h("td", { class: "note" }, bidi(r.note || ""), r.edited ? h("span", { class: "edited-mark", title: `Edited ${r.updated_at} by ${r.updated_by}` }, "edited") : null),
         h("td", { class: "actions-col" }, rowActions(r, () => editAny(r), () => deleteAny(r)))))))) : h("p", { class: "empty" }, "No calls match these filters.");
@@ -221,7 +245,7 @@
   }
 
   async function editAny(rec) {
-    if (await editRecord(rec, state.reasons)) refresh(true);
+    if (await editRecord(rec, state.reasons, state.branches)) refresh(true);
   }
   async function deleteAny(rec) {
     if (await deleteRecord(rec)) refresh(true);
@@ -351,18 +375,72 @@
     refresh(true);
   }
 
+  // -------------------------------------------------------------- branches
+  async function loadBranches(force) {
+    const d = await api("GET", "/api/branches");
+    state.branches = d.branches;
+    fillRegions();
+    if (force || changed("branches", { n: d.branches.length, first: d.branches[0], last: d.branches[d.branches.length - 1] })) renderBranches();
+    return new Date().toTimeString().slice(0, 8).padStart(19, " ");
+  }
+
+  function renderBranches() {
+    const regions = new Set(state.branches.map((b) => b.region)).size;
+    const search = h("input", { type: "search", class: "search", placeholder: "Search number, name or region", "aria-label": "Search branches" });
+    const body = h("tbody");
+    const note = h("p", { class: "hint" });
+    const draw = () => {
+      const q = CL.normAr(search.value).trim();
+      const hits = state.branches.filter((b) => !q || CL.normAr(`${b.code} ${b.name} ${b.region}`).includes(q));
+      body.replaceChildren(...hits.slice(0, 200).map((b) => h("tr", {},
+        h("td", { class: "ip" }, b.code), h("td", {}, bidi(b.name)), h("td", {}, bidi(b.region)), h("td", {}, bidi(b.type)))));
+      note.textContent = hits.length > 200 ? `Showing the first 200 of ${hits.length} — type to narrow the list.` : `${hits.length} shown`;
+    };
+    search.addEventListener("input", debounce(draw, 150));
+    panel("branches").replaceChildren(h("div", { class: "card" },
+      h("div", { class: "card-head" }, h("h2", {}, `${state.branches.length} branches in ${regions} regions`), search, h("span", { class: "grow" }),
+        h("button", { class: "btn btn-primary", type: "button", onclick: importBranches }, icon("upload"), "Import from Excel")),
+      h("p", { class: "hint" }, "Employees choose from this list when the caller is a branch. Importing replaces the whole list; calls already logged keep the branch they were logged with."),
+      h("div", { class: "table-wrap" }, h("table", { class: "data" },
+        h("thead", {}, h("tr", {}, ["Number", "Branch", "Region", "Type"].map((c) => h("th", {}, c)))), body)), note));
+    draw();
+  }
+
+  async function importBranches() {
+    const file = h("input", { type: "file", accept: ".xlsx,.csv", "aria-label": "Branch list file" });
+    let report = null;
+    await modal({
+      title: "Import the branch list", submitLabel: "Replace the list",
+      body: h("div", { class: "dlg-body" },
+        h("p", { class: "muted" }, "Choose an Excel (.xlsx) or CSV file. The first row must have the column titles:"),
+        h("p", {}, h("code", { dir: "auto" }, "رقم الفرع"), ", ", h("code", { dir: "auto" }, "اسم الفرع"), " and optionally ",
+          h("code", { dir: "auto" }, "اسم المنطقة التابع لها"), ", ", h("code", { dir: "auto" }, "نوع الفرع"), " (English titles work too)."),
+        h("p", { class: "hint" }, `The current list of ${state.branches.length} branches will be replaced.`), file),
+      onSubmit: async () => {
+        if (!file.files[0]) throw new Error("Choose a file first.");
+        const fd = new FormData();
+        fd.append("file", file.files[0]);
+        report = await api("POST", "/api/admin/branches/import", fd);
+      },
+    });
+    if (!report) return;
+    toast(`Branch list updated: ${report.count} branches` + (report.duplicates_merged ? ` (${report.duplicates_merged} duplicates merged)` : ""));
+    refresh(true);
+  }
+
   // ----------------------------------------------------------------- audit
   function auditDetails(e) {
     const d = e.details || {}, who = (o) => (o && o !== e.actor ? ` (employee ${o})` : "");
     const reason = (k) => reasonLabel(k);
     switch (e.action) {
-      case "record_created": return `IP ${d.ip_phone} · ${reason(d.reason)}` + (d.note ? ` · “${d.note}”` : "");
+      case "record_created": return `IP ${d.ip_phone} · ${reason(d.reason)}` + (d.branch ? ` · ${d.branch}` : "") + (d.note ? ` · “${d.note}”` : "");
       case "record_updated": return Object.keys(d.after || {}).map((k) => `${k.replace("_", " ")}: ${k === "reason" ? reason(d.before[k]) : d.before[k] || "—"} → ${k === "reason" ? reason(d.after[k]) : d.after[k] || "—"}`).join(" · ") + who(d.owner);
-      case "record_deleted": return `${d.date} ${hhmm(d.time || "")} · IP ${d.ip_phone} · ${reason(d.reason)}` + who(d.owner);
+      case "record_deleted": return `${d.date} ${hhmm(d.time || "")} · IP ${d.ip_phone} · ${reason(d.reason)}` + (d.branch ? ` · ${d.branch}` : "") + who(d.owner);
       case "user_created": return `${d.name} (${d.role})`;
       case "user_updated": return Object.entries(d).map(([k, v]) => `${k}: ${v.from} → ${v.to}`).join(" · ");
       case "export": return `${e.target} · ${d.from} → ${d.to} · ${fmtNum(d.rows)} rows`;
       case "users_imported": return `${d.created} created, ${d.skipped} skipped`;
+      case "branches_imported": return `${d.count} branches (was ${d.previous}), ${d.duplicates_merged} duplicates merged`;
       case "login_failed": return d.reason === "disabled" ? "account is disabled" : "";
       default: return "";
     }
@@ -419,6 +497,12 @@
     sel.replaceChildren(h("option", { value: "" }, "All departments"), ...(state.departments || []).map((d) => h("option", { value: d }, d)));
     sel.value = keep;
   }
+  function fillRegions() {
+    const sel = $("#fRegion"), keep = state.rec.region || "";
+    const regions = [...new Set(state.branches.map((b) => b.region).filter(Boolean))];
+    sel.replaceChildren(h("option", { value: "" }, "All regions"), ...regions.map((r) => h("option", { value: r }, r)));
+    sel.value = keep;
+  }
   function fillReasons() {
     const sel = $("#fReason");
     sel.replaceChildren(h("option", { value: "" }, "All reasons"), ...state.reasons.map((r) => h("option", { value: r.key }, `${r.label_ar} — ${r.label_en}`)));
@@ -446,6 +530,7 @@
     $("#fUser").addEventListener("change", onRec("user_id"));
     $("#fDept").addEventListener("change", onRec("department"));
     $("#fReason").addEventListener("change", onRec("reason"));
+    $("#fRegion").addEventListener("change", onRec("region"));
     $("#fQuery").addEventListener("input", debounce(onRec("q"), 250));
     const onAudit = (key) => (ev) => { state.audit[key] = ev.target.value; state.audit.page = 1; refresh(true); };
     $("#aActor").addEventListener("input", debounce(onAudit("actor"), 250));
@@ -460,16 +545,19 @@
       state.reasonByKey = Object.fromEntries(me.reasons.map((r) => [r.key, r]));
       state.today = me.today;
       state.users = (await api("GET", "/api/admin/users")).users;
+      state.branches = (await api("GET", "/api/branches")).branches;
     } catch (e) {
       toast(e.message, "error");
       return;
     }
     fillReasons();
+    fillRegions();
     fillUserFilter();
     applyPreset("today");
     showTab(location.hash.slice(1));
     setInterval(() => {
-      if (!document.hidden && !document.querySelector("dialog[open]")) refresh(false);
+      if (document.hidden || document.querySelector("dialog[open]")) return;
+      if (Date.now() - (state.lastRefresh || 0) >= pollDelay()) refresh(false);
     }, REFRESH_MS);
   }
   init();

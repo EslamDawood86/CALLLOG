@@ -24,6 +24,9 @@
       <input id="ipInput" class="ip-input" inputmode="numeric" autocomplete="off" maxlength="10"
              placeholder="e.g. 75942" autofocus aria-describedby="ipHelp">
       <p class="field-error" id="ipHelp" role="alert" hidden></p>
+      <p class="field big" id="branchLabel">Branch <span class="hint">(only if the caller is a branch — otherwise leave empty)</span></p>
+      <div id="branchHost" role="group" aria-labelledby="branchLabel"></div>
+      <p class="field-error" id="branchHelp" role="alert" hidden></p>
       <p class="field big" id="reasonLabel">Reason for the call <span class="hint">(click to save)</span></p>
       <div class="reasons" id="reasons" role="group" aria-labelledby="reasonLabel"></div>
       <details class="note-box">
@@ -71,7 +74,7 @@
     </div>
     <div class="table-wrap">
       <table class="data" id="recordsTable">
-        <thead><tr><th>Time</th><th>IP phone</th><th>Reason</th><th>Status</th><th>Note</th><th class="actions-col"><span class="sr-only">Actions</span></th></tr></thead>
+        <thead><tr><th>Time</th><th>IP phone</th><th>Branch</th><th>Reason</th><th>Status</th><th>Note</th><th class="actions-col"><span class="sr-only">Actions</span></th></tr></thead>
         <tbody id="recordsBody"></tbody>
       </table>
     </div>

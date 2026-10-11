@@ -172,6 +172,107 @@
     return modal({ title, body: h("p", { class: "muted", dir: "auto" }, message), submitLabel: confirmLabel, danger, onSubmit: async () => true });
   }
 
+  // ------------------------------------------------------------- bar rows
+  /** Horizontal bars. items: {label, hint, value, cls}. Square at the baseline, 4px rounded data end. */
+  function barRows(items) {
+    const max = Math.max(1, ...items.map((i) => i.value));
+    return h("div", { class: "reason-rows" }, items.map((i) => {
+      const bar = h("div", { class: `rbar ${i.cls || "neutral"}` });
+      bar.style.width = `${(i.value / max) * 100}%`;
+      return h("div", { class: "rrow" },
+        h("div", { class: "rlabel" }, bidi(i.label), i.hint ? h("span", { class: "hint" }, i.hint) : null),
+        h("div", { class: "rtrack" }, bar), h("strong", { class: "rcount" }, fmtNum(i.value)));
+    }));
+  }
+
+  // --------------------------------------------------------- branch picker
+  const DIGITS = "٠١٢٣٤٥٦٧٨٩";
+  /** Lower-case, no diacritics/tatweel, one spelling for alef/yaa/taa-marbuta, ASCII digits. */
+  function normAr(text) {
+    return String(text || "").toLowerCase()
+      .replace(/[\u0640\u064B-\u065F\u0670]/g, "")
+      .replace(/[أإآٱ]/g, "ا").replace(/ى/g, "ي").replace(/ة/g, "ه")
+      .replace(/[٠-٩]/g, (d) => String(DIGITS.indexOf(d))).replace(/[۰-۹]/g, (d) => String("۰۱۲۳۴۵۶۷۸۹".indexOf(d)));
+  }
+  const branchText = (b) => `${b.code} · ${b.name}`;
+  let pickerSeq = 0;
+
+  /** Search-as-you-type branch chooser. Optional: leave it empty for callers that are not branches. */
+  function branchPicker(branches) {
+    const index = branches.map((b) => ({ b, n: normAr(`${b.code} ${b.name} ${b.region}`), name: normAr(b.name) }));
+    const id = `bp${++pickerSeq}`;
+    const input = h("input", { type: "text", class: "bp-input", role: "combobox", autocomplete: "off", spellcheck: "false", dir: "ltr",
+      "aria-autocomplete": "list", "aria-expanded": "false", "aria-controls": `${id}-list`, "aria-label": "Branch the call came from",
+      placeholder: "Type the branch number or name — leave empty if not a branch" });
+    const list = h("ul", { class: "bp-list", id: `${id}-list`, role: "listbox", hidden: true });
+    const clearBtn = h("button", { type: "button", class: "bp-clear", "aria-label": "Clear branch", hidden: true, tabindex: "-1" }, "×");
+    const el = h("div", { class: "bp" }, input, clearBtn, list);
+    let selected = null, unchanged = false, matches = [], active = -1;
+
+    function search(query) {
+      const q = normAr(query).trim();
+      if (!q) return [];
+      const words = q.split(/\s+/), found = [];
+      for (const e of index) {
+        if (!words.every((w) => e.n.includes(w))) continue;
+        found.push([e.b.code === q ? 0 : e.b.code.startsWith(q) ? 1 : e.name.startsWith(q) ? 2 : 3, e.b]);
+      }
+      return found.sort((x, y) => x[0] - y[0]).slice(0, 50).map((x) => x[1]);
+    }
+    function close() { list.hidden = true; input.setAttribute("aria-expanded", "false"); input.removeAttribute("aria-activedescendant"); active = -1; }
+    function render() {
+      list.replaceChildren(...matches.map((b, i) => h("li", { id: `${id}-o${i}`, role: "option", "aria-selected": String(i === active), class: i === active ? "active" : "",
+        onmousedown: (ev) => { ev.preventDefault(); choose(b); } },
+        h("span", { class: "bp-main" }, h("strong", {}, b.code), " ", bidi(b.name)), h("span", { class: "hint" }, [b.region, b.type].filter(Boolean).join(" · ")))));
+      if (!matches.length) list.replaceChildren(h("li", { class: "bp-none", role: "presentation" }, "No branch matches. Leave it empty if the caller is not a branch."));
+      list.hidden = false; input.setAttribute("aria-expanded", "true");
+      if (active >= 0) { input.setAttribute("aria-activedescendant", `${id}-o${active}`); list.children[active].scrollIntoView({ block: "nearest" }); }
+    }
+    function choose(b) {
+      selected = b; unchanged = false; input.value = branchText(b); input.setAttribute("aria-invalid", "false");
+      clearBtn.hidden = false; close();
+    }
+    function clear() { selected = null; unchanged = false; input.value = ""; clearBtn.hidden = true; close(); input.removeAttribute("aria-invalid"); }
+
+    input.addEventListener("input", () => {
+      selected = null; unchanged = false; clearBtn.hidden = !input.value; input.removeAttribute("aria-invalid");
+      matches = search(input.value); active = matches.length ? 0 : -1;
+      input.value ? render() : close();
+    });
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+        if (!matches.length) return;
+        ev.preventDefault();
+        active = (active + (ev.key === "ArrowDown" ? 1 : -1) + matches.length) % matches.length;
+        render();
+      } else if (ev.key === "Enter" && !list.hidden && matches.length) {
+        ev.preventDefault(); choose(matches[Math.max(active, 0)]);
+      } else if (ev.key === "Escape" && !list.hidden) {
+        ev.preventDefault(); ev.stopPropagation(); close();
+      } else if (ev.key === "Tab" && !selected && input.value && matches.length) {
+        choose(matches[Math.max(active, 0)]);          // typed "100" then Tab: take the best match and move on
+      }
+    });
+    input.addEventListener("blur", () => close());
+    clearBtn.addEventListener("click", () => { clear(); input.focus(); });
+
+    return {
+      el, focus: () => input.focus(), clear,
+      /** Branch id to send: "" = none, undefined = leave a stored branch that is no longer in the list unchanged. */
+      value: () => (selected ? selected.id : unchanged ? undefined : ""),
+      /** Typed something but never picked it from the list. */
+      problem: () => (input.value.trim() && !selected && !unchanged
+        ? "Choose the branch from the list, or clear the field if the caller is not a branch." : ""),
+      markInvalid: () => input.setAttribute("aria-invalid", "true"),
+      setFromRecord(rec) {
+        if (!rec.branch) return clear();
+        const hit = branches.find((b) => b.code === rec.branch && b.name === rec.branch_name && b.region === rec.region);
+        if (hit) return choose(hit);
+        selected = null; unchanged = true; input.value = `${rec.branch} · ${rec.branch_name}`; clearBtn.hidden = false;   // branch was removed from the list
+      },
+    };
+  }
+
   // ---------------------------------------------------------- record editor
   const reasonName = (r) => r.label_ar || r.label_en || r.key;
   const bidi = (text) => h("span", { class: "bidi", dir: "auto" }, text);
@@ -195,7 +296,7 @@
   }
 
   /** Edit one call. ``reasons`` = list from /api/me. Resolves true if the record changed. */
-  function editRecord(rec, reasons) {
+  function editRecord(rec, reasons, branches) {
     const ip = h("input", { value: rec.ip_phone, inputmode: "numeric", maxlength: "10", autocomplete: "off", "aria-label": "IP phone" });
     const note = h("textarea", { rows: "3", maxlength: "300", "aria-label": "Note" });
     note.value = rec.note || "";
@@ -203,8 +304,11 @@
       h("input", { type: "radio", name: "reason", value: r.key, checked: r.key === rec.reason }),
       h("i", { class: `dot s-${r.status}` }),
       h("span", { class: "rl-text" }, bidi(reasonName(r)), h("span", { class: "hint" }, r.label_en))));
+    const picker = branchPicker(branches || []);
+    picker.setFromRecord(rec);
     const body = h("div", { class: "dlg-body" },
       h("label", { class: "field" }, "IP phone", ip),
+      h("div", { class: "field" }, h("span", {}, "Branch ", h("span", { class: "hint" }, "(only if the caller is a branch)")), picker.el),
       h("div", { class: "field" }, "Reason for the call", h("div", { class: "radio-list" }, radios)),
       h("label", { class: "field" }, "Note", note),
       h("p", { class: "hint" }, `${fmtDay(rec.date)} · ${hhmm(rec.time)}`, rec.name && rec.user_id ? [" · ", h("bdi", {}, rec.name)] : null));
@@ -212,7 +316,11 @@
       title: "Edit call", body, submitLabel: "Save changes",
       onSubmit: async () => {
         const reason = body.querySelector("input[name=reason]:checked");
-        await api("PUT", `/api/records/${encodeURIComponent(rec.id)}`, { ip_phone: ip.value, reason: reason && reason.value, note: note.value });
+        const problem = picker.problem();
+        if (problem) { picker.markInvalid(); throw new Error(problem); }
+        const payload = { ip_phone: ip.value, reason: reason && reason.value, note: note.value };
+        if (picker.value() !== undefined) payload.branch = picker.value();
+        await api("PUT", `/api/records/${encodeURIComponent(rec.id)}`, payload);
         toast("Changes saved");
         return true;
       },
@@ -384,6 +492,6 @@
   }
 
   window.CL = { h, $, svgEl, icon, api, csrf, toast, modal, confirmDialog, editRecord, deleteRecord, rowActions, statusChip,
-    reasonName, bidi, reasonBars, trimHours, drawChart, legend, chartWithToggle, fmtNum, hhmm, fmtDay, isoDate, addDays, parseISODate, pct, agoText,
+    reasonName, bidi, reasonBars, barRows, branchPicker, branchText, normAr, trimHours, drawChart, legend, chartWithToggle, fmtNum, hhmm, fmtDay, isoDate, addDays, parseISODate, pct, agoText,
     STATUSES, STATUS_NAMES };
 })();

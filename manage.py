@@ -9,6 +9,7 @@ Works while the server is running; it uses the same data folder and file locking
 import argparse
 import sys
 
+import bootstrap  # noqa: F401  (adds the 'libs' folder)
 from calllog import security
 from calllog.config import load_config
 from calllog.storage import StorageError, Store, iso_now, norm_uid, valid_uid

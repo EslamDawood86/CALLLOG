@@ -2,9 +2,9 @@
 /* Employee dashboard: log a call (IP phone + reason), see today's numbers, edit/delete own calls. */
 (function () {
   const { h, $, api, toast, icon, editRecord, deleteRecord, rowActions, statusChip, reasonName, trimHours, drawChart,
-    legend, chartWithToggle, bidi, reasonBars, fmtNum, hhmm, fmtDay, addDays, pct, STATUS_NAMES } = CL;
+    legend, chartWithToggle, bidi, reasonBars, branchPicker, fmtNum, hhmm, fmtDay, addDays, pct, STATUS_NAMES } = CL;
 
-  const state = { me: null, reasons: [], today: "", day: "", data: null, saving: false, dialogOpen: false };
+  const state = { me: null, reasons: [], branches: [], picker: null, today: "", day: "", data: null, saving: false, dialogOpen: false };
   const ARABIC_DIGITS = "٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹";
 
   const el = {
@@ -53,12 +53,16 @@
   function renderRecords(flashId) {
     const { records, date } = state.data;
     const q = el.search.value.trim().toLowerCase();
-    const rows = records.filter((r) => !q || r.ip_phone.includes(q) || (r.note || "").toLowerCase().includes(q));
+    const rows = records.filter((r) => !q || r.ip_phone.includes(q) || (r.note || "").toLowerCase().includes(q)
+      || r.branch.includes(q) || r.branch_name.includes(q));
     $("#recordsTitle").textContent = date === state.today ? "Today's calls" : `Calls on ${fmtDay(date)}`;
     el.body.replaceChildren(...rows.map((r) => {
       const tr = h("tr", { class: r.id === flashId ? "flash" : "" },
         h("td", { class: "nowrap" }, hhmm(r.time), h("span", { class: "hint" }, r.time.slice(5))),
         h("td", { class: "ip" }, r.ip_phone),
+        h("td", { class: "branch-cell" }, r.branch
+          ? [h("strong", {}, r.branch), bidi(r.branch_name), h("div", { class: "hint" }, r.region)]
+          : h("span", { class: "branch-none" }, "—")),
         h("td", {}, bidi(r.reason_ar), h("div", { class: "hint" }, r.reason_en)),
         h("td", {}, statusChip(r.status, r.status_label)),
         h("td", { class: "note" }, bidi(r.note || ""), r.edited ? h("span", { class: "edited-mark", title: `Edited ${r.updated_at}` }, "edited") : null),
@@ -98,6 +102,12 @@
   async function loadDay(flashId, quiet) {
     try {
       const data = await api("GET", `/api/records?date=${state.day}`);
+      if (data.today !== state.today) {          // midnight passed while the page stayed open
+        const followToday = state.day === state.today;
+        state.today = data.today;
+        if (followToday) { state.day = data.today; renderDateNav(); loadDay(); return; }
+        renderDateNav();
+      }
       const changed = JSON.stringify(data.records) !== JSON.stringify(state.data && state.data.records);
       state.data = data;
       if (changed || !quiet) { renderStats(); renderRecords(flashId); }
@@ -133,12 +143,17 @@
       return;
     }
     showIpError("");
+    const branchProblem = state.picker.problem();
+    $("#branchHelp").textContent = branchProblem;
+    $("#branchHelp").hidden = !branchProblem;
+    if (branchProblem) { state.picker.markInvalid(); state.picker.focus(); return; }
     state.saving = true;
     el.reasons.querySelectorAll("button").forEach((b) => (b.disabled = true));
     try {
-      const { record } = await api("POST", "/api/records", { ip_phone: ip, reason: reasonKey, note: el.note.value });
+      const { record } = await api("POST", "/api/records", { ip_phone: ip, reason: reasonKey, note: el.note.value, branch: state.picker.value() });
       el.ip.value = "";
       el.note.value = "";
+      state.picker.clear();
       toast(`Saved · ${record.ip_phone} · ${record.reason_en}`);
       await loadDay(record.id);
     } catch (e) {
@@ -152,7 +167,7 @@
 
   async function edit(rec) {
     state.dialogOpen = true;
-    const changed = await editRecord(rec, state.reasons);
+    const changed = await editRecord(rec, state.reasons, state.branches);
     state.dialogOpen = false;
     if (changed) loadDay(rec.id);
   }
@@ -176,6 +191,13 @@
       return;
     }
     state.reasons = state.me.reasons;
+    try {
+      state.branches = (await api("GET", "/api/branches")).branches;
+    } catch (e) {
+      toast("The branch list could not be loaded: " + e.message, "error");
+    }
+    state.picker = branchPicker(state.branches);
+    $("#branchHost").append(state.picker.el);
     state.today = state.day = state.me.today;
     renderProfile();
     renderReasons();
@@ -187,10 +209,9 @@
       if (el.ip.value) showIpError("");
     });
     el.ip.addEventListener("keydown", (ev) => {
-      if (ev.key === "Enter") {          // Enter jumps to the first reason so the whole flow works from the keyboard
+      if (ev.key === "Enter") {          // Enter moves on to the branch box, so the whole flow works from the keyboard
         ev.preventDefault();
-        const first = el.reasons.querySelector("button");
-        if (first) first.focus();
+        state.picker.focus();
       }
     });
     $("#prevDay").addEventListener("click", () => goDay(addDays(state.day, -1)));
@@ -202,20 +223,10 @@
 
     await loadDay();
     // Pick up changes made elsewhere (e.g. an administrator corrected a record) and roll over at midnight.
-    setInterval(async () => {
+    setInterval(() => {
       if (document.hidden || state.dialogOpen || state.saving) return;
-      try {
-        const { today } = await api("GET", "/api/me");
-        if (today !== state.today) {
-          const followToday = state.day === state.today;
-          state.today = today;
-          if (followToday) state.day = today;
-          renderDateNav();
-          renderProfile();
-        }
-      } catch (e) { /* the next tick retries */ }
       loadDay(undefined, true);
-    }, 15000);
+    }, 20000);
   }
   init();
 })();

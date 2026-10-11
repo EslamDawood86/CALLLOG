@@ -17,6 +17,7 @@
   --btn-hover: #00553e;
   --accent-text: #006a4e;
   --good: #0ca30c;
+  --neutral-bar: #6c7a89;
   --danger: #d03b3b;
   --danger-text: #b42f2f;
   --ok-text: #006300;
@@ -44,6 +45,7 @@
     --btn: #0b7d5a;
     --btn-hover: #12946a;
     --accent-text: #4fd1a1;
+    --neutral-bar: #8a98a8;
     --danger: #e66767;
     --danger-text: #ee8a8a;
     --ok-text: #0ca30c;
@@ -271,6 +273,7 @@ textarea { width: 100%; resize: vertical; }
 .rbar.s-transferred { background: var(--series-2); }
 .rbar.s-ticket_inquiry { background: var(--series-3); }
 .rbar.s-other { background: var(--muted); }
+.rbar.neutral { background: var(--neutral-bar); }
 .rcount { text-align: end; font-variant-numeric: tabular-nums; }
 
 /* ---------- tables ---------- */
@@ -351,6 +354,7 @@ tr.flash td { animation: flash 1.8s ease-out; }
 
 /* ---------- dialogs & toast ---------- */
 dialog.dlg {
+  overflow: visible;          /* the branch drop-down may extend past the dialog */
   border: 1px solid var(--axis); border-radius: 14px; padding: 0; background: var(--surface); color: var(--ink);
   width: min(460px, calc(100vw - 24px)); box-shadow: 0 18px 50px rgba(0, 0, 0, 0.3);
 }
@@ -379,3 +383,32 @@ dialog.dlg::backdrop { background: rgba(0, 0, 0, 0.45); }
   .live.ok .live-dot, tr.flash td { animation: none; }
   .reason-btn:active:not([disabled]) { transform: none; }
 }
+
+/* ---------- branch picker (search-as-you-type drop-down) ---------- */
+.bp { position: relative; }
+.bp-input { width: 100%; padding-inline-end: 34px; }
+.bp-input[aria-invalid="true"] { border-color: var(--danger); }
+.bp-clear {
+  position: absolute; inset-inline-end: 6px; top: 50%; transform: translateY(-50%); border: 0; background: none;
+  color: var(--ink-2); font-size: 1.3rem; line-height: 1; cursor: pointer; padding: 2px 8px; border-radius: 6px;
+}
+.bp-clear:hover { background: var(--wash); color: var(--ink); }
+.bp-list {
+  position: absolute; z-index: 40; inset-inline: 0; top: calc(100% + 4px); margin: 0; padding: 4px; list-style: none;
+  max-height: 300px; overflow-y: auto; background: var(--surface); border: 1px solid var(--axis);
+  border-radius: 10px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.22);
+}
+.bp-list li { display: grid; padding: 7px 10px; border-radius: 7px; cursor: pointer; line-height: 1.3; }
+.bp-list li.active, .bp-list li:hover { background: var(--wash); }
+.bp-list li[aria-selected="true"] { outline: 2px solid var(--btn); outline-offset: -2px; }
+.bp-list .bp-main strong { font-variant-numeric: tabular-nums; margin-inline-end: 4px; }
+.bp-list .hint { font-size: 0.8rem; }
+.bp-list li.bp-none { cursor: default; color: var(--ink-2); }
+.branch-cell strong { font-variant-numeric: tabular-nums; margin-inline-end: 6px; }
+.branch-none { color: var(--muted); }
+.card-head.spaced { margin-top: 20px; }
+.top-list { list-style: none; margin: 0; padding: 0; display: grid; }
+.top-list li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0 12px; padding: 7px 0; border-bottom: 1px solid var(--hair); }
+.top-list li:last-child { border-bottom: 0; }
+.top-list .hint { font-size: 0.8rem; }
+.top-list strong { align-self: center; font-variant-numeric: tabular-nums; grid-row: 1 / span 2; grid-column: 2; }
