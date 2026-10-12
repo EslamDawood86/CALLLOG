@@ -304,8 +304,8 @@ place for users, passwords and machine-specific values**. Same shape as the sett
 
 ```json
 {
-  "sla":   {"username": "239582", "password": "...", "base_url": "https://nbesrv.nbe.ahly.bank"},
-  "itsm":  {"username": "239582", "password": "..."},
+  "sla":   {"username": "1001", "password": "...", "base_url": "https://nbesrv.nbe.ahly.bank"},
+  "itsm":  {"username": "1001", "password": "..."},
   "email": {"target_archive_name": "2026_Part3"},
   "data_dir": "data"
 }

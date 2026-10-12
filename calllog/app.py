@@ -1,4 +1,5 @@
 """Application factory."""
+import importlib.util
 import secrets
 from datetime import datetime, timedelta
 
@@ -7,6 +8,7 @@ from flask import Flask, g, jsonify, render_template, request, session
 from . import auth
 from .config import APP_DIR, load_config
 from .queries import ApiError, api_error_response
+from .ops.store import OpsStore
 from .security import generate_password, hash_password
 from .storage import StorageError, Store, iso_now
 
@@ -66,13 +68,22 @@ def create_app(overrides=None):
     store = Store(cfg["data_dir"])
     store.init()
     app.extensions["store"] = store
+    # Operations Hub files (snapshots, overrides, settings...) live in <data_dir>/ops, next to the Call Log data
+    app.extensions["ops"] = OpsStore(cfg["data_dir"]).init()
     app.extensions["throttles"] = auth.make_throttles()
     app.config["INITIAL_ADMIN_PASSWORD"] = bootstrap_admin(store, app.config["CLOCK"])
 
     from . import api, exports, views
+    from .ops import api as ops_api, exports as ops_exports
     app.register_blueprint(views.bp)
     app.register_blueprint(api.bp, url_prefix="/api")
     app.register_blueprint(exports.bp, url_prefix="/export")
+    app.register_blueprint(ops_api.bp, url_prefix="/api/ops")
+    app.register_blueprint(ops_exports.bp, url_prefix="/export/ops")
+    # The Hub pages (/hub /my /email /sla /itsm /system) are a separate module; registered once it exists.
+    if importlib.util.find_spec("calllog.ops.views"):
+        from .ops import views as ops_views
+        app.register_blueprint(ops_views.bp)         # that module must expose `bp`
 
     @app.before_request
     def load_user_and_check_csrf():

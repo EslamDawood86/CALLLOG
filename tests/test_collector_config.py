@@ -18,11 +18,11 @@ def test_missing_file_is_empty(tmp_path):
 
 
 def test_accounts_and_overlay_without_secrets(tmp_path):
-    p = write(tmp_path, {"_help": "x", "sla": {"username": "239582", "password": "s3cret", "warning_minutes": 45},
+    p = write(tmp_path, {"_help": "x", "sla": {"username": "1001", "password": "s3cret", "warning_minutes": 45},
                          "itsm": {"username": "u2", "password": "p2"}, "email": {"target_archive_name": "2026_Part3"}})
     cc = collector_config.load(p)
-    assert cc.username("sla") == "239582" and cc.file_password("sla") == "s3cret"
-    assert cc.overlay()["sla"] == {"username": "239582", "warning_minutes": 45}
+    assert cc.username("sla") == "1001" and cc.file_password("sla") == "s3cret"
+    assert cc.overlay()["sla"] == {"username": "1001", "warning_minutes": 45}
     assert "password" not in json.dumps(cc.overlay())
     assert cc.pinned_keys() == ["email.target_archive_name", "itsm.username", "sla.username", "sla.warning_minutes"]
 

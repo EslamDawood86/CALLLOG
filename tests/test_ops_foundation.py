@@ -155,8 +155,8 @@ def test_unknown_keys_survive_and_save_roundtrip(ops):
     assert settings.load(ops)["email"]["business_emails"] == ["a@nbe.com.eg"]
     with pytest.raises(settings.SettingsError):
         settings.save(ops, {"sla": {"timeout_seconds": 1}})
-    settings.patch(ops, {"sla": {"username": "239582"}})
-    assert settings.load(ops)["sla"]["username"] == "239582"
+    settings.patch(ops, {"sla": {"username": "1001"}})
+    assert settings.load(ops)["sla"]["username"] == "1001"
     assert settings.load(ops)["email"]["business_emails"] == ["a@nbe.com.eg"]
 
 

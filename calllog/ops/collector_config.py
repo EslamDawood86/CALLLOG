@@ -5,8 +5,8 @@ machine-specific value such as the Outlook archive name to scan. It has the same
 ``username`` / ``password`` inside ``sla`` and ``itsm``::
 
     {
-      "sla":   {"username": "239582", "password": "...", "base_url": "https://nbesrv.nbe.ahly.bank"},
-      "itsm":  {"username": "239582", "password": "..."},
+      "sla":   {"username": "1001", "password": "...", "base_url": "https://nbesrv.nbe.ahly.bank"},
+      "itsm":  {"username": "1001", "password": "..."},
       "email": {"target_archive_name": "2026_Part3"}
     }
 

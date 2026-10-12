@@ -10,6 +10,9 @@ import json
 from flask import Blueprint, current_app, g, jsonify, request
 
 from . import auth, branches as branch_list, overview as overview_data, stats
+from .ops import settings as hub_settings
+from .ops.overlay import normalize_email, valid_email
+from .ops.schemas import ALL_TEAMS_MARK
 from .queries import (ApiError, clean_ip_phone, clean_note, clean_reason,
                       decorate, filtered_raw, json_body, paginate, parse_day, parse_range,
                       reasons_by_key)
@@ -19,12 +22,15 @@ from .storage import (STATUSES, STATUS_LABELS, StorageError, iso_now, new_record
 
 bp = Blueprint("api", __name__)
 
-ROLES = ("user", "admin")
+ROLES = ("user", "manager", "admin")
+ROLE_ORDER = {"admin": 0, "manager": 1, "user": 2}
+MAX_SECURITY_NAME = 120
 
 
 def public_user(u):
     return {"user_id": u["user_id"], "name": u["name"], "department": u.get("department", ""),
-            "role": u["role"]}
+            "role": u["role"], "email": u.get("email", ""), "team": u.get("team", ""),
+            "security_name": u.get("security_name", "")}
 
 
 def admin_user_row(u):
@@ -114,7 +120,7 @@ def my_records():
 @auth.login_required
 def create_record():
     if g.user["role"] != "user":
-        raise ApiError("Administrator accounts do not log calls. Use an employee account.", 403)
+        raise ApiError("Administrator and manager accounts do not log calls. Use an employee account.", 403)
     body = json_body()
     ip_phone = clean_ip_phone(body.get("ip_phone"))
     reason = clean_reason(body.get("reason"))
@@ -244,11 +250,34 @@ def admin_records():
 @bp.get("/admin/users")
 @auth.admin_required
 def list_users():
-    users = sorted(auth.store().users().values(), key=lambda u: (u["role"] != "admin", u["name"]))
+    users = sorted(auth.store().users().values(), key=lambda u: (ROLE_ORDER.get(u["role"], 9), u["name"]))
     return jsonify(users=[admin_user_row(u) for u in users])
 
 
-def _clean_profile(body, partial=False):
+def _hub_teams():
+    return hub_settings.load(current_app.extensions["ops"])["email"]["teams"]
+
+
+def _clean_team(value, current=""):
+    """A team of the Hub settings, '__all__' or empty (= every team). A team that was removed from the settings
+    stays valid on an account that already has it, so editing the account never fails because of it."""
+    team = str(value or "").strip()
+    if len(team) > 80:
+        raise ApiError("Team is too long (max 80 characters).")
+    if team in ("", ALL_TEAMS_MARK) or team == current:
+        return team
+    if team not in _hub_teams():
+        raise ApiError("Choose a team from the list (or leave it empty for every team).")
+    return team
+
+
+def _email_in_use(email, users, own_uid=None):
+    return any(u.get("email") == email and uid != own_uid for uid, u in users.items())
+
+
+def _clean_profile(body, partial=False, current=None):
+    """Checked profile fields. ``current`` = the account being edited (its own e-mail may stay)."""
+    current = current or {}
     out = {}
     if not partial or "name" in body:
         name = str(body.get("name") or "").strip()
@@ -262,8 +291,20 @@ def _clean_profile(body, partial=False):
         out["department"] = dept
     if "role" in body:
         if body["role"] not in ROLES:
-            raise ApiError("Role must be 'user' or 'admin'.")
+            raise ApiError("Role must be 'user', 'manager' or 'admin'.")
         out["role"] = body["role"]
+    if "email" in body:
+        email = normalize_email(body["email"])
+        if email and (len(email) > 120 or not valid_email(email)):
+            raise ApiError("That e-mail address is not valid.")
+        out["email"] = email
+    if "team" in body:
+        out["team"] = _clean_team(body["team"], current.get("team", ""))
+    if "security_name" in body:
+        security_name = " ".join(str(body["security_name"] or "").split())
+        if len(security_name) > MAX_SECURITY_NAME:
+            raise ApiError(f"Security name is too long (max {MAX_SECURITY_NAME} characters).")
+        out["security_name"] = security_name
     return out
 
 
@@ -281,6 +322,8 @@ def create_user():
     if not valid_uid(uid):
         raise ApiError("User ID may use letters, digits, dot, dash and underscore (max 32).")
     profile = _clean_profile(body)
+    if profile.get("email") and _email_in_use(profile["email"], auth.store().users()):
+        raise ApiError("Another account already uses that e-mail address.", 409)
     password = str(body.get("password") or "")
     if password:
         problem = password_problem(password)
@@ -292,7 +335,9 @@ def create_user():
         user = auth.store().create_user(_new_user(uid, {"role": "user", **profile}, password))
     except StorageError as exc:
         raise ApiError(str(exc), 409)
-    auth.audit("user_created", target=uid, details={"name": user["name"], "role": user["role"]})
+    auth.audit("user_created", target=uid, details={
+        "name": user["name"], "role": user["role"],
+        **{k: user[k] for k in ("email", "team", "security_name") if user.get(k)}})
     return jsonify(user=admin_user_row(user), temp_password=password), 201
 
 
@@ -301,11 +346,13 @@ def create_user():
 def update_user(uid):
     uid = norm_uid(uid)
     body = json_body()
-    changes = _clean_profile(body, partial=True)
+    changes = _clean_profile(body, partial=True, current=auth.store().get_user(uid))
     if "active" in body:
         changes["active"] = bool(body["active"])
 
     def guard(users, after):
+        if after.get("email") and _email_in_use(after["email"], users, uid):
+            raise ApiError("Another account already uses that e-mail address.", 409)
         if uid == g.user["user_id"] and (not after.get("active", True) or after["role"] != "admin"):
             raise ApiError("You cannot disable or demote your own account.", 409)
         if not any(u.get("active", True) and u["role"] == "admin"
@@ -350,6 +397,10 @@ _HEADER_ALIASES = {
     "name": {"name", "full name", "employee name", "employee"},
     "department": {"department", "dept", "section"},
     "password": {"password", "pwd"},
+    "role": {"role", "account type"},
+    "email": {"email", "e-mail", "mail", "email address"},
+    "team": {"team"},
+    "security_name": {"security_name", "security name", "security user"},
 }
 
 
@@ -390,31 +441,47 @@ def import_users():
                 break
     if "user_id" not in col or "name" not in col:
         raise ApiError("The first row must have column titles including 'user_id' and 'name' "
-                       "(optional: 'department', 'password').")
+                       "(optional: 'department', 'password', 'role', 'email', 'team', 'security_name').")
 
     def cell(row, field):
         i = col.get(field)
         return row[i].strip() if i is not None and i < len(row) else ""
 
     to_create, skipped, seen, credentials = [], [], set(), []
+    taken = {u["email"] for u in auth.store().users().values() if u.get("email")}
     for line_no, row in enumerate(rows[1:], start=2):
         uid = norm_uid(cell(row, "user_id").removesuffix(".0"))  # Excel numbers arrive as 230966.0
         name, dept, password = cell(row, "name"), cell(row, "department"), cell(row, "password")
-        problem = None
-        if not valid_uid(uid):
+        problem, extra = None, {}
+        try:
+            fields = {k: cell(row, k) for k in ("role", "email", "team", "security_name") if k in col}
+            if fields.get("role", "user") not in ("", "user", "manager"):
+                raise ApiError("Role must be 'user' or 'manager'")
+            extra = _clean_profile({k: v for k, v in fields.items() if k != "role" and v != ""}, partial=True)
+            if fields.get("role"):
+                extra["role"] = fields["role"]
+        except ApiError as exc:
+            problem = exc.message.rstrip(".")
+        if problem:
+            pass
+        elif not valid_uid(uid):
             problem = "Invalid User ID"
         elif not name or len(name) > 80 or len(dept) > 80:
             problem = "Missing or too-long name/department"
         elif uid in seen:
             problem = "Duplicate User ID in the file"
+        elif extra.get("email") in taken:
+            problem = "E-mail address already used by another account"
         elif password and password_problem(password):
             problem = password_problem(password)
         if problem:
             skipped.append({"row": line_no, "user_id": uid, "reason": problem})
             continue
         seen.add(uid)
+        if extra.get("email"):
+            taken.add(extra["email"])
         password = password or generate_password()
-        to_create.append(_new_user(uid, {"name": name, "department": dept}, password))
+        to_create.append(_new_user(uid, {"name": name, "department": dept, **extra}, password))
         credentials.append({"user_id": uid, "name": name, "password": password})
 
     created, existing = auth.store().create_users(to_create)
