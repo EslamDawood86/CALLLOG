@@ -40,6 +40,7 @@ class JobResult:
     snapshot_date: str = None         # YYYY-MM-DD the data is about (default: today)
     summary: str = ""                 # one line for the System page, e.g. "31 open, 4 breached"
     error: str = None
+    error_kind: str = None            # "auth" = wrong/expired password: the runner stops retrying (account lock-out protection)
     emails_sent: int = 0
     history_point: dict = None        # appended to ops/history/<module>/<day>.json
     history_extra: dict = None        # merged into that day document

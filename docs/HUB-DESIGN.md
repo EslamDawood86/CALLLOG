@@ -373,3 +373,35 @@ What keeps it cheap, and what every endpoint must respect:
 * Targets on the reference demo data (500 e-mail rows, 300 SLA requests): `?since=` unchanged < 5 ms, full e-mail answer p95 < 150 ms,
   `/my` p95 < 100 ms, `/shared` < 20 ms, with 60 simulated users and an extra 5 ms delay on every file operation. `tools/loadtest_hub.py`
   measures this and its result is quoted in the README.
+
+## 15. Running 24/7
+
+The web server and the collector are expected to run all day, every day, for months, and to survive reboots, Outlook crashes and
+network hiccups without anybody touching them.
+
+**Web server (`run.py --service`)** - already supervised by Task Scheduler + its own restart loop. Additionally: bounded caches only,
+`server.log` rotation, a public `GET /healthz` (no sign-in; JSON `{ok, time, collectors: {job: online}}`, nothing else) that an
+existing monitoring tool can poll, and a daily housekeeping step (below).
+
+**Collector (`collector.py --service`)** - same pattern as `run.py --service`: a small supervisor that restarts the runner if it dies and keeps
+the Startup-folder / Task Scheduler entry. Outlook COM and the SSO browser need an interactive Windows session: the collector PC must
+stay logged in (a locked screen is fine) - say so in the README.
+
+Rules for 24/7 safety:
+
+* **Jobs run in child processes** (`collector.py --run-job <job>` started by the runner, result handed back as a JSON file) with a hard
+  timeout per job (email 20 min, email_report 30 min, sla 5 min, itsm 10 min, settings can lower them) and a kill of the whole process tree
+  (Outlook scan, Chrome, Playwright) on timeout. A hung COM call or a leaking browser can therefore never freeze the collector or grow
+  memory for days.
+* **Never hammer a login.** A wrong or expired password (`JobResult.error_kind == "auth"`) stops the scheduled runs of that job until
+  the credential changes (collector_config.json mtime / password source changed) or an admin presses *Run now*; the System page and Home show
+  "login failed - fix the password, retries paused". This protects the SSO account from a lock-out.
+* **Back-off**: after repeated failures the retry interval grows (1x, 2x, 4x ... capped at 30 min) and resets on success; the heartbeat says so.
+* **Heartbeat stamps carry epoch seconds** (`updated_ts`) next to the local ISO time, and online / stale decisions use the epoch, so daylight-saving
+  changes (Egypt uses DST) and small clock differences between the PCs (tolerance 2 minutes) cannot make a collector look offline.
+* **Housekeeping once a day** (runner, outside business hours): prune history (60 days), events (30), reports (60 days / 30 copies), debug dumps (7),
+  job logs (rotation), stale run requests (> 1 day), and write the result to the job log. Nothing under `records/` or `logs/audit-*` is touched.
+* **Midnight / weekend**: scans outside the active window are skipped but the heartbeat keeps ticking, so "online" stays true and the pages show
+  "Outside working hours - showing the last scan from <time>" instead of an alarm. Settings can make the schedule all-day (`active_hours: ""`, every
+  `work_days`) for real 24/7 scanning.
+* Writes are atomic and locked, readers tolerate a half-finished copy (retry once) - a network share hiccup must never crash a page or a job.
