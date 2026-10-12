@@ -168,3 +168,65 @@ def test_schedule_rules():
     assert not settings.is_active(s, "email", dt.datetime(2026, 10, 9, 9, 30))      # Friday
     assert not settings.is_active(s, "email", dt.datetime(2026, 10, 14, 9, 30))     # holiday
     assert settings.is_active(s, "sla", sunday) and not settings.is_active(s, "sla", dt.datetime(2026, 10, 11, 12, 0))
+
+
+def test_classification_settings():
+    clean, errors = settings.validate({"email": {"classification": {
+        "system_team_map": {"Swift Alliance": "Third Party", "فليكس": "Flex Cube"},
+        "address_team_map": {"MFA_Team@NBE.com.eg": "MFA Team"},
+        "unclassified_team": "Open System", "extra_no_action_keywords": ["تم الاستلام", "fyi"]}}})
+    assert errors == []
+    cls = clean["email"]["classification"]
+    assert cls["address_team_map"] == {"mfa_team@nbe.com.eg": "MFA Team"}
+    assert cls["system_team_map"]["Swift Alliance"] == "Third Party" and cls["unclassified_team"] == "Open System"
+    _, errors = settings.validate({"email": {"classification": {
+        "system_team_map": {"X": "No Such Team"}, "unclassified_team": "Nope", "address_team_map": {"bad": "MFA Team"}}}})
+    assert {e["path"] for e in errors} >= {"email.classification.system_team_map.X",
+                                           "email.classification.unclassified_team",
+                                           "email.classification.address_team_map.bad"}
+
+
+# --------------------------------------------------------------------------- events
+def _sla_snap(statuses, ts="2026-10-11T09:15:00"):
+    reqs = [{"key": k, "status": s, "security_user": "u-" + k} for k, s in statuses.items()]
+    return {"generated_at": ts, "data": {"thresholds": {"breach_minutes": 120}, "requests": reqs}}
+
+
+def test_sla_events_are_aggregated():
+    from calllog.ops import events
+    old = _sla_snap({"a": "within", "b": "reminder", "c": "breached", "d": "within"})
+    new = _sla_snap({"a": "reminder", "b": "breached", "c": "breached", "e": "within"}, "2026-10-11T09:30:00")
+    kinds = {e["kind"]: e for e in events.diff_events("sla", old, new)}
+    assert kinds["sla_breached"]["count"] == 1 and kinds["sla_breached"]["level"] == "danger"
+    assert kinds["sla_reminder"]["count"] == 1 and kinds["sla_closed"]["count"] == 1   # d completed
+    assert events.diff_events("sla", None, new) == []                                    # first scan: nothing to compare
+
+
+def test_itsm_and_email_events():
+    from calllog.ops import events
+    new = {"generated_at": "2026-10-11T10:00:00", "data": {"changes": {
+        "new": [{"role": "R", "category": "Rollback Requests", "number": "1", "summary": "s"}],
+        "closed": [{"role": "R", "category": "Implementation Requests", "number": "2", "summary": "t"}]}}}
+    evs = events.diff_events("itsm", None, new)
+    assert [(e["kind"], e["level"]) for e in evs] == [("itsm_new", "warn"), ("itsm_closed", "ok")]
+    old = {"data": {"rows": [{"message_id": "m1", "status": "Pending Reply", "escalated": False}]}}
+    cur = {"generated_at": "2026-10-11T10:05:00", "data": {"rows": [
+        {"message_id": "m1", "status": "Pending Reply", "escalated": True, "subject": "S", "team": "Flex Cube"},
+        {"message_id": "m2", "status": "Replied", "escalated": False}]}}
+    assert [e["kind"] for e in events.diff_events("email", old, cur)] == ["email_escalated"]
+
+
+def test_job_events_only_on_transitions():
+    from calllog.ops import events
+    assert events.job_event("sla", "2026-10-11T09:00:00", False, True, "boom")["kind"] == "scan_failed"
+    assert events.job_event("sla", "2026-10-11T09:01:00", False, False, "boom") is None
+    assert events.job_event("sla", "2026-10-11T09:02:00", True, False)["kind"] == "scan_recovered"
+    assert events.job_event("sla", "2026-10-11T09:03:00", True, True) is None
+
+
+def test_event_store_roundtrip(ops):
+    ops.add_events([{"ts": "2026-10-11T09:00:00", "text": "a"}, {"ts": "2026-10-11T10:00:00", "text": "b"},
+                    {"ts": "2026-10-12T08:00:00", "text": "c"}, {"ts": "garbage", "text": "x"}])
+    assert [e["text"] for e in ops.read_events("2026-10-11")] == ["b", "a"]
+    assert [e["text"] for e in ops.read_events("2026-10-12")] == ["c"]
+    assert ops.read_events("2026-10-13") == []

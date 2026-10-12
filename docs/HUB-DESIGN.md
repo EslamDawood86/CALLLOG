@@ -58,16 +58,33 @@ Engines and `store.py` must **import on Linux/macOS without Outlook, Chrome, pyw
 pandas installed** (import those lazily inside the functions that need them). This is what makes them
 testable here. Do not add pandas to the project.
 
-## 3. Roles
+## 3. Roles and the two dashboards
 
-| role | who | can |
+| role | home page | can |
 |---|---|---|
-| `admin` | existing | everything: settings, collectors, users, all modules, all teams |
-| `manager` | new | sees Home/Email/SLA/ITSM/Calls dashboards, acts on e-mails (assign, no-action, team, quality) for **their team** (`user.team`; empty or `__all__` = all teams); cannot change settings/users; cannot log calls |
-| `user` | existing employee | logs calls exactly as today. May see "My e-mails" (e-mails assigned to `user.email`) |
+| `admin` | `/hub` **Admin dashboard** | everything: all modules, all teams, settings, collectors, users, audit, "view as employee" |
+| `manager` | `/hub` | sees the same dashboards, acts on e-mails (assign, no-action, team, quality, classification rules) for **their team** (`user.team`; empty or `__all__` = all teams); no settings, no user management; cannot log calls |
+| `user` (employee) | `/my` **My work** | logs calls as today (`/dashboard`), and sees *everything that is theirs* under their own user (section 3.2) plus the shared team strip |
 
-User profile gets two optional fields: `email` (lower-case; links the account to the mailbox that
-replies / gets assignments) and `team` (one of the team names or `__all__`).
+User profile fields (all optional): `email` (their mailbox, lower-case; links replies and assignments to the account),
+`team` (a team name or `__all__`), `security_name` (their name exactly as in the portal's "مستخدم السرية" column; links
+SLA requests to the account).
+
+### 3.1 Shared information (same numbers for admin, manager and employee)
+`GET /api/ops/shared` returns **counts only, never subjects, customers or names**: calls today (team total), e-mails
+(business / replied / pending / reply rate / SLA breached), security requests (open / reminder / breached), ITSM
+(per category totals), collector freshness (online, last update). The same "Team status" strip component renders it on
+the Admin dashboard and on My work, so both always agree.
+
+### 3.2 My work (`/my`, employee; admin/manager may open it for anyone with `?as=<user_id>`, read-only)
+`GET /api/ops/my[?as=uid]` returns the signed-in user's own data:
+* **calls**: today / yesterday / last 7 days totals, split by status, calls per hour today (from the existing call storage);
+* **e-mails**: assigned to my `email` (pending / done, waiting time), e-mails I replied to today (count, average first-reply
+  minutes, SLA met / breached), my quality reviews and appeals;
+* **security requests**: SLA requests whose `security_user` equals my `security_name` (status, age) - empty state when no
+  `security_name` is set on the account;
+* **shared**: the section 3.1 strip.
+An employee never receives anybody else's rows.
 
 ## 4. Data layout (inside `data_dir`, i.e. the shared folder)
 
@@ -80,6 +97,7 @@ ops/overrides/email/team.json           { message_id: {team, marked_by, marked_a
 ops/overrides/email/assignments.json    { message_id: {assigned_to_email, assigned_to_name, note, marked_by, marked_at, subject, notified} }
 ops/overrides/email/quality.json        { message_id: {rating, note, reasons, replied_by, replied_by_email, reviewed_by, reviewed_at, appeal, appeal_by, appeal_at, appeal_decision, decided_by, decided_at, rating_withdrawn, subject} }
 ops/state/<module>.json                 engine-private state (alert de-duplication, last sent, ...)
+ops/events/<YYYY-MM-DD>.jsonl           timeline events (section 5.4): one line per event, written by the runner
 ops/jobs/heartbeat/<job>.json           collector heartbeat (section 6)
 ops/jobs/requests/<job>-<stamp>-<rand>.json   "Run now" requests written by the web app
 ops/jobs/logs/<job>.log                 rolling text log (tail shown in System > Logs), rotated at ~1 MB
@@ -200,6 +218,20 @@ manager dashboard used. Row keys are stable; unknown extra keys are allowed (UI 
 ```
 History point (`ops/history/email/<day>.json`): `{"points":[{"ts","business_emails","replied","pending","no_action_needed","sla_breached","escalated"}], "final": {...stats subset...}}`.
 
+### 5.4 Timeline events (`calllog/ops/events.py`, already written)
+After each good scan the runner calls `events.diff_events(module, old_snapshot, new_snapshot)`; a failing / recovering scan
+adds `events.job_event(...)`; all go to `store.add_events`. Event: `{ts, module, level: danger|warn|info|ok, kind, text, count?, items?}`.
+Home shows "Today" from `GET /api/ops/events?day=`; admin/manager only (items may contain subjects).
+
+### 5.5 E-mail classification settings ("Unclassified")
+`settings.email.classification` (see `settings.py`) makes the unclassified bucket adjustable without touching code:
+`system_team_map` (keyword/application -> team, wins over the built-in map), `address_team_map` (business mailbox the mail
+was sent TO -> team; generalises the legacy MFA-address rule), `unclassified_team` (where mails with no detected team go
+instead of "Unclassified"), `extra_no_action_keywords`. The Email page has an **Unclassified** panel (rows with team
+"Unclassified", their detected words) with *Assign team* (one mail, an override) and *Create rule* (keyword -> team, saved into
+`system_team_map` through `POST /api/ops/email/classification/rule`, admin or a manager for their own team, audited).
+The System > Settings page has a Classification editor for the same keys.
+
 ## 6. Collector and jobs
 
 `python collector.py` runs a loop (see `calllog/ops/runner.py`). Jobs:
@@ -235,7 +267,10 @@ Rules every job follows:
 | `GET /overview` | admin, manager | Home data: per-module headline numbers, `attention` list, collector health, calls today |
 | `GET /<module>?since=<generated_at>` | admin, manager | snapshot or `{"unchanged": true}`; adds `meta` (heartbeat, `online`, `stale`, `last_error`); email rows are team-scoped for managers and have overrides applied (`overlay.py`); the email answer also carries `options` = `{teams, quality_reasons, ratings, people: [{email, name, team}]}` |
 | `GET /<module>/history?days=14` | admin, manager | list of history days |
-| `GET /email/mine` | any signed-in | rows assigned to `user.email` |
+| `GET /shared` | any signed-in | section 3.1 numbers, counts only |
+| `GET /my[?as=uid]` | any signed-in (`as`: admin, manager) | section 3.2 |
+| `GET /events?day=` | admin, manager | timeline events, newest first |
+| `POST /email/classification/rule` `{keyword, team}` / `DELETE` | admin, manager (own team) | adds / removes a `system_team_map` entry |
 | `POST /email/assign` `{message_id, assigned_to_email, assigned_to_name, note}` | admin, manager | |
 | `POST /email/no-action` `{message_id}` / `DELETE` to undo | admin, manager | |
 | `POST /email/team` `{message_id, team}` | admin, manager | |
@@ -251,8 +286,8 @@ Every write action calls `auth.audit(...)` with an `ops_*` action name.
 
 ## 8. Pages
 
-`/hub` Home, `/calls` = existing admin dashboard (`/admin` stays), `/email`, `/sla`, `/itsm`, `/system`.
-After sign-in: `admin`/`manager` -> `/hub`; `user` -> `/dashboard` (unchanged). One shared top bar with module links
+`/hub` Admin dashboard (Home), `/my` My work (employee), `/calls` = existing admin dashboard (`/admin` stays), `/email`, `/sla`, `/itsm`, `/system`.
+After sign-in: `admin`/`manager` -> `/hub`; `user` -> `/my` (its top bar links to `/dashboard` for logging calls). One shared top bar with module links
 (`templates/_topbar.html`). Strict CSP stays (`script-src 'self'; style-src 'self'`): **no inline scripts or
 style attributes**; everything from `static/*.js|css`. All scraped / e-mail text is inserted with
 `textContent`. Arabic text uses `dir="auto"`. Same visual language as the Call Log (`app.css` tokens).

@@ -31,6 +31,12 @@ DEFAULTS = {
         "sla_target_minutes": 60,
         "backlog_lookback_days": 1,             # unanswered mails from previous days that are still shown
         "history_keep_days": 30,
+        "classification": {                     # how e-mails are sent to a team; tune it when too many land in "Unclassified"
+            "system_team_map": {},              # keyword / application name -> team (added to the built-in map, wins over it)
+            "address_team_map": {},             # business mailbox the mail was sent TO -> team
+            "unclassified_team": "",            # mails with no detected team go here instead of "Unclassified" ("" = keep)
+            "extra_no_action_keywords": [],     # extra phrases (Arabic or English) that mean "no reply needed"
+        },
         "outlook_connect_retries": 5,
         "outlook_connect_retry_seconds": 15,
         "report": {                             # the old daily run
@@ -120,7 +126,7 @@ def deep_merge(base, over):
 
 # dict-valued settings whose KEYS are data (teams, names), so a saved dict must replace the default, not merge into it
 _FREE_DICTS = {"team_members_by_team", "team_link_groups", "team_recipients", "owner_emails", "categories",
-               "selectors", "advanced"}
+               "selectors", "advanced", "system_team_map", "address_team_map"}
 
 
 # --------------------------------------------------------------- field checkers
@@ -288,6 +294,21 @@ def _regex(ctx, path, v):
     return v
 
 
+def _addr_map(ctx, path, v):
+    """business mailbox -> team; the mailbox is lower-cased and must be an address."""
+    if v is None:
+        return {}
+    if not isinstance(v, dict):
+        ctx.err(path, "must be an object")
+        return {}
+    out = {}
+    for k, team in v.items():
+        addr = _email_one(ctx, f"{path}.{k}", k)
+        if addr:
+            out[addr] = _str(80, allow_empty=False)(ctx, f"{path}.{k}", team)
+    return out
+
+
 def _recipients(ctx, path, v):
     if not isinstance(v, dict):
         ctx.err(path, "must be an object with to / cc")
@@ -321,6 +342,8 @@ FIELDS = {
         "ignored_sender_emails": _emails, "manager_emails": _emails, "teams": _strs(80),
         "sla_target_minutes": _int(1, 10080), "backlog_lookback_days": _int(0, 30), "history_keep_days": _int(1, 365),
         "outlook_connect_retries": _int(1, 20), "outlook_connect_retry_seconds": _int(1, 300),
+        "classification": {"system_team_map": _map(_str(80, allow_empty=False)), "address_team_map": _addr_map,
+                           "unclassified_team": _str(80), "extra_no_action_keywords": _strs(120)},
         "report": {"send": _bool, "send_times": _times, "to": _emails, "cc": _emails, "subject_prefix": _str(120),
                    "attach_excel": _bool, "attach_pending_msg": _bool, "max_pending_attachments": _int(1, 500),
                    "team_recipients": _map(_recipients)},
@@ -378,6 +401,14 @@ def validate(raw):
         ctx.err("sla.breach_minutes", "must be larger than warning_minutes")
     if clean["email"]["teams"] and "Unclassified" not in clean["email"]["teams"]:
         clean["email"]["teams"].append("Unclassified")
+    teams = clean["email"]["teams"]
+    cls = clean["email"]["classification"]
+    for name in ("system_team_map", "address_team_map"):
+        for key, team in cls[name].items():
+            if team not in teams:
+                ctx.err(f"email.classification.{name}.{key}", f"'{team}' is not one of the teams")
+    if cls["unclassified_team"] and cls["unclassified_team"] not in teams:
+        ctx.err("email.classification.unclassified_team", f"'{cls['unclassified_team']}' is not one of the teams")
     return clean, ctx.errors
 
 

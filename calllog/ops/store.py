@@ -40,6 +40,7 @@ class OpsStore:
         self.history_dir = self.root / "history"
         self.overrides_dir = self.root / "overrides" / "email"
         self.state_dir = self.root / "state"
+        self.events_dir = self.root / "events"
         self.jobs_dir = self.root / "jobs"
         self.heartbeat_dir = self.jobs_dir / "heartbeat"
         self.requests_dir = self.jobs_dir / "requests"
@@ -55,7 +56,7 @@ class OpsStore:
     # ------------------------------------------------------------------ setup
     def init(self):
         try:
-            for d in (self.snapshots_dir, self.history_dir, self.overrides_dir, self.state_dir, self.heartbeat_dir,
+            for d in (self.snapshots_dir, self.history_dir, self.overrides_dir, self.state_dir, self.events_dir, self.heartbeat_dir,
                       self.requests_dir, self.logs_dir, self.reports_dir, self.locks_dir):
                 d.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -238,6 +239,49 @@ class OpsStore:
 
     def delete_override(self, name, key):
         return self.update_override(name, key, lambda old: None)
+
+    # ----------------------------------------------------------------- events
+    def add_events(self, events):
+        """Append timeline events (see events.py) to ops/events/<day>.jsonl, one JSON object per line."""
+        by_day = {}
+        for ev in events:
+            by_day.setdefault(str(ev.get("ts", ""))[:10], []).append(ev)
+        for day, items in by_day.items():
+            if not schemas.is_iso_day(day):
+                continue
+            self.events_dir.mkdir(parents=True, exist_ok=True)
+            with self._lock("events")():
+                with open(self.events_dir / f"{day}.jsonl", "a", encoding="utf-8") as f:
+                    for ev in items:
+                        f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+
+    def read_events(self, day, limit=200):
+        """Newest first. A damaged line is skipped, never fatal."""
+        if not schemas.is_iso_day(day):
+            raise ValueError(f"bad day {day!r}")
+        out = []
+        try:
+            with open(self.events_dir / f"{day}.jsonl", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(ev, dict):
+                        out.append(ev)
+        except FileNotFoundError:
+            return []
+        out.sort(key=lambda e: str(e.get("ts", "")), reverse=True)
+        return out[:max(1, min(int(limit), 1000))]
+
+    def prune_events(self, keep_days=30):
+        try:
+            days = sorted(p.stem for p in self.events_dir.glob("*.jsonl") if schemas.is_iso_day(p.stem))
+        except OSError:
+            return
+        for day in days[:-keep_days] if keep_days else []:
+            with contextlib.suppress(OSError):
+                (self.events_dir / f"{day}.jsonl").unlink()
 
     # ------------------------------------------------------------------ state
     def read_state(self, name, default=None):
