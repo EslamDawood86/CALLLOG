@@ -14,7 +14,7 @@
   const JOBS = Object.entries(OPS.JOB_LABELS);
   const MODULE_NAMES = { email: "E-mail", sla: "Security requests", itsm: "ITSM", calls: "Calls" };
   const LEVEL_NAMES = { danger: "Critical", warn: "Warning", info: "For information", ok: "Good news" };
-  const state = { day: OPS.localNowIso().slice(0, 10), seen: {}, overview: null };
+  const state = { day: page.dataset.day || OPS.localNowIso().slice(0, 10), seen: {}, overview: null };     // the SERVER's day: this PC's clock may differ
   const strip = OPS.sharedStrip($("#hubStrip"), { poll: false, links: IS_ADMIN ? true : { calls: false, system: false } });
 
   // ------------------------------------------------------------------------------------------------ helpers
@@ -235,11 +235,6 @@
   }
 
   // ------------------------------------------------------------------------------------------------ loading
-  /** The timeline asks for the SERVER's day, which the overview tells; so it starts after the first overview (or its first failure). */
-  let timelineStarted = false;
-  function startTimeline() {
-    if (!timelineStarted) { timelineStarted = true; timeline.start(); }
-  }
   function showOverview(d) {
     state.overview = d;
     state.day = d.date || state.day;
@@ -251,12 +246,10 @@
     paint("cards", [d.calls, d.email, d.sla, d.itsm, d.shared.collector], () => renderCards(d));
     paint("teams", d.email, () => renderTeams(d));
     setLive(true, `Live · updated ${OPS.fmtClock(d.server_time, true)}`);
-    startTimeline();
   }
   function showError(e) {
     setLive(false, e.network ? "Offline · retrying…" : e.message);
     if (!state.overview && !e.network) toast(e.message, "error");
-    startTimeline();
   }
 
   const overview = OPS.loader({ url: "/api/ops/overview", interval: 15000, since: false, onData: showOverview, onError: showError });
@@ -271,4 +264,5 @@
   if (picker) picker.addEventListener("change", () => { if (picker.value) $("#viewAsForm").submit(); });
 
   overview.start();
+  timeline.start();
 })();

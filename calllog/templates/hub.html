@@ -2,7 +2,7 @@
 {% block title %}Home · NBE Operations Hub{% endblock %}
 {% block body %}
 {% include "_topbar.html" %}
-<main class="page op-page" id="hub-page" data-role="{{ current_user.role }}">
+<main class="page op-page" id="hub-page" data-role="{{ current_user.role }}" data-day="{{ today }}">
   <header class="op-head">
     <div class="op-head-title">
       <h1>Operations Hub</h1>

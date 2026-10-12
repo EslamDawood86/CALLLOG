@@ -6,18 +6,41 @@ snapshots pass ``schemas.validate_snapshot``, e-mail rows carry what the engine 
 """
 import json
 import re
+import sys
 from collections import Counter
 from datetime import datetime, timedelta
 
 import pytest
 
 from calllog import security
-from calllog.ops import demo, health, schemas
+from calllog.ops import health, schemas
 from calllog.ops import settings as hub_settings
 from calllog.ops.store import OpsStore
 from calllog.storage import Store
 
 NOW = datetime(2026, 10, 12, 11, 40, 0)
+
+
+class _LazyDemo:
+    """``calllog.ops.demo`` imported on first use and forgotten after this module's tests: an import at collection time would leave
+    ``calllog.ops.demo`` on the package for the whole session and hide a missing module from tests/test_legacy_import.py."""
+
+    def __getattr__(self, name):
+        if name.startswith("_") or name == "pytestmark":          # pytest probes every module attribute while collecting
+            raise AttributeError(name)
+        import calllog.ops.demo as module
+        return getattr(module, name)
+
+
+demo = _LazyDemo()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _forget_the_demo_module():
+    yield
+    import calllog.ops
+    sys.modules.pop("calllog.ops.demo", None)
+    calllog.ops.__dict__.pop("demo", None)
 
 
 @pytest.fixture

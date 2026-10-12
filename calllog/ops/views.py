@@ -48,7 +48,7 @@ def employees_for_picker():
 @bp.get("/hub")
 @page(*auth.OPS_ROLES)
 def hub():
-    return render_template("hub.html", employees=employees_for_picker())
+    return render_template("hub.html", employees=employees_for_picker(), today=auth.today())
 
 
 @bp.get("/calls")

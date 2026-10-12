@@ -219,14 +219,17 @@
       return h("span", {}, bidi(r.last_summary || "—"), r.last_duration_seconds != null ? h("span", { class: "hint" }, ` · took ${Math.round(r.last_duration_seconds)} s`) : null);
     }
 
+    let serverNow = "";
+    let waiting = new Set();                      // jobs with a "Run now" request the collector has not taken yet (read by the columns below)
     function jobsCard(d) {
-      const waiting = new Set((d.pending || []).map((p) => p.job));
+      waiting = new Set((d.pending || []).map((p) => p.job));
+      serverNow = d.server_time;
       const rows = Object.values(d.jobs);
       const columns = [
         { key: "job", label: "Job", render: (r) => h("div", {}, h("strong", {}, OPS.JOB_LABELS[r.job] || r.job), h("div", { class: "hint" }, (JOB_INFO[r.job] || {}).what || "")) },
         { key: "state", label: "State", nowrap: true, render: (r) => h("div", {}, OPS.jobChip(r), r.present && r.host ? h("div", { class: "hint" }, r.host) : null) },
-        { key: "last_ok_at", label: "Last OK", nowrap: true, render: (r) => when(r.last_ok_at, d.server_time) },
-        { key: "next_run_at", label: "Next run", nowrap: true, render: (r) => (r.enabled === false ? "—" : when(r.next_run_at, d.server_time)) },
+        { key: "last_ok_at", label: "Last OK", nowrap: true, render: (r) => when(r.last_ok_at, serverNow) },
+        { key: "next_run_at", label: "Next run", nowrap: true, render: (r) => (r.enabled === false ? "—" : when(r.next_run_at, serverNow)) },
         { key: "result", label: "Last result", render: resultCell },
         { key: "runs", label: "Runs", num: true, nowrap: true, render: (r) => (r.present ? `${fmtNum(r.runs_ok)} ok · ${fmtNum(r.runs_failed)} failed` : "—") },
         { key: "action", label: "", nowrap: true, render: (r) => (waiting.has(r.job)
@@ -265,15 +268,16 @@
     function accountsCard(d) {
       const accounts = ((d.collector_info || {}).accounts) || {};
       const names = { sla: "Security portal (SLA)", itsm: "ITSM" };
+      const SOURCES = { "collector_config.json": "the config file" };
       const rows = Object.entries(accounts).map(([kind, a]) => ({ kind, ...a }));
       if (!rows.length) {
         return OPS.card("Accounts", {}, h("p", { class: "muted" }, "No accounts reported yet."));
       }
       return OPS.card("Accounts", { hint: "the portals the collector signs in to" },
         h("div", { class: "table-wrap" }, h("table", { class: "data op-table" },
-          h("thead", {}, h("tr", {}, ["Account", "User name", "Password set", "From"].map((t) => h("th", { scope: "col" }, t)))),
+          h("thead", {}, h("tr", {}, ["Account", "User name", "Password set"].map((t) => h("th", { scope: "col" }, t)))),
           h("tbody", {}, rows.map((a) => h("tr", {}, h("td", {}, h("strong", {}, names[a.kind] || a.kind)), h("td", {}, a.username ? mono(a.username) : "—"),
-            h("td", {}, yesNo(!!a.has_password, "Yes", "No")), h("td", { class: "op-wrap" }, a.password_source || "—")))))),
+            h("td", {}, yesNo(!!a.has_password, "Yes", "No"), a.password_source ? h("div", { class: "hint op-wrap" }, `from ${SOURCES[a.password_source] || a.password_source}`) : null)))))),
         rows.some((a) => !a.has_password)
           ? h("p", { class: "op-note op-t-warn op-block" }, OPS.icon("alert"), "A job without a password fails at every run. Put it in collector_config.json on the collector PC, or run  python collector.py --set-password sla  (or itsm).")
           : null);
