@@ -99,6 +99,8 @@ def password():
 def dashboard():
     if g.user["role"] == "admin":
         return redirect(url_for("pages.admin"))
+    if g.user["role"] == "manager":      # managers do not log calls: their home is the dashboard
+        return redirect("/hub")
     return render_template("user.html")
 
 

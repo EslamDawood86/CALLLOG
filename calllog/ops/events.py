@@ -68,14 +68,19 @@ def _itsm_events(new, ts):
     return out
 
 
+def _row_key(row):
+    """One row per (mail, team): a mail sent to two teams has two rows with the same message_id."""
+    return row.get("row_id") or row.get("message_id") or row.get("entry_id")
+
+
 def _email_events(old, new, ts):
     if old is None:
         return []
     rows_new = new["data"].get("rows", [])
-    rows_old = {r.get("message_id") or r.get("entry_id"): r for r in old.get("data", {}).get("rows", [])}
+    rows_old = {_row_key(r): r for r in old.get("data", {}).get("rows", [])}
     out = []
     newly_escalated = [r for r in rows_new if r.get("escalated") and r.get("status") == schemas.EMAIL_PENDING
-                       and not rows_old.get(r.get("message_id") or r.get("entry_id"), {}).get("escalated")]
+                       and not rows_old.get(_row_key(r), {}).get("escalated")]
     if newly_escalated:
         out.append(_event(ts, "email", "danger", "email_escalated",
                           f"{_plural(len(newly_escalated), 'e-mail')} waiting past the SLA with no team reply",
