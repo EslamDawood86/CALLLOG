@@ -884,7 +884,7 @@ def build_report(ctx, cfg, included_emails, all_emails, now=None):
     rows = []
     for customer in customers:
         rows.extend(_rows_for_customer(cfg, customer, (by_conversation, by_root, by_subject), team_replies, ovr, now))
-    rows.sort(key=lambda r: (r["received_time"], r["row_id"]))
+    rows.sort(key=lambda r: (r["received_time"], r["message_id"]))        # stable: a split mail keeps its team order
     return rows, team_replies
 
 

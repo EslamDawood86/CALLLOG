@@ -465,6 +465,7 @@ _HINT_STOPWORDS = frozenset((
     "re", "fw", "fwd", "tr", "the", "and", "for", "with", "from", "this", "that", "please", "kindly", "request",
     "issue", "problem", "error", "urgent", "help", "need", "access", "user", "users", "new", "update", "reply", "mail",
     "email", "team", "dear", "all", "any", "not", "can", "could", "you", "your", "our", "has", "have", "was", "are",
+    "check", "regarding", "about", "working", "unable", "cannot", "fix", "open",
     "برجاء", "يرجى", "من", "في", "على", "الى", "إلى", "عن", "هذا", "هذه", "مع", "لو", "سمحت", "ممكن", "مشكلة", "طلب",
     "عاجل", "السادة", "تحية", "الفريق", "الخاص", "الخاصة", "بخصوص", "موضوع"))
 

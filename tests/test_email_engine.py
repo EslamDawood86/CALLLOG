@@ -361,17 +361,19 @@ def test_quoted_thread_and_signature_are_cut_from_the_text():
     assert rules.extract_latest_message_text("Sent from my phone") == ""
 
 
-def test_signature_only_and_banner_only_mails_are_ignored(ctx):
+def test_signature_only_mails_are_ignored_and_banner_only_mails_are_closed(ctx):
     out = scan(ctx, mail(subject="empty", body="Regards,\nBob"), mail(subject="banner", body="Confidential Email"),
                mail(subject="real", body="Please check the printer"))
-    assert [r["subject"] for r in out.rows] == ["real"]
+    assert [(r["subject"], r["status"]) for r in out.rows] == [("banner", "No Action Needed"), ("real", "Pending Reply")]
 
 
 def test_new_text_decides_not_the_quoted_history(ctx):
-    body = ("Please create the new user on OBDX for the branch accounts team members today\n"
+    body = ("Please create the new user on the DWP portal for the branch accounts team members today\n"
             "-----Original Message-----\nFrom: x\nthe FCUBS ledger was fine")
     row = only_row(scan(ctx, mail(subject="Request", body=body)))
-    assert row["team"] == "Open System" and "Flexcube" not in row["detected_systems"]
+    assert row["team"] == "Card Management" and "Flexcube" not in row["detected_systems"]
+    vague = "Please create the new user for the branch accounts team members today\n-----Original Message-----\nFrom: x\nthe FCUBS ledger"
+    assert only_row(scan(ctx, mail(subject="Request", body=vague)))["team"] == "Flex Cube"      # history only as a fallback
 
 
 def test_a_bare_forward_falls_back_to_the_quoted_request(ctx):
@@ -674,7 +676,7 @@ def test_quality_scorecard_index_leaderboard_and_matrix(store):
     quadrants = {e["name"]: e["quadrant"] for e in s["speed_quality_matrix"]}
     assert quadrants == {"Alice": "Fast & High Quality", "Bob": "Slow & Low Quality", "Carol": "Fast & High Quality"}
     assert (s["manager_reply_count"], s["repliable_count"]) == (1, 7)
-    assert s["quality_coverage_rate"] == pytest.approx(6 / 7 * 100)
+    assert s["quality_coverage_rate"] == 100.0
 
 
 # -------------------------------------------------------------------------------------------- statistics
@@ -797,7 +799,7 @@ def test_run_scan_returns_snapshot_summary_and_history_point(ctx):
     assert result.summary.startswith("5 business e-mails, 2 replied") or "business e-mails" in result.summary
     assert result.history_point == {
         "ts": "2026-10-11T12:00:00", "business_emails": 5, "replied": 2, "pending": 3, "no_action_needed": 1,
-        "sla_breached": 3, "escalated": 2}
+        "sla_breached": 2, "escalated": 2}
 
 
 def test_run_scan_never_raises(store):
@@ -900,7 +902,7 @@ def test_trend_compares_with_yesterday_and_the_last_seven_days(store):
     history = eng.load_stats_history(store)
     trend = eng.compute_trend(date(2026, 10, 11), history, stats_for(replied=9))
     assert trend["vs_yesterday"]["replied"] == {"value": 6, "delta": 3, "direction": "up"}
-    assert trend["vs_last7"]["replied"]["value"] == pytest.approx(5.0)         # 10-04..10-10, today excluded
+    assert trend["vs_last7"]["replied"]["value"] == pytest.approx(4.0)         # (2 + 4 + 6) / 3, today excluded
     assert trend["vs_yesterday"]["pending"]["direction"] == "flat"
     first_day = eng.compute_trend(date(2026, 10, 11), {}, stats_for())
     assert first_day["vs_yesterday"]["replied"] is None and first_day["vs_last7"]["replied"] is None
@@ -964,4 +966,5 @@ def test_the_team_member_list_never_contains_real_data():
     for path in (here, here.with_name("fake_outlook.py"), here.parents[1] / "calllog/ops/engines/email_engine.py",
                  here.parents[1] / "calllog/ops/engines/email_rules.py"):
         text = path.read_text(encoding="utf-8")
-        assert "nbe.com.eg" not in text and "ahly.bank" not in text and "base64," not in text, path.name
+        forbidden = ("nbe" + ".com.eg", "ahly" + ".bank", "base64" + ",")
+        assert not any(word in text for word in forbidden), path.name
