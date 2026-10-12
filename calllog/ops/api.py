@@ -6,8 +6,9 @@ classification rules), jobs ("Run now"), settings, reports, history, events and 
 
 Rules this file keeps:
 * the web app never talks to Outlook or the portals - it reads snapshots and writes override files;
-* an employee only ever gets numbers (``/shared``) and the rows that are theirs (``/my``);
-* a manager acts only on their own team's e-mails;
+* an employee only ever gets numbers (``/shared``), the rows that are theirs and the e-mails of their own teams
+  (``/my``) - never a mail of the "Unclassified" bucket unless it was handed to them by name;
+* a manager acts only on the e-mails of their own teams (an account can hold several teams);
 * every write is validated, answered as JSON and written to the audit log (``ops_*`` actions);
 * scraped / e-mail text is returned as data only - the pages show it with textContent.
 """
@@ -155,22 +156,68 @@ def _latest_override_stamp(ovr):
     return latest
 
 
-def email_view(snap, scope_team=None, ovr=None):
-    """The e-mail snapshot data with overrides applied, narrowed to a team and recounted.
+_CACHE_LIMIT = 96
+
+
+def _view_cache():
+    return current_app.extensions.setdefault("ops_view_cache", {})
+
+
+def _remember(cache, key, snap, value):
+    """Store ``value`` for ``key`` (the last item of a key is the 5-second bucket, so old entries can be dropped)."""
+    if len(cache) >= _CACHE_LIMIT:
+        for old in [k for k in cache if k[-1] != key[-1]]:
+            del cache[old]
+        if len(cache) >= _CACHE_LIMIT:
+            cache.clear()
+    cache[key] = (snap, value)
+
+
+def current_overrides():
+    """(override lists, their fingerprint) for a read-only request - read once per request."""
+    cached = g.get("_overrides")
+    if cached is None:
+        ovr = read_overrides()
+        cached = g._overrides = (ovr, overrides_rev(ovr))
+    return cached
+
+
+def overlaid_rows(snap, ovr=None, rev=None):
+    """All rows of the e-mail snapshot with the overrides applied (every team, shared by every scope below). Callers
+    must treat the list and its rows as read-only."""
+    if ovr is None:
+        ovr, rev = current_overrides()
+    rev = rev if rev is not None else overrides_rev(ovr)
+    now = auth.now()
+    key = ("rows", snap.get("generated_at"), rev, int(now.timestamp() // 5))
+    cache = _view_cache()
+    hit = cache.get(key)
+    if hit is not None and hit[0] is snap:                # same parsed file, not just the same timestamp
+        return hit[1]
+    rows = overlay.apply_overrides((snap.get("data") or {}).get("rows") or [], ovr, now)
+    _remember(cache, key, snap, rows)
+    return rows
+
+
+def email_view(snap, scope_team=None, ovr=None, hide_unclassified=False, rev=None):
+    """The e-mail snapshot data with overrides applied, narrowed to a scope (None = every team, else a team name or a
+    tuple of names) and recounted.
 
     Many pages ask for the same thing every few seconds, so the result is shared for a moment (and until the snapshot
     or an override changes). Callers must treat it as read-only."""
     ovr = ovr if ovr is not None else read_overrides()
+    rev = rev if rev is not None else overrides_rev(ovr)
+    scope = overlay.as_scope(scope_team)
     now = auth.now()
-    key = (snap.get("generated_at"), overrides_rev(ovr), scope_team, int(now.timestamp() // 5))
-    cache = current_app.extensions.setdefault("ops_view_cache", {})
+    key = ("view", snap.get("generated_at"), rev, overlay.scope_key(scope), bool(hide_unclassified),
+           int(now.timestamp() // 5))
+    cache = _view_cache()
     hit = cache.get(key)
-    if hit is not None and hit[0] is snap:                # same parsed file, not just the same timestamp
+    if hit is not None and hit[0] is snap:
         return hit[1]
-    view = overlay.view_email_data(snap.get("data") or {}, ovr, scope_team, now)
-    if len(cache) >= 12:
-        cache.clear()
-    cache[key] = (snap, view)
+    view = overlay.view_email_data(snap.get("data") or {}, ovr, scope, now,
+                                   rows=overlaid_rows(snap, ovr, rev), hide_unclassified=hide_unclassified)
+    _remember(cache, key, snap, view)
     return view
 
 
@@ -178,6 +225,23 @@ def current_email_view(scope_team=None):
     """(view or None, snapshot or None) for the latest e-mail snapshot."""
     snap, _ = read_snapshot("email")
     return (email_view(snap, scope_team) if snap else None), snap
+
+
+def team_mail(snap, scope, ovr=None, rev=None):
+    """(items, summary) of the e-mails of ``scope`` for the 'my team' list (see ``overlay.team_mail``), computed once
+    per snapshot version, overrides version and team set and shared by everybody with the same teams. Read-only."""
+    if ovr is None:
+        ovr, rev = current_overrides()
+    rev = rev if rev is not None else overrides_rev(ovr)
+    now = auth.now()
+    key = ("team_mail", snap.get("generated_at"), rev, overlay.scope_key(scope), int(now.timestamp() // 5))
+    cache = _view_cache()
+    hit = cache.get(key)
+    if hit is not None and hit[0] is snap:
+        return hit[1]
+    value = overlay.team_mail(overlaid_rows(snap, ovr, rev), scope)
+    _remember(cache, key, snap, value)
+    return value
 
 
 # ----------------------------------------------------------------------------- headline numbers
@@ -210,22 +274,40 @@ def _public_calls(totals):
     return {k: v for k, v in totals.items() if not k.startswith("_")}
 
 
-def build_shared():
+def shared_scope(user, viewer=None):
+    """The teams the 'Team status' strip counts e-mails of for ``user``: None = every team. When somebody else (a
+    manager) looks at another person's page, only what both of them may see."""
+    scope = overlay.scope_for_user(user)
+    if viewer is not None:
+        scope = overlay.intersect_scopes(scope, overlay.scope_for_user(viewer))
+    return scope
+
+
+def build_shared(user=None, viewer=None):
     """Section 3.1: counts only - never a subject, a customer or a name. The ONE function behind ``/shared``,
-    ``/my`` (its ``shared`` block) and Home, so every dashboard shows the same numbers."""
+    ``/my`` (its ``shared`` block) and Home, so every dashboard shows the same numbers for the same viewer.
+
+    Calls, security requests and ITSM are sector-wide counts. The e-mail numbers are scoped to the viewer: an
+    administrator (and a manager of every team) gets all rows, everybody else the rows of their own teams - an employee
+    never counts a mail of the "Unclassified" bucket. The block says so with ``scope`` ('all' | 'teams') and ``teams``."""
+    user = user if user is not None else g.user
+    scope = shared_scope(user, viewer)
+    hide = user.get("role") == "user"
     snaps = {m: read_snapshot(m) for m in schemas.MODULES}
     modules, updates = {}, []
-    ovr = read_overrides()
+    ovr, rev = current_overrides()
     for module in schemas.MODULES:
         snap, problem = snaps[module]
         meta = module_meta(module, snap, problem)
         block = {"available": bool(snap), "online": meta["online"], "stale": meta["stale"], "enabled": meta["enabled"],
                  "updated_at": meta["generated_at"], "date": meta["date"]}
+        if module == "email":
+            block.update(scope="all" if scope is None else "teams", teams=list(scope or ()))
         if snap:
             updates.append(snap["generated_at"])
             data = snap.get("data") or {}
             if module == "email":
-                block.update(email_headline(email_view(snap, None, ovr)["stats"]))
+                block.update(email_headline(email_view(snap, scope, ovr, hide, rev)["stats"]))
             elif module == "sla":
                 block.update(sla_headline(data))
             else:
@@ -287,18 +369,39 @@ def _my_email_row(row):
             "is_carryover": bool(row.get("is_carryover"))}
 
 
+def _team_summary(teams, all_teams=False):
+    return {"teams": list(teams), "all_teams": all_teams, "pending": 0, "replied": 0, "no_action": 0, "sla_breached": 0,
+            "escalated": 0, "reply_rate": 0.0, "listed": 0, "more": 0}
+
+
 def my_email(user, viewer=None):
+    """The e-mail part of /my: the mails that are the person's by name (``assigned`` / ``replied``) and the e-mails of
+    their own teams (``team_emails`` + ``team_summary``; never the "Unclassified" bucket).
+
+    ``viewer`` = the manager / administrator looking at somebody else's page: the manager only sees what both of them
+    may see."""
     email = overlay.normalize_email(user.get("email"))
+    own_scope = overlay.scope_for_user(user)
+    scope = overlay.intersect_scopes(own_scope, overlay.scope_for_user(viewer)) if viewer is not None else own_scope
+    hint = ""
+    if scope is not None and not scope:
+        hint = "no_team" if not own_scope else "out_of_scope"
     empty = {"configured": bool(email), "available": False, "email": email,
              "assigned": {"pending": 0, "done": 0, "items": []},
-             "replied": {"count": 0, "average_first_reply_minutes": None, "sla_met": 0, "sla_breached": 0, "items": []}}
-    if not email:
-        return empty
+             "replied": {"count": 0, "average_first_reply_minutes": None, "sla_met": 0, "sla_breached": 0, "items": []},
+             "team_emails": [], "team_summary": _team_summary(scope or (), scope is None), "team_emails_hint": hint}
     snap, _ = read_snapshot("email")
     if not snap:
         return empty
-    rows = email_view(snap, None)["rows"]
-    if viewer is not None:                        # a manager looking at someone else sees only rows of their own team
+    ovr, rev = current_overrides()
+    out = {**empty, "available": True, "date": snap.get("date"), "updated_at": snap.get("generated_at")}
+    if scope is None or scope:
+        items, summary = team_mail(snap, scope, ovr, rev)
+        out["team_emails"], out["team_summary"] = items, {**summary, "teams": list(summary["teams"])}
+    if not email:
+        return out
+    rows = overlaid_rows(snap, ovr, rev)
+    if viewer is not None:                        # a manager looking at someone else sees only rows of their own teams
         rows = overlay.scope_rows(rows, viewer)
     mine_assigned, mine_replied = overlay.assigned_rows(rows, email), overlay.replied_rows(rows, email)
     pending = [r for r in mine_assigned if r.get("status") == schemas.EMAIL_PENDING]
@@ -307,14 +410,14 @@ def my_email(user, viewer=None):
     done.sort(key=lambda r: str(r.get("received_time") or ""), reverse=True)
     times = [m for m in (overlay.response_minutes(r) for r in mine_replied) if m is not None]
     mine_replied.sort(key=lambda r: str(r.get("first_reply_time") or ""), reverse=True)
-    return {**empty, "available": True, "date": snap.get("date"), "updated_at": snap.get("generated_at"),
-            "assigned": {"pending": len(pending), "done": len(done),
-                         "items": [_my_email_row(r) for r in (pending + done)[:_MAX_LIST]]},
-            "replied": {"count": len(mine_replied),
-                        "average_first_reply_minutes": round(sum(times) / len(times), 1) if times else None,
-                        "sla_met": sum(1 for r in mine_replied if r.get("sla_status") == "Met"),
-                        "sla_breached": sum(1 for r in mine_replied if r.get("sla_status") == "Breached"),
-                        "items": [_my_email_row(r) for r in mine_replied[:_MAX_LIST]]}}
+    out["assigned"] = {"pending": len(pending), "done": len(done),
+                       "items": [_my_email_row(r) for r in (pending + done)[:_MAX_LIST]]}
+    out["replied"] = {"count": len(mine_replied),
+                      "average_first_reply_minutes": round(sum(times) / len(times), 1) if times else None,
+                      "sla_met": sum(1 for r in mine_replied if r.get("sla_status") == "Met"),
+                      "sla_breached": sum(1 for r in mine_replied if r.get("sla_status") == "Breached"),
+                      "items": [_my_email_row(r) for r in mine_replied[:_MAX_LIST]]}
+    return out
 
 
 def _my_review(message_id, entry):
@@ -376,7 +479,7 @@ def build_my(user, viewer=None):
     return {"user": public_user(user), "read_only": viewer is not None, "viewer": viewer["user_id"] if viewer else None,
             "date": day, "server_time": auth.now().isoformat(timespec="seconds"),
             "calls": my_calls(user["user_id"], day), "email": my_email(user, viewer), "quality": my_quality(user),
-            "sla": my_sla(user), "shared": build_shared()}
+            "sla": my_sla(user), "shared": build_shared(user, viewer)}
 
 
 @bp.get("/my")
@@ -475,14 +578,15 @@ def overview():
     snaps = {m: read_snapshot(m) for m in schemas.MODULES}
     metas = {m: module_meta(m, *snaps[m]) for m in schemas.MODULES}
     scope = auth.team_scope()
-    ovr = read_overrides()
+    scope_text = overlay.scope_label(scope)
+    ovr, rev = current_overrides()
 
     email_stats = email_rows = None
-    email_block = {"available": False, "scope": scope}
+    email_block = {"available": False, "scope": scope_text}
     if snaps["email"][0]:
-        view = email_view(snaps["email"][0], scope, ovr)
+        view = email_view(snaps["email"][0], scope, ovr, rev=rev)
         email_stats, email_rows = view["stats"], view["rows"]
-        email_block = {"available": True, "scope": scope, **email_headline(email_stats),
+        email_block = {"available": True, "scope": scope_text, **email_headline(email_stats),
                        "quality": email_stats.get("quality", {}), "teams": _team_table(email_stats),
                        "unclassified": sum(1 for r in email_rows if str(r.get("team") or "").casefold() == "unclassified"),
                        "updated_at": snaps["email"][0]["generated_at"]}
@@ -503,7 +607,8 @@ def overview():
                       "updated_at": snaps["itsm"][0]["generated_at"]}
     yesterday_calls = calls_totals(yesterday)
     return jsonify(
-        server_time=auth.now().isoformat(timespec="seconds"), date=day, scope=scope, shared=build_shared(),
+        server_time=auth.now().isoformat(timespec="seconds"), date=day, scope=scope_text,
+        scope_teams=None if scope is None else list(scope), shared=build_shared(),
         calls={"today": _public_calls(today_calls), "yesterday": _public_calls(yesterday_calls),
                "per_hour_today": today_calls["_hours"]},
         email=email_block, sla=sla_block, itsm=itsm_block,
@@ -513,7 +618,9 @@ def overview():
 
 # ----------------------------------------------------------------------------- module answers
 def people_directory(scope_team=None):
-    """[{email, name, team}] of the people an e-mail can be assigned to (settings team members)."""
+    """[{email, name, team}] of the people an e-mail can be assigned to (settings team members). ``scope_team`` = None
+    (everybody) or the team names of a manager."""
+    scope = overlay.as_scope(scope_team)
     email_cfg = hub_cfg()["email"]
     seen, out = set(), []
     pairs = [(team, addr) for team, addrs in (email_cfg.get("team_members_by_team") or {}).items() for addr in addrs]
@@ -522,7 +629,7 @@ def people_directory(scope_team=None):
         addr = overlay.normalize_email(addr)
         if not addr or addr in seen:
             continue
-        if scope_team and team.casefold() != scope_team.casefold():
+        if scope is not None and not overlay.team_in(scope, team):
             continue
         seen.add(addr)
         out.append({"email": addr, "name": overlay.display_name_from_email(addr), "team": team})
@@ -531,12 +638,16 @@ def people_directory(scope_team=None):
 
 
 def email_options(scope_team=None):
+    """Lists for the e-mail page. ``scope`` = the teams text of a manager ('Flex Cube' or 'Flex Cube, Card Management'),
+    None for every team; ``scope_teams`` = the same as a list (None for every team)."""
+    scope = overlay.as_scope(scope_team)
     email_cfg = hub_cfg()["email"]
     cls = email_cfg["classification"]
-    rules = {k: v for k, v in cls["system_team_map"].items() if not scope_team or v.casefold() == scope_team.casefold()}
+    rules = {k: v for k, v in cls["system_team_map"].items() if overlay.team_in(scope, v)}
     return {"teams": list(email_cfg["teams"]), "quality_reasons": list(QUALITY_REASONS), "ratings": list(RATINGS),
-            "people": people_directory(scope_team), "unclassified_team": cls["unclassified_team"],
-            "system_team_map": rules, "scope": scope_team}
+            "people": people_directory(scope), "unclassified_team": cls["unclassified_team"],
+            "system_team_map": rules, "scope": overlay.scope_label(scope),
+            "scope_teams": None if scope is None else list(scope)}
 
 
 @bp.get("/<any(email,sla,itsm):module>")
@@ -549,8 +660,7 @@ def module_answer(module):
     options = email_options(scope) if is_email else None
     if snap is None:
         return jsonify(snapshot=None, meta=meta, **({"options": options} if is_email else {}))
-    ovr = read_overrides() if is_email else {}
-    rev = overrides_rev(ovr) if is_email else ""
+    ovr, rev = current_overrides() if is_email else ({}, "")
     meta["rev"] = rev
     if request.args.get("since") == snap["generated_at"]:
         sent_rev = request.args.get("rev")
@@ -560,7 +670,7 @@ def module_answer(module):
             return jsonify(unchanged=True, meta=meta)
     out = dict(snap)
     if is_email:
-        out["data"] = email_view(snap, scope, ovr)
+        out["data"] = email_view(snap, scope, ovr, rev=rev)
         out["options"] = options
     out["meta"] = meta
     return jsonify(out)
@@ -598,16 +708,16 @@ def events():
         raise ApiError("limit must be a number.")
     items = ops().read_events(day, limit)
     scope = auth.team_scope()
-    if scope:
+    if scope is not None:
         items = [e for e in (_scope_event(e, scope) for e in items) if e]
     return jsonify(day=day, events=items)
 
 
-def _scope_event(event, team):
-    """A team manager sees e-mail events only for their team (items carry subjects)."""
+def _scope_event(event, scope):
+    """A team manager sees e-mail events only for their teams (items carry subjects)."""
     if event.get("module") != "email" or not event.get("items"):
         return event
-    mine = [i for i in event["items"] if isinstance(i, dict) and str(i.get("team") or "").casefold() == team.casefold()]
+    mine = [i for i in event["items"] if isinstance(i, dict) and overlay.team_in(scope, i.get("team"))]
     return {**event, "items": mine} if mine else None
 
 
@@ -626,7 +736,7 @@ def current_rows(message_id):
     if not rows:
         raise ApiError("That e-mail is not in the latest scan. Reload the page.", 404)
     scope = auth.team_scope()
-    if scope and not any(overlay.row_in_team(r, scope) for r in rows):
+    if scope is not None and not any(overlay.row_in_scope(r, scope) for r in rows):
         raise ApiError("That e-mail belongs to another team.", 403)
     return rows
 
@@ -708,7 +818,7 @@ def email_no_action_undo():
         raise ApiError("That e-mail is not marked as needing no action.", 404)
     scope = auth.team_scope()
     raw = raw_rows(message_id)       # the overlay hides marked carry-over mails, so look at the snapshot itself
-    if scope and not any(overlay.row_in_team(r, scope) for r in raw):
+    if scope is not None and not any(overlay.row_in_scope(r, scope) for r in raw):
         raise ApiError("That e-mail belongs to another team.", 403)
     ops().delete_override("no_action", message_id)
     auth.audit("ops_no_action_undo", target=message_id, details={"subject": _subject(raw)[:80]})

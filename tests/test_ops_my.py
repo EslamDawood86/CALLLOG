@@ -217,17 +217,34 @@ def test_manager_view_as_is_limited_to_their_team(mgr, flex_mgr, alice, work):
 
 
 # ---------------------------------------------------------------------------- one set of numbers
-def test_every_dashboard_shows_the_same_team_numbers(admin, mgr, alice, bob, work):
-    def strip(shared):
-        return {k: v for k, v in shared.items() if k != "generated_at"}
+def strip(shared, scope_fields=True):
+    """A shared strip without its timestamp (and, when asked, without the fields that name the viewer's scope)."""
+    out = {k: v for k, v in shared.items() if k != "generated_at"}
+    if not scope_fields:
+        out["email"] = {k: v for k, v in out["email"].items() if k not in ("scope", "teams")}
+    return out
+
+
+def test_every_dashboard_shows_the_same_numbers_for_the_same_viewer(admin, mgr, alice, bob, make_account, work):
+    carl = make_account("1003", "user", "Carl Employee", email="carl@example.test", teams=["Flex Cube", "Card Management"])
     alice.post("/api/records", {"ip_phone": "70001", "reason": "solved", "note": ""})
     shared = strip(admin.get("/api/ops/shared").get_json())
-    assert strip(alice.get("/api/ops/shared").get_json()) == shared
-    assert strip(bob.get("/api/ops/shared").get_json()) == shared
-    assert strip(alice.get("/api/ops/my").get_json()["shared"]) == shared
-    assert strip(bob.get("/api/ops/my").get_json()["shared"]) == shared
+    assert shared["email"]["scope"] == "all" and shared["email"]["teams"] == []
+    # the same viewer sees the same numbers wherever the strip is drawn
+    for who in (admin, mgr, carl, alice, bob):
+        assert strip(who.get("/api/ops/shared").get_json()) == strip(who.get("/api/ops/my").get_json()["shared"])
     assert strip(admin.get("/api/ops/overview").get_json()["shared"]) == shared
     assert strip(mgr.get("/api/ops/overview").get_json()["shared"]) == shared
+    # an employee of every team in the snapshot counts exactly what the administrator counts (no Unclassified mail here)
+    assert strip(carl.get("/api/ops/shared").get_json(), False) == strip(admin.get("/api/ops/shared").get_json(), False)
+    assert carl.get("/api/ops/shared").get_json()["email"]["scope"] == "teams"
+    # calls, security requests and ITSM stay sector-wide for everybody, even for an employee without a team
+    for who in (alice, bob):
+        theirs = strip(who.get("/api/ops/shared").get_json())
+        for block in ("calls", "sla", "itsm", "collector"):
+            assert theirs[block] == shared[block], block
+        assert theirs["email"]["scope"] == "teams" and theirs["email"]["teams"] == []
+        assert theirs["email"]["business_emails"] == 0 and theirs["email"]["pending"] == 0
     # and the headline numbers on Home are the shared ones
     home = admin.get("/api/ops/overview").get_json()
     for key in ("business_emails", "replied", "pending", "reply_rate", "sla_breached"):
@@ -236,9 +253,10 @@ def test_every_dashboard_shows_the_same_team_numbers(admin, mgr, alice, bob, wor
     assert home["sla"]["breached"] == shared["sla"]["breached"] == 1
 
 
-def test_shared_follows_actions_taken_on_the_email_page(admin, alice, work):
-    before = alice.get("/api/ops/shared").get_json()["email"]
+def test_shared_follows_actions_taken_on_the_email_page(admin, make_account, work):
+    carl = make_account("1003", "user", "Carl Employee", teams=["Flex Cube"])
+    before = carl.get("/api/ops/shared").get_json()["email"]
     admin.post("/api/ops/email/no-action", {"message_id": "<x1>"})
-    after = alice.get("/api/ops/shared").get_json()["email"]
+    after = carl.get("/api/ops/shared").get_json()["email"]
     assert after["pending"] == before["pending"] - 1 and after["no_action_needed"] == before["no_action_needed"] + 1
     assert after["needed_reply"] == before["needed_reply"] - 1

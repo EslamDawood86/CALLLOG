@@ -1,5 +1,26 @@
+{# Top bar of every signed-in page (Call Log pages and Operations Hub pages). The links depend on the role; the current page is
+   found from the URL so the older pages that include this file need no change. ops.css styles the links. #}
+<link rel="stylesheet" href="{{ url_for('static', filename='ops.css') }}">
+{% set here = request.path %}
+{% set role = current_user.role %}
+{% macro nav_link(href, label, active) -%}
+<a class="op-nav-link" href="{{ href }}"{% if active %} aria-current="page"{% endif %}>{{ label }}</a>
+{%- endmacro %}
 <header class="topbar">
-  <div class="brand"><img class="logo" src="{{ url_for('static', filename='nbe-logo.svg') }}" alt="NBE" width="32" height="32"><span>NBE <span class="brand-sub">Call Log</span></span>{% if current_user.role == 'admin' %}<span class="badge">Admin</span>{% endif %}</div>
+  <div class="brand"><img class="logo" src="{{ url_for('static', filename='nbe-logo.svg') }}" alt="NBE" width="32" height="32"><span>NBE <span class="brand-sub">Operations Hub</span></span>{% if role == 'admin' %}<span class="badge">Admin</span>{% elif role == 'manager' %}<span class="badge">Manager</span>{% endif %}</div>
+  <nav class="op-nav" aria-label="Main">
+    {% if role in ('admin', 'manager') %}
+    {{ nav_link('/hub', 'Home', here == '/hub') }}
+    {% if role == 'admin' %}{{ nav_link('/calls', 'Calls', here == '/admin') }}{% endif %}
+    {{ nav_link('/email', 'E-mail', here == '/email') }}
+    {{ nav_link('/sla', 'SLA', here == '/sla') }}
+    {{ nav_link('/itsm', 'ITSM', here == '/itsm') }}
+    {% if role == 'admin' %}{{ nav_link('/system', 'System', here == '/system') }}{% endif %}
+    {% else %}
+    {{ nav_link('/dashboard', 'Log calls', here == '/dashboard') }}
+    {{ nav_link('/my', 'My work', here == '/my') }}
+    {% endif %}
+  </nav>
   <div class="topbar-right">
     {% block topbar_extra %}{% endblock %}
     <span class="who" dir="auto">{{ current_user.name }}</span>

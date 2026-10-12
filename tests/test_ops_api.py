@@ -427,7 +427,7 @@ def test_scope_rows_and_rows_for_email():
 
 
 def test_display_name_from_email():
-    assert overlay.display_name_from_email("flexcube.Ayman.Aly2@nbe.test") == "Ayman Aly2"
+    assert overlay.display_name_from_email("flexcube.Alice.Smith2@nbe.test") == "Alice Smith2"
     assert overlay.display_name_from_email("alice_smith@example.test") == "Alice Smith"
 
 
@@ -478,17 +478,17 @@ def test_manager_quality_sections_carry_nothing_about_other_teams(admin, flex_mg
 
 def test_options_people_come_from_settings_and_are_scoped(admin, flex_mgr, hub):
     cfg = admin.get("/api/ops/settings").get_json()["settings"]
-    cfg["email"]["team_members_by_team"] = {"Flex Cube": ["flexcube.Ayman.Aly2@example.test"],
+    cfg["email"]["team_members_by_team"] = {"Flex Cube": ["flexcube.Alice.Smith2@example.test"],
                                            "Card Management": ["carla.cardholder@example.test"]}
-    cfg["email"]["team_members"] = ["flexcube.Ayman.Aly2@example.test", "solo.person@example.test"]
+    cfg["email"]["team_members"] = ["flexcube.Alice.Smith2@example.test", "solo.person@example.test"]
     assert admin.put("/api/ops/settings", cfg).status_code == 200
     people = admin.get("/api/ops/email").get_json()["options"]["people"]
     assert {p["email"]: (p["name"], p["team"]) for p in people} == {
-        "flexcube.ayman.aly2@example.test": ("Ayman Aly2", "Flex Cube"),
+        "flexcube.alice.smith2@example.test": ("Alice Smith2", "Flex Cube"),
         "carla.cardholder@example.test": ("Carla Cardholder", "Card Management"),
         "solo.person@example.test": ("Solo Person", "")}
     mine = flex_mgr.get("/api/ops/email").get_json()["options"]["people"]
-    assert [p["email"] for p in mine] == ["flexcube.ayman.aly2@example.test"]
+    assert [p["email"] for p in mine] == ["flexcube.alice.smith2@example.test"]
 
 
 # ---------------------------------------------------------------------------- e-mail actions
@@ -921,19 +921,25 @@ def test_overview_with_no_data_says_so(admin):
 
 def test_overview_is_team_scoped_for_managers(flex_mgr, hub):
     body = flex_mgr.get("/api/ops/overview").get_json()
-    assert body["scope"] == "Flex Cube" and body["email"]["escalated_count"] == 0
+    assert body["scope"] == "Flex Cube" and body["scope_teams"] == ["Flex Cube"] and body["email"]["escalated_count"] == 0
     assert all(t["team"] == "Flex Cube" for t in body["email"]["teams"])
     assert not any("past the SLA" in a["text"] for a in body["attention"])
-    assert body["shared"]["email"]["business_emails"] == 5              # the strip is sector-wide for everyone
+    # the strip is the same component for everybody, but its e-mail numbers are the viewer's own teams'
+    strip = body["shared"]["email"]
+    assert strip["business_emails"] == 2 and strip["scope"] == "teams" and strip["teams"] == ["Flex Cube"]
+    assert strip["sla_breached"] == 0
 
 
-def test_shared_is_counts_only(emp, hub):
+def test_shared_is_counts_only(make_account, hub):
+    emp = make_account("1005", "user", "Eli Employee", email="eli@example.test", teams=["Flex Cube", "Card Management"])
     body = emp.get("/api/ops/shared").get_json()
     text = json.dumps(body, ensure_ascii=False)
     for secret in ("Subject", "Reset Flexcube", "Card limit", "Customer", "cust-", "example.test", "احمد", "منى",
                    "Replier", "Strange request", "100001", "Add user"):
         assert secret not in text, secret
-    assert body["email"]["business_emails"] == 5 and body["email"]["replied"] == 2
+    # an employee's e-mail numbers are those of their own teams, never the "Unclassified" bucket
+    assert body["email"]["business_emails"] == 4 and body["email"]["replied"] == 2 and body["email"]["scope"] == "teams"
+    assert body["email"]["teams"] == ["Flex Cube", "Card Management"]
     assert body["sla"]["breached"] == 1 and body["itsm"]["totals"]["Rollback Requests"] == 1
     assert body["collector"]["online"] is True and body["collector"]["last_update"] == SNAP_AT
     assert body["calls"]["total"] == 0 and "employees" in body["calls"]

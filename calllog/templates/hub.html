@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}Home · NBE Operations Hub{% endblock %}
+{% block body %}
+{% include "_topbar.html" %}
+<main class="page op-page" id="hub-page" data-role="{{ current_user.role }}">
+  <header class="op-head">
+    <div class="op-head-title">
+      <h1>Operations Hub</h1>
+      <p class="muted" id="hubSub">Everything the sector is working on, right now.</p>
+    </div>
+    <div class="op-head-tools">
+      <form class="op-viewas" method="get" action="/my" id="viewAsForm">
+        <label class="inline-field" for="viewAs">View as employee</label>
+        <select name="as" id="viewAs" required>
+          <option value="">Choose a person…</option>
+          {% for e in employees %}<option value="{{ e.user_id }}" dir="auto">{{ e.name }} ({{ e.user_id }}){% if e.department %} · {{ e.department }}{% endif %}</option>{% endfor %}
+        </select>
+        <button class="btn btn-ghost btn-sm" type="submit">Open</button>
+      </form>
+      <span class="live" id="live" role="status"><i class="live-dot"></i><span id="liveText">Connecting…</span></span>
+    </div>
+  </header>
+
+  <section id="hubStrip" class="card op-strip-card" aria-label="Team status"></section>
+
+  <div class="op-split op-split-attn">
+    <section class="card" id="hubAttention" aria-labelledby="attnTitle">
+      <div class="card-head"><h2 id="attnTitle">Needs attention</h2><span class="hint" id="attnHint"></span></div>
+      <div id="attnBody"><p class="empty">Loading…</p></div>
+    </section>
+    <section class="card" id="hubCollectors" aria-labelledby="colTitle">
+      <div class="card-head"><h2 id="colTitle">Collectors</h2><span class="grow"></span><a class="link" href="/system#collectors" id="colLink">Details</a></div>
+      <div id="colBody"><p class="empty">Loading…</p></div>
+    </section>
+  </div>
+
+  <section class="op-cards" id="hubCards" aria-label="Modules"></section>
+
+  <div class="op-split op-split-even">
+    <section class="card" id="hubTimeline" aria-labelledby="tlTitle">
+      <div class="card-head"><h2 id="tlTitle">Today</h2><span class="hint">what changed since the morning</span></div>
+      <div id="tlBody"><p class="empty">Loading…</p></div>
+    </section>
+    <section class="card" id="hubTeams" aria-labelledby="teamTitle">
+      <div class="card-head"><h2 id="teamTitle">E-mail by team</h2><span class="grow"></span><a class="link" href="/email">Open E-mail</a></div>
+      <div id="teamBody"><p class="empty">Loading…</p></div>
+    </section>
+  </div>
+</main>
+<div id="toast" role="status" aria-live="polite"></div>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='common.js') }}"></script>
+<script src="{{ url_for('static', filename='ops-common.js') }}"></script>
+<script src="{{ url_for('static', filename='hub.js') }}"></script>
+{% endblock %}

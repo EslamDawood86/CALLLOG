@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}My work · NBE Operations Hub{% endblock %}
+{% block body %}
+{% include "_topbar.html" %}
+{# Shell only: my.js (written separately) fills #my-page from GET /api/ops/my[?as=<id>] and shows the Team status strip with OPS.sharedStrip(). #}
+<main class="page op-page" id="my-page" data-role="{{ current_user.role }}" data-user-id="{{ current_user.user_id }}"{% if view_as %} data-view-as="{{ view_as.user_id }}"{% endif %}>
+  {% if view_as %}
+  <div class="op-viewing" role="status">
+    <span>Viewing the page of <strong dir="auto">{{ view_as.name }}</strong> ({{ view_as.user_id }}) - read only.</span>
+    <a class="btn btn-ghost btn-sm" href="/hub">Back to Home</a>
+  </div>
+  {% endif %}
+  <noscript><p class="form-error">This page needs JavaScript.</p></noscript>
+  <p class="empty" id="pageLoading">Loading your work…</p>
+</main>
+<div id="toast" role="status" aria-live="polite"></div>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='common.js') }}"></script>
+<script src="{{ url_for('static', filename='ops-common.js') }}"></script>
+<script src="{{ url_for('static', filename='my.js') }}"></script>
+{% endblock %}

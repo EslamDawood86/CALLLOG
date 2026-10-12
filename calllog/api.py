@@ -11,7 +11,8 @@ from flask import Blueprint, current_app, g, jsonify, request
 
 from . import auth, branches as branch_list, overview as overview_data, stats
 from .ops import settings as hub_settings
-from .ops.overlay import normalize_email, valid_email
+from .ops.overlay import (UNCLASSIFIED, legacy_team, normalize_email, split_teams, user_teams,
+                          valid_email)
 from .ops.schemas import ALL_TEAMS_MARK
 from .queries import (ApiError, clean_ip_phone, clean_note, clean_reason,
                       decorate, filtered_raw, json_body, paginate, parse_day, parse_range,
@@ -25,11 +26,15 @@ bp = Blueprint("api", __name__)
 ROLES = ("user", "manager", "admin")
 ROLE_ORDER = {"admin": 0, "manager": 1, "user": 2}
 MAX_SECURITY_NAME = 120
+MAX_TEAMS_PER_ACCOUNT = 40
 
 
 def public_user(u):
+    """The profile as pages see it. ``teams`` is the list of teams (['__all__'] = every team); ``team`` is the older
+    single value (first team, '__all__' or '') kept so existing pages and scripts keep working."""
+    teams = user_teams(u)
     return {"user_id": u["user_id"], "name": u["name"], "department": u.get("department", ""),
-            "role": u["role"], "email": u.get("email", ""), "team": u.get("team", ""),
+            "role": u["role"], "email": u.get("email", ""), "team": legacy_team(teams), "teams": teams,
             "security_name": u.get("security_name", "")}
 
 
@@ -258,17 +263,37 @@ def _hub_teams():
     return hub_settings.load(current_app.extensions["ops"])["email"]["teams"]
 
 
-def _clean_team(value, current=""):
-    """A team of the Hub settings, '__all__' or empty (= every team). A team that was removed from the settings
-    stays valid on an account that already has it, so editing the account never fails because of it."""
-    team = str(value or "").strip()
-    if len(team) > 80:
-        raise ApiError("Team is too long (max 80 characters).")
-    if team in ("", ALL_TEAMS_MARK) or team == current:
-        return team
-    if team not in _hub_teams():
-        raise ApiError("Choose a team from the list (or leave it empty for every team).")
-    return team
+def _clean_teams(value, role, current_teams=()):
+    """The teams of an account from a list or a text such as 'Flex Cube; Card Management'.
+
+    Each name must be one of the teams in the Hub settings (any spelling of upper / lower case is accepted) - except a
+    team the account already has, so a team renamed or removed in the settings never blocks editing the account.
+    '__all__' (every team) is for managers only and stands alone. Employees cannot be put in "Unclassified": that
+    bucket is for managers to sort out. Returns the list to store."""
+    known = {t.casefold(): t for t in _hub_teams()}
+    mine = {t.casefold(): t for t in current_teams}
+    if isinstance(value, str) and value.strip().casefold() in {**known, **mine}:
+        names = [value.strip()]                              # a team whose own name contains ',' or ';'
+    else:
+        names = split_teams(value)
+    out = []
+    for name in names:
+        if len(name) > 80:
+            raise ApiError("A team name is too long (max 80 characters).")
+        if name.casefold() == ALL_TEAMS_MARK:
+            if role == "user":
+                raise ApiError("Only managers can follow every team. Tick the employee's own teams instead.")
+            return [ALL_TEAMS_MARK]
+        canonical = known.get(name.casefold()) or mine.get(name.casefold())
+        if canonical is None:
+            raise ApiError(f"'{name}' is not one of the teams. Choose teams from the list in the settings.")
+        if role == "user" and canonical.casefold() == UNCLASSIFIED.casefold() and canonical.casefold() not in mine:
+            raise ApiError(f"Employees cannot be put in '{canonical}': that bucket is for managers to sort out.")
+        if canonical not in out:
+            out.append(canonical)
+    if len(out) > MAX_TEAMS_PER_ACCOUNT:
+        raise ApiError(f"Too many teams (max {MAX_TEAMS_PER_ACCOUNT}).")
+    return out
 
 
 def _email_in_use(email, users, own_uid=None):
@@ -298,8 +323,12 @@ def _clean_profile(body, partial=False, current=None):
         if email and (len(email) > 120 or not valid_email(email)):
             raise ApiError("That e-mail address is not valid.")
         out["email"] = email
-    if "team" in body:
-        out["team"] = _clean_team(body["team"], current.get("team", ""))
+    if "teams" in body or "team" in body:
+        # `teams` (a list or 'A; B') wins when both are sent; the single `team` is the older way to say one team
+        raw = body["teams"] if "teams" in body else body["team"]
+        role = out.get("role") or current.get("role") or "user"
+        teams = _clean_teams(raw, role, user_teams(current))
+        out["teams"], out["team"] = teams, legacy_team(teams)
     if "security_name" in body:
         security_name = " ".join(str(body["security_name"] or "").split())
         if len(security_name) > MAX_SECURITY_NAME:
@@ -335,9 +364,10 @@ def create_user():
         user = auth.store().create_user(_new_user(uid, {"role": "user", **profile}, password))
     except StorageError as exc:
         raise ApiError(str(exc), 409)
+    teams = user_teams(user)
     auth.audit("user_created", target=uid, details={
-        "name": user["name"], "role": user["role"],
-        **{k: user[k] for k in ("email", "team", "security_name") if user.get(k)}})
+        "name": user["name"], "role": user["role"], **({"teams": teams} if teams else {}),
+        **{k: user[k] for k in ("email", "security_name") if user.get(k)}})
     return jsonify(user=admin_user_row(user), temp_password=password), 201
 
 
@@ -365,7 +395,9 @@ def update_user(uid):
         raise ApiError("User not found.", 404)
     before, after = result
     diff = {k: {"from": before.get(k), "to": after.get(k)} for k in changes
-            if before.get(k) != after.get(k)}
+            if k not in ("team", "teams") and before.get(k) != after.get(k)}
+    if "teams" in changes and user_teams(before) != user_teams(after):
+        diff["teams"] = {"from": user_teams(before), "to": user_teams(after)}
     if diff:
         auth.audit("user_updated", target=uid, details=diff)
     return jsonify(user=admin_user_row(after))
@@ -400,6 +432,7 @@ _HEADER_ALIASES = {
     "role": {"role", "account type"},
     "email": {"email", "e-mail", "mail", "email address"},
     "team": {"team"},
+    "teams": {"teams", "team list", "team names"},
     "security_name": {"security_name", "security name", "security user"},
 }
 
@@ -441,7 +474,7 @@ def import_users():
                 break
     if "user_id" not in col or "name" not in col:
         raise ApiError("The first row must have column titles including 'user_id' and 'name' "
-                       "(optional: 'department', 'password', 'role', 'email', 'team', 'security_name').")
+                       "(optional: 'department', 'password', 'role', 'email', 'teams', 'team', 'security_name').")
 
     def cell(row, field):
         i = col.get(field)
@@ -454,10 +487,13 @@ def import_users():
         name, dept, password = cell(row, "name"), cell(row, "department"), cell(row, "password")
         problem, extra = None, {}
         try:
-            fields = {k: cell(row, k) for k in ("role", "email", "team", "security_name") if k in col}
+            fields = {k: cell(row, k) for k in ("role", "email", "team", "teams", "security_name") if k in col}
             if fields.get("role", "user") not in ("", "user", "manager"):
                 raise ApiError("Role must be 'user' or 'manager'")
-            extra = _clean_profile({k: v for k, v in fields.items() if k != "role" and v != ""}, partial=True)
+            if fields.get("teams"):                  # `teams` (A;B or A,B) wins over the older single `team` column
+                fields.pop("team", None)
+            extra = _clean_profile({k: v for k, v in fields.items() if k != "role" and v != ""}, partial=True,
+                                   current={"role": fields.get("role") or "user"})
             if fields.get("role"):
                 extra["role"] = fields["role"]
         except ApiError as exc:

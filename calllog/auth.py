@@ -9,7 +9,6 @@ from functools import wraps
 from flask import current_app, g, jsonify, redirect, request, session, url_for
 
 from .ops import overlay
-from .ops.schemas import ALL_TEAMS_MARK
 from .storage import iso_now
 
 UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
@@ -141,22 +140,23 @@ ops_view_required = roles_required(*OPS_ROLES)
 ops_act_required = roles_required(*OPS_ROLES)
 
 
-# ------------------------------------------------------------ team scope (managers)
+# ------------------------------------------------------------ team scope
 def team_scope(user=None):
-    """The one team ``user`` is limited to, or None when they see every team (admins; managers with no team or '__all__')."""
-    user = user if user is not None else g.get("user")
-    if not user or user.get("role") == "admin":
-        return None
-    team = str(user.get("team") or "").strip()
-    return None if team in ("", ALL_TEAMS_MARK) else team
+    """What ``user`` (default: the signed-in one) may see of the e-mail data: ``None`` = every team, otherwise a tuple of
+    team names (names are compared ignoring case; an empty tuple = nothing).
+
+    * administrators: every team;
+    * managers: the teams on their account; none or the all-teams marker means every team;
+    * employees: the teams on their account, never "Unclassified" (none = nothing).
+    Always test ``scope is None`` - an empty scope is falsy but means *nothing*, not *everything*."""
+    return overlay.scope_for_user(user if user is not None else g.get("user"))
 
 
 def may_act_on_team(team, user=None):
-    """May ``user`` act on something that belongs to ``team``?"""
-    scope = team_scope(user)
-    return scope is None or str(team or "").strip().casefold() == scope.casefold()
+    """May ``user`` act on something that belongs to ``team``? True when any team of their scope matches."""
+    return overlay.team_in(team_scope(user), team)
 
 
 def scope_email_rows(rows, user=None):
-    """E-mail rows ``user`` may see (a manager with a team sees that team's rows only)."""
+    """E-mail rows ``user`` may see (a manager with teams sees those teams' rows only; an employee only their teams')."""
     return overlay.scope_rows(rows, user if user is not None else g.get("user"))

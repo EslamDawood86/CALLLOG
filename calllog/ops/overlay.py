@@ -5,8 +5,13 @@ The collector builds the e-mail snapshot from Outlook and already folds the over
 applies the same rules again on every read: a click shows up at once and the next scan agrees with it.
 
 Everything here is a pure function over plain dicts (no Flask, no files): ``apply_overrides`` -> new rows,
-``recount`` -> new stats, ``scope_rows`` / ``rows_for_email`` -> who may see which rows. Inputs are never changed
-(snapshots come out of a shared cache).
+``recount`` -> new stats, ``scope_rows`` / ``rows_for_email`` -> who may see which rows, ``team_mail`` -> the list an
+employee sees of their own teams' e-mails. Inputs are never changed (snapshots come out of a shared cache).
+
+Teams and scopes (docs/HUB-DESIGN.md, section 3): an account holds a LIST of teams (``user_teams``). The *scope* of a
+viewer (``scope_for_user``) is ``None`` (= every team) or a tuple of team names; names are compared ignoring case. An
+e-mail belongs to a scope when its ``team`` or any of its ``all_teams`` is in it. An employee's scope never contains
+"Unclassified" and an employee never gets a row whose team is "Unclassified".
 """
 import re
 from collections import Counter
@@ -49,6 +54,130 @@ def _same_team(a, b):
 def row_in_team(row, team):
     """A row belongs to a team when its ``team`` or any of ``all_teams`` is that team."""
     return _same_team(row.get("team"), team) or any(_same_team(t, team) for t in row.get("all_teams") or [])
+
+
+# --------------------------------------------------------------------------- teams and scopes
+UNCLASSIFIED = "Unclassified"
+_TEAM_SEPARATORS = re.compile(r"[;,]")
+
+
+def _key(value):
+    return str(value or "").strip().casefold()
+
+
+def is_unclassified(row):
+    """Rows nobody could assign to a team. Employees never receive them."""
+    return _key(row.get("team")) == UNCLASSIFIED.casefold()
+
+
+def split_teams(value):
+    """Team names from a list or from a text such as ``"A; B, C"`` (separators ``;`` and ``,``): stripped, no empty
+    names, no duplicates (case-insensitive, first spelling wins), order kept."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        parts = _TEAM_SEPARATORS.split(value)
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        parts = list(value)
+    else:
+        parts = [value]
+    out, seen = [], set()
+    for part in parts:
+        name = " ".join(str(part if part is not None else "").split())
+        if name and name.casefold() not in seen:
+            seen.add(name.casefold())
+            out.append(name)
+    return out
+
+
+def user_teams(user):
+    """The teams recorded on an account, as a list. The new ``teams`` list wins; an older account that only has the
+    single ``team`` text counts as ``[team]``. The all-teams marker ('__all__') stands alone when it is present."""
+    user = user or {}
+    raw = user.get("teams")
+    if isinstance(raw, (list, tuple)):
+        names = split_teams(list(raw))
+    elif isinstance(raw, str) and raw.strip():
+        names = split_teams(raw)
+    else:
+        names = split_teams([user.get("team")])
+    if any(n == schemas.ALL_TEAMS_MARK for n in names):
+        return [schemas.ALL_TEAMS_MARK]
+    return names
+
+
+def legacy_team(teams):
+    """The single ``team`` text older code reads: the first team, the all-teams marker, or empty."""
+    return teams[0] if teams else ""
+
+
+def scope_for_user(user):
+    """What ``user`` may see: ``None`` = every team (administrators; managers without a team or with the all-teams
+    marker), otherwise a tuple of team names (possibly empty = nothing). Employees get their teams without the
+    marker and without "Unclassified"; any other role gets nothing."""
+    role = (user or {}).get("role")
+    if role == "admin":
+        return None
+    if role not in ("manager", "user"):
+        return ()
+    teams = user_teams(user)
+    if role == "manager":
+        return None if not teams or teams == [schemas.ALL_TEAMS_MARK] else tuple(teams)
+    return tuple(t for t in teams if t != schemas.ALL_TEAMS_MARK and _key(t) != UNCLASSIFIED.casefold())
+
+
+def as_scope(value):
+    """A scope from what callers hand in: None, one team name, or any list of names."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return (value,) if value.strip() else ()
+    return tuple(value)
+
+
+def scope_key(scope):
+    """Hashable, case-insensitive identity of a scope (cache keys)."""
+    return None if scope is None else tuple(sorted({_key(t) for t in scope if _key(t)}))
+
+
+def scope_label(scope):
+    """Display text of a scope: None for every team, else the names joined with ', '."""
+    return None if scope is None else ", ".join(scope)
+
+
+def team_in(scope, team):
+    """Is ``team`` inside ``scope``? (None = every team.)"""
+    if scope is None:
+        return True
+    key = _key(team)
+    return bool(key) and any(_key(t) == key for t in scope)
+
+
+def intersect_scopes(a, b):
+    """Scope that satisfies both ``a`` and ``b`` (None = every team)."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return tuple(t for t in a if team_in(b, t))
+
+
+def row_in_scope(row, scope):
+    return scope is None or any(row_in_team(row, t) for t in scope)
+
+
+def rows_in_scope(rows, scope):
+    """The rows whose ``team`` or one of ``all_teams`` is in ``scope`` (None = all rows, kept as they are)."""
+    if scope is None:
+        return list(rows)
+    keys = {_key(t) for t in scope} - {""}
+    if not keys:
+        return []
+    out = []
+    for row in rows:
+        if _key(row.get("team")) in keys or any(_key(t) in keys for t in row.get("all_teams") or ()):
+            out.append(row)
+    return out
 
 
 def _parse(value):
@@ -346,17 +475,13 @@ def recount(rows, stats):
 
 # --------------------------------------------------------------------------- who sees which rows
 def scope_rows(rows, user):
-    """Rows ``user`` may see: everything for an admin or a manager without a team (empty / '__all__'), the team's
-    rows for a manager with a team, nothing for anybody else."""
-    role = (user or {}).get("role")
-    if role == "admin":
-        return list(rows)
-    if role != "manager":
-        return []
-    team = str(user.get("team") or "").strip()
-    if team in ("", schemas.ALL_TEAMS_MARK):
-        return list(rows)
-    return [r for r in rows if row_in_team(r, team)]
+    """Rows ``user`` may see: everything for an administrator or a manager without a team (empty / '__all__'), the rows
+    of their teams for a manager with teams, the rows of their teams (never "Unclassified") for an employee, nothing
+    for anybody else."""
+    out = rows_in_scope(rows, scope_for_user(user))
+    if (user or {}).get("role") == "user":
+        out = [r for r in out if not is_unclassified(r)]
+    return out
 
 
 def assigned_rows(rows, email):
@@ -380,46 +505,111 @@ def rows_for_email(rows, email):
 
 
 # --------------------------------------------------------------------------- a team-scoped view
-def _keep_team(items, team):
-    return [i for i in items or [] if isinstance(i, dict) and _same_team(i.get("team"), team)]
+def _keep_teams(items, scope, hide_unclassified=False):
+    return [i for i in items or [] if isinstance(i, dict) and team_in(scope, i.get("team"))
+            and not (hide_unclassified and _key(i.get("team")) == UNCLASSIFIED.casefold())]
 
 
-def _scope_quality(quality, team):
+def _scope_quality(quality, scope, hide_unclassified=False):
     if not isinstance(quality, dict):
         return {}
     out = {}
     for key, value in quality.items():
         if isinstance(value, list):
-            out[key] = _keep_team(value, team)
+            out[key] = _keep_teams(value, scope, hide_unclassified)
         elif isinstance(value, dict):
-            out[key] = {k: v for k, v in value.items() if _same_team(k, team)}
+            out[key] = {k: v for k, v in value.items()
+                        if team_in(scope, k) and not (hide_unclassified and _key(k) == UNCLASSIFIED.casefold())}
         else:
             out[key] = value
     return out
 
 
-def view_email_data(data, overrides, scope_team=None, now=None):
-    """The snapshot ``data`` with overrides applied, narrowed to ``scope_team`` (None = every team) and the numbers
-    recomputed from what is left. A scoped view carries nothing about other teams' rows or people."""
+def view_email_data(data, overrides, scope_team=None, now=None, rows=None, hide_unclassified=False):
+    """The snapshot ``data`` with overrides applied, narrowed to a scope (None = every team; a team name or a list of
+    names) and the numbers recomputed from what is left. A scoped view carries nothing about other teams' rows or
+    people. ``rows`` = the already overlaid rows (so many scopes can share one overlay); ``hide_unclassified`` also
+    drops the rows of the "Unclassified" bucket (what an employee gets)."""
     data = data if isinstance(data, dict) else {}
-    rows = apply_overrides(data.get("rows") or [], overrides, now)
+    if rows is None:
+        rows = apply_overrides(data.get("rows") or [], overrides, now)
+    scope = as_scope(scope_team)
     stats = data.get("stats") or {}
-    if scope_team:
-        rows = [r for r in rows if row_in_team(r, scope_team)]
+    scoped = scope is not None or hide_unclassified
+    if scope is not None:
+        rows = rows_in_scope(rows, scope)
+    if hide_unclassified:
+        rows = [r for r in rows if not is_unclassified(r)]
     new_stats = recount(rows, stats)
     out = {**data, "rows": rows, "stats": new_stats}
-    if scope_team:
+    if scoped:
+        def keep(name):
+            return team_in(scope, name) and not (hide_unclassified and _key(name) == UNCLASSIFIED.casefold())
         unique = {message_key(r) or id(r): r for r in rows}.values()
-        new_stats["team_stats"] = {k: v for k, v in new_stats["team_stats"].items() if _same_team(k, scope_team)}
+        new_stats["team_stats"] = {k: v for k, v in new_stats["team_stats"].items() if keep(k)}
         new_stats["system_volume"] = dict(Counter(
             s for r in rows for s in str(r.get("detected_systems") or "").split("; ") if s))
         new_stats["business_address_volume"] = {}
-        new_stats["reply_breakdown"] = _keep_team(stats.get("reply_breakdown"), scope_team)
+        new_stats["reply_breakdown"] = _keep_teams(stats.get("reply_breakdown"), scope, hide_unclassified)
         new_stats["total_team_replies"] = sum(r.get("reply_count") or 0 for r in unique)
         for name, method in (("conversation_matches", "ConversationID"), ("conversation_index_matches", "ConversationIndex"),
                              ("subject_matches", "Subject"), ("no_matches", "No Match")):
             new_stats[name] = sum(1 for r in unique if r.get("match_method") == method)
         new_stats["trend"] = {}
-        out["quality"] = _scope_quality(data.get("quality"), scope_team)
-        out["teams"] = [t for t in data.get("teams") or [] if _same_team(t, scope_team)]
+        out["quality"] = _scope_quality(data.get("quality"), scope, hide_unclassified)
+        out["teams"] = [t for t in data.get("teams") or [] if keep(t)]
     return out
+
+
+# --------------------------------------------------------------------------- what an employee sees of their teams
+TEAM_MAIL_LIMIT = 300
+TEAM_MAIL_FIELDS = ("row_id", "message_id", "subject", "customer_name", "team", "status", "received_time",
+                    "current_waiting_time", "sla_status", "escalated", "is_carryover", "first_reply_by",
+                    "first_reply_time", "assigned_to_name", "detected_systems")
+
+
+def _team_mail_item(row):
+    """Whitelisted fields only: no body text, no customer address, no quality notes."""
+    return {"row_id": row.get("row_id") or row.get("message_id") or "", "message_id": row.get("message_id", ""),
+            "subject": row.get("subject", ""), "customer_name": row.get("customer_name", ""),
+            "team": row.get("team", ""), "status": row.get("status", ""), "received_time": row.get("received_time"),
+            "current_waiting_time": row.get("current_waiting_time", ""), "sla_status": row.get("sla_status", ""),
+            "escalated": bool(row.get("escalated")), "is_carryover": bool(row.get("is_carryover")),
+            "first_reply_by": row.get("first_reply_by", ""), "first_reply_time": row.get("first_reply_time"),
+            "assigned_to_name": row.get("assigned_to_name", ""), "detected_systems": row.get("detected_systems", "")}
+
+
+def team_summary_numbers(rows):
+    """The headline numbers of ``rows`` with the same formulas as ``recount`` (so the 'Team status' strip and the
+    team summary of one viewer always agree), without the heavy parts."""
+    business = replied = pending = no_action = breached = escalated = 0
+    for row in rows:
+        status = row.get("status")
+        if not row.get("is_carryover"):
+            business += 1
+        if status == schemas.EMAIL_REPLIED:
+            replied += 1
+        elif status == schemas.EMAIL_PENDING:
+            pending += 1
+        elif status == schemas.EMAIL_NO_ACTION:
+            no_action += 1
+        if row.get("sla_status") == "Breached":
+            breached += 1
+        if row.get("escalated"):
+            escalated += 1
+    return {"pending": pending, "replied": replied, "no_action": no_action, "sla_breached": breached,
+            "escalated": escalated, "reply_rate": _percent(replied, business - no_action)}
+
+
+def team_mail(rows, scope, limit=TEAM_MAIL_LIMIT):
+    """(items, summary) for the e-mails of ``scope`` (None = every team): pending first, oldest first, at most
+    ``limit``; mails that need no action are counted but not listed; "Unclassified" rows never appear.
+    ``rows`` must already have the overrides applied."""
+    mine = [r for r in rows_in_scope(rows, scope) if not is_unclassified(r)]
+    listed = [r for r in mine if r.get("status") in (schemas.EMAIL_PENDING, schemas.EMAIL_REPLIED)]
+    listed.sort(key=lambda r: (r.get("status") != schemas.EMAIL_PENDING, str(r.get("received_time") or ""),
+                               str(r.get("row_id") or r.get("message_id") or "")))
+    items = [_team_mail_item(r) for r in listed[:limit]]
+    summary = {"teams": list(scope or ()), "all_teams": scope is None, **team_summary_numbers(mine),
+               "listed": len(items), "more": max(0, len(listed) - len(items))}
+    return items, summary

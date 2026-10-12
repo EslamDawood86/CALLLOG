@@ -1,7 +1,8 @@
 """Downloads of the Operations Hub, mounted at ``/export/ops``.
 
 * ``/export/ops/<module>.xlsx`` and ``.csv``: the latest snapshot as a workbook (NBE green header, like the Call Log
-  exports) or as a plain CSV of the main table. E-mail rows have the overrides applied and are team-scoped for managers.
+  exports) or as a plain CSV of the main table. E-mail rows have the overrides applied and are limited to the teams
+  of a manager (an account can hold several teams).
 * ``/export/ops/report/<module>/<name>``: a report file the collector produced (Excel / HTML), never outside its folder.
 
 Every download is written to the audit log. Text that starts with ``=`` is written as text, never as a formula.
@@ -16,7 +17,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 
 from .. import auth
 from ..exports import XLSX_MIME, _col
-from . import api as ops_api, schemas
+from . import api as ops_api, overlay, schemas
 
 bp = Blueprint("ops_exports", __name__)
 
@@ -82,11 +83,11 @@ def _csv(header, rows):
 
 # ------------------------------------------------------------------------------ tables per module
 def _email_tables(snap):
-    view = ops_api.email_view(snap, auth.team_scope())
-    stats, rows = view["stats"], view["rows"]
     scope = auth.team_scope()
+    view = ops_api.email_view(snap, scope)
+    stats, rows = view["stats"], view["rows"]
     summary = [["Date", snap.get("date")], ["Scan time", _when(snap.get("generated_at"))],
-               ["Team", scope or "All teams"],
+               ["Team", overlay.scope_label(scope) or "All teams"],
                ["Business e-mails", stats.get("business_emails", 0)], ["Replied", stats.get("replied", 0)],
                ["Pending reply", stats.get("pending", 0)], ["No action needed", stats.get("no_action_needed", 0)],
                ["Needed a reply", stats.get("needed_reply", 0)], ["Reply rate (%)", round(stats.get("reply_rate", 0), 1)],
