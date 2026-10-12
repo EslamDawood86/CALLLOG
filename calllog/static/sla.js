@@ -118,10 +118,17 @@
     } catch (e) { /* ignore */ }
   }
 
+  /** The page's own stylesheet. A template may link it itself; if not, it is added here and the page waits for it (no unstyled flash). */
   function ensureStyles() {
-    if (document.querySelector('link[href*="ops-sla.css"]')) return;
+    if (document.querySelector('link[href*="ops-sla.css"]')) return Promise.resolve();
     const href = SELF ? new URL("ops-sla.css", SELF).href : "/static/ops-sla.css";
-    document.head.append(h("link", { rel: "stylesheet", href }));
+    return new Promise((done) => {
+      const link = h("link", { rel: "stylesheet", href });
+      link.addEventListener("load", done);
+      link.addEventListener("error", done);
+      setTimeout(done, 2000);
+      document.head.append(link);
+    });
   }
 
   /** Re-render a block without losing keyboard focus on the control that was used. */
@@ -782,11 +789,10 @@
         el.banner, el.runLine, el.empty, el.content));
   }
 
-  function start() {
-    ensureStyles();
+  async function start() {
+    await ensureStyles();
     loadView();
     build();
-    state.filters.q && (el.search.value = state.filters.q);
     refresh(true).catch((e) => { state.failure = { network: !!e.network, message: e.message }; renderBanner(); if (!e.network) toast(e.message, "error"); }).finally(() => schedule());
     setInterval(tick, TICK_MS);
     document.addEventListener("visibilitychange", () => { if (!document.hidden) { tick(); schedule(0); } });

@@ -66,10 +66,17 @@
     if (hrs < 24) return `${hrs} h ${pad2(min % 60)} min`;
     return `${Math.floor(hrs / 24)} d ${hrs % 24} h`;
   }
+  /** The page's own stylesheet. A template may link it itself; if not, it is added here and the page waits for it (no unstyled flash). */
   function ensureStyles() {
-    if (document.querySelector('link[href*="ops-sla.css"]')) return;
+    if (document.querySelector('link[href*="ops-sla.css"]')) return Promise.resolve();
     const href = SELF ? new URL("ops-sla.css", SELF).href : "/static/ops-sla.css";
-    document.head.append(h("link", { rel: "stylesheet", href }));
+    return new Promise((done) => {
+      const link = h("link", { rel: "stylesheet", href });
+      link.addEventListener("load", done);
+      link.addEventListener("error", done);
+      setTimeout(done, 2000);
+      document.head.append(link);
+    });
   }
   function keepFocus(root, render) {
     const active = document.activeElement;
@@ -306,9 +313,11 @@
   function categoryRow(role, category) {
     const entry = (role.categories || {})[category];
     const count = entry ? entry.count : null, t = tone(category, count);
-    if (count == null) {
+    if (count == null) {                // not on this role's scoreboard - or a scoreboard line whose number could not be read
+      const why = entry && entry.warning;
       return h("div", { class: "sx-cat", "data-category": category, "data-tone": "na" },
-        h("div", { class: "sx-cat-head" }, h("span", { class: "sx-cat-name muted" }, category), h("span", { class: "sx-na" }, "not on this scoreboard")));
+        h("div", { class: "sx-cat-head" }, h("span", { class: "sx-cat-name muted" }, category), h("span", { class: "sx-na" }, why ? "count not read" : "not on this scoreboard")),
+        why ? h("p", { class: "sx-cat-note warn" }, why) : null);
     }
     const chipEl = h("span", { class: `sx-count-chip tone-${t}`, "data-count": String(count) }, glyph(TONE_ICON[t]), fmtNum(count));
     const rows = visibleRows(entry), open = isOpen(role, category, entry);
@@ -606,8 +615,8 @@
       el.banner, el.runLine, el.empty, el.content));
   }
 
-  function start() {
-    ensureStyles();
+  async function start() {
+    await ensureStyles();
     loadView();
     build();
     refresh(true).catch((e) => { state.failure = { network: !!e.network, message: e.message }; renderBanner(); if (!e.network) toast(e.message, "error"); }).finally(() => schedule());

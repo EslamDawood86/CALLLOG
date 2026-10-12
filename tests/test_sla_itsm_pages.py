@@ -660,6 +660,17 @@ def test_itsm_cards_show_counts_tones_and_lists(tab, hub):
     t.clean()
 
 
+def test_itsm_explains_a_scoreboard_line_whose_number_was_not_read(ops, tab, hub):
+    data = itsm_snapshot()
+    data["roles"][0]["categories"][ROLLBACK] = {"count": None, "rows": [], "note": None,
+                                                 "warning": "The scoreboard line 'Rollback Requests' has no number in brackets."}
+    write_itsm(ops, data)
+    page = tab().open("/itsm", ".sx-role")
+    cat = category(page, ROLE_A, ROLLBACK)
+    assert cat.get_attribute("data-tone") == "na" and "count not read" in cat.inner_text()
+    assert "has no number in brackets" in cat.inner_text()
+
+
 def test_itsm_shows_the_message_of_a_role_that_could_not_be_read(ops, tab, hub):
     write_itsm(ops, itsm_snapshot(error_role=True))
     t = tab()

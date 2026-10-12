@@ -436,6 +436,38 @@ def test_real_registry_points_at_real_functions():
             assert job == "email_report" and exc.name == module        # that engine may still be missing
 
 
+def test_the_real_sla_and_email_engines_through_the_runner(store, clock, monkeypatch, tmp_path):
+    """The contract between runner and engines: snapshots the pages can read, one history point, mail only through ctx.mailer."""
+    from calllog.ops.engines import email_engine, sla_engine
+    from tests.fake_outlook import FakeFolder, FakeItem, FakeNamespace
+    from tests.fake_portal import HEADERS, sample_requests, table_cells
+
+    cc = write_config(tmp_path)
+    hub_settings.patch(store, {"sla": {"mail": {"to": ["boss@example.test"]}},
+                               "email": {"business_emails": ["support@example.test"], "team_members": ["alice@example.test"]}})
+    table = (HEADERS, [table_cells(r) for r in sample_requests(clock.value)])
+    monkeypatch.setitem(runner.JOBS, "sla", lambda ctx: sla_engine.run(ctx, scraper=lambda c: table))
+    item = FakeItem(subject="Please help", sender="cust@example.test", to=["support@example.test"],
+                    received=clock.value - timedelta(minutes=90), body="Need access to the system", conversation_id="C1",
+                    message_id="<m1@example.test>", entry_id="E1")
+    namespace = FakeNamespace([FakeFolder("2026_Part3", children=[FakeFolder("Inbox", [item])])])
+    monkeypatch.setitem(runner.JOBS, "email", lambda ctx: email_engine.run_scan(ctx, namespace=namespace))
+    mailers = []
+    r = make_runner(store, clock, cc, jobs=("sla", "email"), mailer_factory=lambda: mailers.append(FakeMailer()) or mailers[-1])
+    assert r.step("sla") == "ran" and r.step("email") == "ran"
+    for module in ("sla", "email"):
+        snap = fresh(store).read_snapshot(module)
+        assert schemas.validate_snapshot(snap) == [], module
+        assert hb(store, module)["last_status"] == "ok", hb(store, module)
+        assert len(fresh(store).read_history(module, "2026-10-12")["points"]) == 1
+    assert "first_breach" in fresh(store).read_history("sla", "2026-10-12")
+    assert fresh(store).read_snapshot("email")["data"]["stats"]["business_emails"] == 1
+    sent = [m for mailer in mailers for m in mailer.sent]
+    assert len(sent) == 1 and sent[0]["to"] == ["boss@example.test"]
+    assert PASSWORD not in all_text(store.root.parent) and PASSWORD not in json.dumps(sent)
+    assert list((store.reports_dir / "sla").glob("*.xlsx"))
+
+
 # -------------------------------------------------------------------------- report slots
 def test_report_slot_rules():
     s, _ = hub_settings.validate({"email": {"report": {"send_times": ["16:30", "09:00"]}}})
