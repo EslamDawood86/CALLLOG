@@ -71,16 +71,17 @@ calllog/static/ops-common.js hub.js sla.js itsm.js ...  templates/hub|email|sla|
 | SLA engine (`sla_engine.py`) incl. Excel/e-mail/escalation, error_kind "auth" | **done** | 114 tests (11 real Chromium) |
 | ITSM engine (`itsm_engine.py`) CDP client, changes, slot-based e-mail | **done** | 65 tests (3 real Chromium) |
 | Backend API (`ops/api.py`, `overlay.py`, `health.py`, `exports.py`, roles, Employees tab) | **done**, multi-team part PARTIAL | `test_ops_api.py`, `test_ops_my.py` |
-| Multi-team users + employee sees only own teams' e-mails, never Unclassified | **PARTIAL** - code edits made, `tests/test_ops_teams.py` + admin.js checkbox UI + docs missing | brief: `briefs/multi-team.md` |
-| `email_report.py` (Excel, e-mails, .msg zips, assignment/quality/EOD mails) | **PARTIAL** - 1549 lines written, **7 tests in `tests/test_email_report.py` fail** | brief: `briefs/email-report.md` |
-| `runner.py`, `collector.py`, `legacy_import.py`, manage.py `import-legacy`/`seed-demo` | written, tests pass; needs review + the 24/7 hardening | `test_runner.py`, `test_legacy_import.py`; brief `briefs/runner-collector.md` |
-| Front-end foundation: `views.py`, `demo.py`, templates, `ops-common.js`, `hub.js` | **PARTIAL** - exist and render (200) but: **`ops.css` and `system.js` missing**, `my.js`/`email.js` missing, demo rows lack `row_id`/`classified_by`/`classification_hint`/`data.classification`, shared strip + timeline + health tab + classification editor not verified | brief: `briefs/front-foundation.md` |
-| Pages: `sla.js`, `itsm.js` | drafts written BEFORE the foundation (they guessed the helper API) -> integrate | briefs: `page-sla-itsm.md`, `page-sla-itsm-integrate.md` |
-| Pages: Email (`email.js`), My work (`my.js`) | **not started** | briefs: `page-email.md`, `page-my.md` |
-| Perf (60 users) + 24/7 hardening | **not started** | brief `hardening-24x7-and-performance.md` |
+| Multi-team users + employee sees only own teams' e-mails, never Unclassified | **PARTIAL** - code edits made, `tests/test_ops_teams.py` + admin.js checkbox UI + docs missing (a workflow wave was scheduled for it) | brief: `briefs/multi-team.md` |
+| `email_report.py` (Excel, e-mails, .msg zips, assignment/quality/EOD mails) | **done** - `tests/test_email_report.py` green (57 tests) | brief: `briefs/email-report.md` |
+| `runner.py`, `collector.py`, `legacy_import.py`, manage.py `import-legacy`/`seed-demo` | written, tests pass; **24/7 hardening still to do**: child-process jobs + timeouts, auth pause, back-off, epoch `updated_ts`, `--service`, housekeeping | `test_runner.py`, `test_legacy_import.py`; brief `briefs/runner-collector.md` + `hardening-24x7-and-performance.md` items 1-5 |
+| Front-end foundation: `views.py`, `demo.py`, templates, `ops-common.js`, `hub.js`, `ops.css`, `system.js` | **mostly done** - Home and System render and have tests (`tests/test_ops_views.py`, `test_ops_demo.py`); still check the shared strip / timeline / classification editor in a real browser and look at screenshots | brief: `briefs/front-foundation.md` |
+| Pages: `sla.js`, `itsm.js` | working with tests (`tests/test_sla_itsm_pages.py`); integrate with the final `ops-common.js` API | briefs: `page-sla-itsm.md`, `page-sla-itsm-integrate.md` |
+| Pages: Email (`email.js`), My work (`my.js`) | **not started** (`email.html` / `my.html` templates exist as drafts) | briefs: `page-email.md`, `page-my.md` |
+| Perf (60 users) | **done**: `OpsStore` background refresher (stale-while-revalidate, remembers missing files), `Store.memo` serves the previous result while one request recomputes, `settings.load` cache, `GET /healthz`, `python tools/loadtest_hub.py` | `tests/test_ops_perf.py` (14); measured with the real intervals: unchanged p95 3.8 ms, e-mail full 22 ms, /my 98 ms (cold first open), /shared 5.8 ms (5 ms added per file operation). At 5x polling speed unchanged p95 is ~6 ms. Put final numbers in README |
 | Review (security, privacy scrub, legacy fidelity), docs, guides EN/AR, ZIP | **not started** | - |
 
-Whole-suite result at hand-off: 403 passed, 7 failed (all in `tests/test_email_report.py`), plus the three browser files which passed earlier.
+Whole-suite result at hand-off #2: **772 passed, 2 skipped, 1 xfailed** (Python 3.13, ~3 min incl. real-Chromium tests). A Python 3.9 venv exists at `/tmp/claude-0/py39` (`uv venv --python 3.9`, deps installed incl. matplotlib/playwright) - rerun the suite there before the final ZIP (the first 3.9 run only failed in files that were still being written, not on syntax).
+Known flake seen once: `tests/test_sla_itsm_pages.py` reported `request failed .../api/ops/events` (a page request cancelled while the test closes) - check `ops-common.js` polling/abort handling.
 Smoke test: the app starts, an admin can open `/hub /email /sla /itsm /system /my?as=admin /admin` (200) and `/api/ops/overview|shared|sla|health` (200).
 
 ## DECISIONS ALREADY MADE (keep them)
@@ -97,12 +98,12 @@ Smoke test: the app starts, an admin can open `/hub /email /sla /itsm /system /m
 ## WHAT TO DO NEXT (in this order)
 
 1. `git pull`; run the whole suite; read `docs/HUB-DESIGN.md` and the briefs you need.
-2. Finish `email_report.py` until `tests/test_email_report.py` is green (brief `email-report.md`; its reuse pattern of the scan engine is in the engine brief's `needs_from_others`).
+2. (`email_report.py` is finished and green.)
 3. Finish the multi-team work (brief `multi-team.md`), then update HUB-DESIGN sections 3/3.1/3.2/7.
 4. Finish the front-end foundation (brief `front-foundation.md`): `ops.css`, `system.js` (Collectors / Settings incl. Classification editor / Logs / Reports / Health), fix demo data, shared strip, timeline, "view as employee".
    Send `rev=<meta.rev>` together with `since` when polling (see the backend report: otherwise an override made after the scan forces a full answer).
 5. Build the pages: Email incl. the **Unclassified** panel (brief `page-email.md`), My work (`page-my.md`), integrate SLA/ITSM (`page-sla-itsm-integrate.md`). Drive them in a real browser (Playwright), LOOK at screenshots, no console errors / CSP violations.
-6. Hardening: 24/7 + performance (`hardening-24x7-and-performance.md`), `/healthz`, load test with 60 simulated users.
+6. Hardening 24/7 (`hardening-24x7-and-performance.md` items 1-5: child-process jobs with timeouts, auth pause, back-off, epoch heartbeat, collector `--service`, housekeeping). Performance, `/healthz` and the load test are DONE (`tools/loadtest_hub.py`); start the refresher with `calllog.app.start_refresher(app)` (run.py does).
 7. Review in parallel lenses: security (CSRF, XSS - everything via textContent, path traversal, secrets, role leaks - especially "employee never sees Unclassified"), privacy scrub (grep for real names/addresses/password/user number), legacy fidelity of each port, Windows compatibility (paths, Python 3.9 compatibility, no `.bat`), UX/accessibility.
 8. Docs + package: README for the Hub (setup in 10 steps, collector on a PC that stays logged in, Task Scheduler for the web server, `collector_config.json`), EN + AR guides and employee quick card refreshed, `python docs/build/build_package.py`, ZIP layout `READ-ME-FIRST.txt / program / guides`, the ZIP builder must exclude `collector_config.json`, `data`, `libs`, tests; no `.bat`.
 9. Commit + push to `claude/inspiring-carson-v5va9x`; tell the user in short Egyptian Arabic what works, what could NOT be verified here, and the one-time steps on their side.

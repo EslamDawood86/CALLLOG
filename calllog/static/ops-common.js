@@ -33,8 +33,9 @@
        cls: "op-s0".."op-s4" (categories) or "op-t-danger" | "op-t-warn" | "op-t-ok" | "op-t-info" | "op-t-na" (status)
 
    Data
-     loader({url, interval, query, since, onData, onUnchanged, onMeta, onError}) -> {start, stop, refresh, answer, busy}
-         GET url every `interval` ms (default 15000). The first answer comes at once, the next poll after a random 0.5 - 1.5 x interval
+     loader({url, interval, query, since, onData, onUnchanged, onMeta, onError}) -> {start({wait}), stop, refresh, answer, busy}
+         GET url every `interval` ms (default 15000). The first answer comes at once (start({wait:true}) skips it: the page already
+         carries that answer), the next poll after a random 0.5 - 1.5 x interval
          (so sixty browsers opened at 08:00 do not move in lockstep), later ones after interval + 0..20 %; every failure doubles the
          wait (up to x8); nothing is fetched while the tab is hidden and coming back fetches after a short random pause.
          It sends ?since=<generated_at>&rev=<meta.rev> so an unchanged scan costs almost nothing: onData(answer) runs only for a
@@ -406,7 +407,7 @@
     });
     window.addEventListener("online", () => { if (running) load(false); });
     return {
-      start() { running = true; first = true; load(true); },
+      start(o) { running = true; first = true; if (o && o.wait) schedule(); else load(true); },     // wait: the page already holds the first answer
       stop() { running = false; clearTimeout(timer); },
       refresh() { return load(true); },
       get answer() { return answer; },

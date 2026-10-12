@@ -11,10 +11,11 @@ This module only decides WHO may open WHICH page and what the shell needs to kno
 """
 from functools import wraps
 
-from flask import Blueprint, g, redirect, render_template, request, url_for
+from flask import Blueprint, current_app, g, redirect, render_template, request, url_for
 
 from .. import auth
 from ..storage import norm_uid
+from . import api as ops_api
 
 bp = Blueprint("hub_pages", __name__)
 
@@ -45,10 +46,24 @@ def employees_for_picker():
     return [{"user_id": u["user_id"], "name": u.get("name") or u["user_id"], "department": u.get("department", "")} for u in users]
 
 
+def home_first_paint():
+    """What Home shows first - the overview and today's timeline - computed here, with the very functions the page polls afterwards,
+    and carried in the page itself. The dashboard appears at once instead of after two round trips, and a browser that opens it
+    at 08:00 makes its first request only after a random pause (docs/HUB-DESIGN.md section 14). None when it cannot be computed:
+    the page then fetches it like any later poll and shows the error in its own words."""
+    try:
+        overview = ops_api.overview().get_json()
+        events = ops_api.events().get_json()["events"][:60]
+    except Exception:
+        current_app.logger.exception("Home: the first paint could not be computed; the page will ask for it")
+        return None
+    return {"overview": overview, "events": events}
+
+
 @bp.get("/hub")
 @page(*auth.OPS_ROLES)
 def hub():
-    return render_template("hub.html", employees=employees_for_picker(), today=auth.today())
+    return render_template("hub.html", employees=employees_for_picker(), today=auth.today(), seed=home_first_paint())
 
 
 @bp.get("/calls")

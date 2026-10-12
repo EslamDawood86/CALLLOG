@@ -438,6 +438,40 @@ def test_home_shows_the_sector_and_agrees_with_the_api(admin, demo_data, tab, sc
     assert t.later_problems() == [], t.problems
 
 
+def test_home_is_drawn_from_the_page_itself_and_makes_no_request_at_first(admin, demo_data, tab):
+    """The first paint travels inside the page (views.home_first_paint): no API request while it loads, the first poll comes
+    after a random pause - sixty browsers opened at 08:00 do not call the server in the same second."""
+    t = tab()
+    api_calls = []
+    t.page.on("request", lambda r: api_calls.append(r.url) if "/api/" in r.url else None)
+    page = t.open("/hub", "#hubCards .op-module")
+    assert page.locator("#tlBody .op-tl-item").count() > 0 and page.locator("#attnBody .op-attn-item").count() > 0     # already drawn
+    page.wait_for_timeout(1500)
+    assert api_calls == [], api_calls
+    seed = json.loads(page.get_attribute("#hub-page", "data-seed"))
+    assert seed["overview"]["shared"]["calls"]["total"] == 60 and seed["events"] and len(seed["events"]) <= 60
+    assert seed["overview"]["attention"] == admin.get("/api/ops/overview").get_json()["attention"]       # the same numbers a poll gives
+    assert t.later_problems() == [], t.problems
+
+
+def test_home_falls_back_to_asking_when_the_first_paint_is_missing(admin, demo_data, tab, monkeypatch):
+    from calllog.ops import views
+    monkeypatch.setattr(views, "home_first_paint", lambda: None)
+    t = tab()
+    page = t.open("/hub", "#hubCards .op-module")                       # the loader asked at once
+    assert page.get_attribute("#hub-page", "data-seed") is None
+    assert page.locator("#tlBody .op-tl-item").count() > 0
+    assert t.later_problems() == [], t.problems
+
+
+def test_home_first_paint_is_scoped_like_the_api(app, admin, mgr, demo_data):
+    page = mgr.get("/hub").get_data(as_text=True)
+    seed = json.loads(re.search(r"data-seed='(.*?)'(?=[ >])", page, re.S).group(1))
+    assert seed["overview"]["scope"] == "Flex Cube" and [t["team"] for t in seed["overview"]["email"]["teams"]] == ["Flex Cube"]
+    assert seed["overview"]["email"]["pending"] == mgr.get("/api/ops/overview").get_json()["email"]["pending"]
+    assert "<" not in re.search(r"data-seed='(.*?)'(?=[ >])", page, re.S).group(1)                   # nothing in it can open a tag
+
+
 def test_home_links_jump_to_the_pages(admin, demo_data, tab):
     t = tab()
     page = t.open("/hub", "#hubCards .op-module")
@@ -695,13 +729,29 @@ PAUSED = {"paused": "auth", "paused_since": "2026-10-11T08:40:00", "paused_reaso
           "last_status": "error", "last_error": "The login failed"}
 
 
+def patch_home_seed(page, patcher):
+    """Home carries its first paint in the page (data-seed): change that JSON on its way to the browser."""
+    def handle(route):
+        response = route.fetch()
+        html = response.text()
+        found = re.search(r"data-seed='(.*?)'(?=[ >])", html, re.S)
+        seed = json.loads(found.group(1))
+        patcher(seed)
+        text = json.dumps(seed, ensure_ascii=False)
+        for raw, escaped in (("&", "\\u0026"), ("<", "\\u003c"), (">", "\\u003e"), ("'", "\\u0027")):
+            text = text.replace(raw, escaped)
+        headers = {k: v for k, v in response.headers.items() if k.lower() != "content-length"}
+        route.fulfill(status=response.status, headers=headers, body=html[:found.start(1)] + text + html[found.end(1):])
+    page.route("**/hub", handle)
+
+
 def test_collectors_tab_and_home_show_a_paused_login(demo_data, tab):
     """The pages read `paused` / `paused_reason` of a job (the runner writes them into the heartbeat)."""
     t = tab()
     page = t.context.new_page()
     page.set_default_timeout(10000)
     patch_json(page, "**/api/ops/jobs", lambda body: body["jobs"]["sla"].update(PAUSED))
-    patch_json(page, "**/api/ops/overview", lambda body: body["collectors"]["sla"].update(PAUSED))
+    patch_home_seed(page, lambda seed: seed["overview"]["collectors"]["sla"].update(PAUSED))
     page.goto(f"{t.base}/system#collectors")
     page.wait_for_selector("#tab-collectors .op-table-box tbody tr")
     text = text_of(page, "#tab-collectors .op-table-box")

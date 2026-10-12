@@ -2,8 +2,9 @@
 /* Home (/hub) - the Admin dashboard: everything that is going on, right now, on one page.
 
    Reads GET /api/ops/overview (headline numbers of the four modules, the "needs attention" list, collector health) and
-   GET /api/ops/events (today's timeline) every 15 s / 30 s through OPS.loader (random jitter, paused while the tab is
-   hidden). The "Team status" strip on top is OPS.sharedStrip - the same component the employee page shows - fed with the
+   GET /api/ops/events (today's timeline) every 15 s / 30 s through OPS.loader (random start offset, back-off, paused while the
+   tab is hidden). The first answers are already inside the page (data-seed, written by views.home_first_paint), so the dashboard
+   is drawn at once and the first request is a poll. The "Team status" strip on top is OPS.sharedStrip - the same component the employee page shows - fed with the
    `shared` block of the overview, so strip and cards can never disagree.
    Everything from the server goes in as text (CL.h); Arabic text carries dir="auto". */
 (function () {
@@ -263,6 +264,16 @@
   const picker = $("#viewAs");
   if (picker) picker.addEventListener("change", () => { if (picker.value) $("#viewAsForm").submit(); });
 
-  overview.start();
-  timeline.start();
+  // The page carries its first paint (views.home_first_paint); polling starts after a random pause. Without it, ask at once.
+  let seed = null;
+  try { seed = JSON.parse(page.dataset.seed || "null"); } catch (e) { seed = null; }
+  if (seed && seed.overview && seed.overview.server_time) {
+    showOverview(seed.overview);
+    paint("timeline", seed.events || [], (events) => renderTimeline(seed.overview.date, events));
+    overview.start({ wait: true });
+    timeline.start({ wait: true });
+  } else {
+    overview.start();
+    timeline.start();
+  }
 })();
