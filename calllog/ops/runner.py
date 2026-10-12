@@ -260,6 +260,11 @@ def make_context(job, settings, store, *, clock, log, options, scrub, cc=None, m
         data_dir=str(store.root.parent), headed=headed, options=dict(options or {}), credentials=credentials)
 
 
+def stopped_result():
+    """The collector was asked to stop before or during the run: nothing happened that the pages should hear about."""
+    return common.JobResult(ok=False, skipped=True, error_kind="stopped", summary="Stopped.")
+
+
 def result_from_json(doc):
     names = {f.name for f in dataclasses.fields(common.JobResult)}
     return common.JobResult(**{k: v for k, v in (doc or {}).items() if k in names})
@@ -443,6 +448,8 @@ class Runner:
             return
         st.runs_ok, st.runs_failed = int(hb.get("runs_ok") or 0), int(hb.get("runs_failed") or 0)
         st.last_status = hb.get("last_status")
+        if st.last_status == "skipped":
+            st.last_status = "error" if hb.get("last_error") else "ok"
         st.fail_streak = int(hb.get("consecutive_failures") or 0)
         if hb.get("paused") == "auth":
             st.paused, st.paused_since, st.paused_ts = "auth", hb.get("paused_since"), hb.get("paused_ts")
@@ -685,8 +692,10 @@ class Runner:
         log(f"Started ({options.get('trigger', 'schedule')}{who}){' - dry run' if self.dry_run else ''}")
         try:
             with self._outlook_turn(job) as have_turn:
-                result = self._run(job, settings, options, log) if have_turn else common.JobResult(
-                    ok=False, skipped=True, summary="Stopped before the run started.")
+                result = self._run(job, settings, options, log) if have_turn else stopped_result()
+        except Exception as exc:                                 # e.g. the job process could not even be started
+            log(self.scrub(traceback.format_exc()))
+            result = failed_result(f"{type(exc).__name__}: {self.scrub(exc)}")
         finally:
             st.running = False
         elapsed = time.monotonic() - clock0
@@ -767,7 +776,7 @@ class Runner:
             log(f"The run took longer than {seconds // 60} min and was stopped (the programs it started were closed too).")
             return failed_result(f"Timed out after {seconds // 60} minutes - the run was stopped.", error_kind="timeout")
         if outcome == "stopped":
-            return common.JobResult(ok=False, skipped=True, summary="Stopped while the run was in progress.")
+            return stopped_result()
         try:
             with open(result_path, encoding="utf-8") as f:
                 result = result_from_json(json.load(f))
@@ -794,6 +803,10 @@ class Runner:
         summary = self.scrub(result.summary or "")
         ts = now_iso(finished)
         extra = {}
+        if result.error_kind == "stopped":
+            self._beat(job, running=False, state="stopped")
+            self._job_logger(job)("Stopped before the run was finished.")
+            return
 
         if status == "ok":
             st.runs_ok += 1
@@ -807,12 +820,12 @@ class Runner:
             if result.error_kind == "auth":
                 st.paused, st.paused_since, st.paused_ts = "auth", ts, time.time()
                 st.cred_sig = credential_signature(self.cc, job, self._username(job)) if job in ACCOUNT_KINDS else None
-                self._say("The login was rejected - scheduled runs of this job are paused until the password is fixed "
-                          "(or someone presses Run now).", job)
-        if status != "skipped":
+                self._say("The login failed (wrong or missing user / password) - scheduled runs of this job are paused until "
+                          "the account details are fixed (or someone presses Run now).", job)
+        extra.update(last_run_at=ts, last_status=status)
+        if status != "skipped":                                 # a skipped run says nothing about whether scans work
             self._job_event(job, ts, status == "ok", previous_ok, error)
             st.last_status = status
-            extra.update(last_run_at=ts, last_status=status)
         if slots and (status in ("ok", "skipped") or result.emails_sent):
             self._mark_slots(finished, slots)
 
@@ -823,9 +836,10 @@ class Runner:
         moment = self._next_run_at(job, settings, finished)
         self._beat(job, running=False, state="paused_auth" if st.paused else "idle", enabled=self._enabled(job, settings),
                    last_summary=summary, last_duration_seconds=round(elapsed, 2), runs_ok=st.runs_ok, runs_failed=st.runs_failed,
-                   consecutive_failures=st.fail_streak, retry_multiplier=self._retry_minutes(job, settings) // self._interval(job, settings),
-                   paused=st.paused, paused_since=st.paused_since, paused_ts=st.paused_ts,
-                   paused_reason=self._paused_reason(st), next_run_at=now_iso(moment) if moment else None, emails_sent=int(result.emails_sent or 0), **extra)
+                   consecutive_failures=st.fail_streak,
+                   retry_multiplier=self._retry_minutes(job, settings) // self._interval(job, settings),
+                   paused=st.paused, paused_since=st.paused_since, paused_ts=st.paused_ts, paused_reason=self._paused_reason(st),
+                   next_run_at=now_iso(moment) if moment else None, emails_sent=int(result.emails_sent or 0), **extra)
         line = {"ok": f"Finished OK - {summary}", "error": f"FAILED - {error or 'unknown error'}",
                 "skipped": f"Skipped - {summary or 'nothing to do'}"}[status]
         self._job_logger(job)(f"{line} ({elapsed:.1f} s)" + (f", {result.emails_sent} e-mail(s) sent" if result.emails_sent else ""))
@@ -915,11 +929,15 @@ class Runner:
 
     def _maintenance(self):
         """Keeps the heartbeat of a long-running job alive and runs the daily housekeeping."""
+        rounds = 0
         while not self._stop.wait(HEARTBEAT_SECONDS):
+            rounds += 1
             try:
                 for job in self.jobs:
                     if self._state(job).running:
                         self._beat(job)
+                if rounds % 10 == 0:
+                    self.write_collector_info()
                 self.housekeeping_if_due()
             except Exception:
                 self._note(None, "maintenance", "Maintenance error:\n" + self.scrub(traceback.format_exc()), every=1800)

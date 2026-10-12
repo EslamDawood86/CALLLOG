@@ -30,7 +30,7 @@
   const TONE_ICON = { ok: "check", warn: "alert", danger: "alert", na: "dash" };
 
   const state = {
-    snap: null, meta: null, generatedAt: "", history: null, today: "", offline: false, waiting: null,
+    snap: null, meta: null, generatedAt: "", history: null, today: "", failure: null, waiting: null,
     q: "", chartAsTable: false,
     open: {},                 // "role|category" -> true / false when the person opened / closed a list by hand
   };
@@ -231,9 +231,13 @@
   }
 
   // ================================================================== banner
+  function failureBanner(snap) {
+    const f = state.failure, lead = f.network ? "Cannot reach the server" : `The server reported a problem (${f.message})`;
+    return { level: "warn", icon: "wifi", text: `${lead} - retrying.${snap ? ` Showing the scan from ${hhmm(snap.generated_at)}.` : ""}` };
+  }
   function freshness() {
     const m = state.meta, snap = state.snap;
-    if (state.offline) return { level: "warn", icon: "wifi", text: snap ? `Cannot reach the server - retrying. Showing the scan from ${hhmm(snap.generated_at)}.` : "Cannot reach the server - retrying." };
+    if (state.failure) return failureBanner(snap);
     if (!m) return { level: "info", icon: "clock", text: "Loading…" };
     if (m.problem) return { level: "danger", icon: "alert", text: `The scan file cannot be read: ${m.problem}` };
     if (!snap) {
@@ -253,8 +257,10 @@
     return { level: "ok", icon: "check", text: `Live · last scan ${when} (${agoText})${next}${m.host ? ` · ${m.host}` : ""}` };
   }
   function renderBanner() {
-    const f = freshness();
-    el.banner.className = `sx-banner ${f.level}`;
+    const f = freshness(), key = `${f.level}|${f.text}`;
+    if (el.banner._key === key) return;                           // a live region must not repeat itself every few seconds
+    el.banner._key = key;
+    el.banner.className = `sx-banner sx-fresh ${f.level}`;
     el.banner.replaceChildren(glyph(f.icon), h("span", { class: "sx-banner-text", dir: "auto" }, f.text));
   }
 
@@ -440,9 +446,11 @@
   }
 
   // ================================================================== "Run scan now"
-  function setRunLine(text) {
+  /** The sentence is a polite live region and changes only with the phase; the running clock beside it is silent. */
+  function setRunLine(text, clock) {
     el.runLine.hidden = !text;
-    el.runLine.textContent = text || "";
+    if (el.runText.textContent !== (text || "")) el.runText.textContent = text || "";
+    el.runTimer.textContent = clock || "";
   }
   function updateRunUI() {
     const w = state.waiting;
@@ -453,7 +461,7 @@
     const secs = Math.floor((Date.now() - w.since) / 1000), m = state.meta || {};
     const phase = m.running ? `The collector${m.host ? ` (${m.host})` : ""} is reading the ITSM scoreboards now`
       : m.online === false ? "The collector looks offline - the request waits until it is back" : "Waiting for the collector to pick up the request";
-    setRunLine(`${phase}… ${Math.floor(secs / 60)}:${pad2(secs % 60)}`);
+    setRunLine(`${phase}…`, `${Math.floor(secs / 60)}:${pad2(secs % 60)}`);
   }
   async function runNow() {
     if (state.waiting) return;
@@ -496,10 +504,16 @@
   // ================================================================== data loop
   let timer = null, failures = 0;
 
-  async function refresh(force) {
+  let inflight = null;
+  function refresh(force) {
+    if (!inflight) inflight = load(force).finally(() => { inflight = null; });
+    return inflight;
+  }
+
+  async function load(force) {
     const since = !force && state.generatedAt ? `?since=${encodeURIComponent(state.generatedAt)}` : "";
     const answer = await api("GET", `/api/ops/itsm${since}`);
-    state.offline = false;
+    state.failure = null;
     state.meta = answer.meta;
     noteServerTime(answer.meta.server_time);
     state.today = String(answer.meta.server_time || "").slice(0, 10);
@@ -525,7 +539,7 @@
       failures = 0;
     } catch (e) {
       failures += 1;
-      state.offline = !!e.network;
+      state.failure = { network: !!e.network, message: e.message };
       if (!e.network && failures === 1) toast(e.message, "error");
       renderBanner();
     }
@@ -554,8 +568,10 @@
     el.runBtn = h("button", { type: "button", class: "btn btn-primary", onclick: runNow }, glyph("refresh"), "Run scan now");
     el.exportLink = h("a", { class: "btn btn-ghost", href: "/export/ops/itsm.xlsx", download: "" }, glyph("download"), "Export Excel");
     el.scanInfo = h("span", { class: "hint sx-scan" });
-    el.banner = h("div", { class: "sx-banner info", role: "status" });
-    el.runLine = h("p", { class: "sx-runline", role: "status", "aria-live": "polite", hidden: true });
+    el.banner = h("div", { class: "sx-banner sx-fresh info", role: "status" });
+    el.runText = h("span");
+    el.runTimer = h("span", { class: "sx-timer", "aria-hidden": "true" });
+    el.runLine = h("p", { class: "sx-runline", role: "status", "aria-live": "polite", hidden: true }, el.runText, " ", el.runTimer);
     el.errorsBanner = h("div", { class: "sx-banner danger", role: "alert", hidden: true });
     el.totals = h("div", { class: "sx-totals", role: "group", "aria-label": "Open requests per category" });
 
@@ -594,7 +610,7 @@
     ensureStyles();
     loadView();
     build();
-    refresh(true).catch((e) => { state.offline = !!e.network; renderBanner(); if (!e.network) toast(e.message, "error"); }).finally(() => schedule());
+    refresh(true).catch((e) => { state.failure = { network: !!e.network, message: e.message }; renderBanner(); if (!e.network) toast(e.message, "error"); }).finally(() => schedule());
     setInterval(() => { if (!document.hidden && state.snap) renderBanner(); }, TICK_MS);
     document.addEventListener("visibilitychange", () => { if (!document.hidden) { renderBanner(); schedule(0); } });
   }

@@ -285,8 +285,18 @@ def tab(chromium, server, accounts):
         t.close()
 
 
+def expect(locator):
+    """Playwright's retrying assertion (it does not use eval, which the page's CSP would refuse)."""
+    from playwright.sync_api import expect as playwright_expect
+    return playwright_expect(locator)
+
+
 def text(page, selector):
     return page.locator(selector).first.inner_text().strip()
+
+
+def svg_text(page, selector):
+    return page.locator(selector).first.text_content()
 
 
 def kpi(page, key):
@@ -312,7 +322,7 @@ def test_sla_tiles_equal_the_scan(tab, hub):
     assert "Reminder ≥ 1 h" in text(page, '[data-kpi="reminder"]') and "Breached ≥ 2 h" in text(page, '[data-kpi="breached"]')
     assert abs(int(page.locator('[data-kpi="oldest"]').get_attribute("data-minutes")) - totals["oldest_minutes"]) <= 1
     assert kpi(page, "oldest") == "4 h 10 min" and USERS[0] in text(page, '[data-kpi="oldest"]')
-    assert "Live" in text(page, ".sx-banner") and "09:00" in text(page, ".sx-banner") and "PC-TEST" in text(page, ".sx-banner")
+    assert "Live" in text(page, ".sx-fresh") and "09:00" in text(page, ".sx-fresh") and "PC-TEST" in text(page, ".sx-fresh")
     t.clean()
 
 
@@ -375,16 +385,16 @@ def test_sla_search_ignores_arabic_spelling_and_says_when_nothing_matches(tab, h
     t = tab()
     page = t.open("/sla", ".sx-requests tbody tr")
     page.fill('input[aria-label="Search requests"]', "9007")
-    page.wait_for_function("document.querySelectorAll('.sx-requests tbody tr').length === 1")
+    expect(rows(page)).to_have_count(1)
     assert "9007" in rows(page).first.inner_text()
     page.fill('input[aria-label="Search requests"]', "احمد")                   # data has the hamza spelling "أحمد"
-    page.wait_for_function("document.querySelectorAll('.sx-requests tbody tr').length > 1")
+    expect(rows(page)).to_have_count(8)                                            # the 8 requests of that user
     assert all(USERS[0] in r.locator("td").nth(1).inner_text() for r in rows(page).all())
     page.fill('input[aria-label="Search requests"]', "no such request")
     page.wait_for_selector("text=No requests match these filters.")
     assert rows(page).count() == 0
     page.click("div.empty >> text=Clear filters")
-    page.wait_for_function("document.querySelectorAll('.sx-requests tbody tr').length === 25")
+    expect(rows(page)).to_have_count(25)
     t.clean()
 
 
@@ -413,7 +423,7 @@ def test_sla_keeps_filters_sort_and_scroll_when_a_new_scan_arrives(tab, hub, ops
     page = t.open("/sla", ".sx-requests tbody tr")
     page.click('[data-kpi="reminder"]')
     page.fill('input[aria-label="Search requests"]', "T24")
-    page.wait_for_function("document.querySelectorAll('.sx-requests tbody tr').length < 7")
+    expect(rows(page)).to_have_count(3)                                            # 3 of the 7 reminders are on T24
     page.click('.sx-requests button.sx-sort:has-text("Age")')
     before = rows(page).count()
     page.evaluate("window.scrollTo(0, 120)")
@@ -425,7 +435,7 @@ def test_sla_keeps_filters_sort_and_scroll_when_a_new_scan_arrives(tab, hub, ops
     newer["by_user"] = by_user(newer["requests"])
     write_sla(ops, newer, at=NOW + dt.timedelta(minutes=15), history=False)
     t.poll_now()
-    page.wait_for_function(f"document.querySelectorAll('.sx-requests tbody tr').length === {before + 1}")
+    expect(rows(page)).to_have_count(before + 1)
     assert page.locator('[data-kpi="reminder"]').get_attribute("aria-pressed") == "true"
     assert page.locator('input[aria-label="Search requests"]').input_value() == "T24"
     assert page.locator('.sx-requests th[aria-sort="descending"]').inner_text().strip().startswith("Age")
@@ -452,13 +462,13 @@ def test_sla_ages_follow_the_server_clock_between_scans(tab, hub, clock):
     assert row("k004").locator("[data-age]").inner_text() == "1 h 58 min"
     clock.advance(minutes=3)                                                    # no new scan, only time passes
     t.poll_now()
-    page.wait_for_function("document.querySelector('tr[data-key=\"k003\"] [data-age]').textContent === '2 h 08 min'")
+    expect(row("k003").locator("[data-age]")).to_have_text("2 h 08 min")
     assert row("k004").locator("[data-age]").inner_text() == "2 h 01 min"
     assert row("k004").get_attribute("data-status") == "reminder"               # the status is the scan's ...
     assert row("k004").locator("[data-cue]").inner_text() == "now over 2 h"      # ... and the page says the clock has passed the limit
     assert page.locator('[data-kpi="oldest"]').get_attribute("data-minutes") == "253"
     assert kpi(page, "breached") == "4"                                         # tiles stay the scan's numbers
-    assert "13 min ago" not in text(page, ".sx-banner") and "3 min ago" in text(page, ".sx-banner")
+    assert "13 min ago" not in text(page, ".sx-fresh") and "3 min ago" in text(page, ".sx-fresh")
     t.clean()
 
 
@@ -467,14 +477,14 @@ def test_sla_timeline_marks_where_requests_first_breached(tab, hub):
     page = t.open("/sla", ".sx-chart svg")
     assert page.locator(".sx-chart path.ln-open").count() == 1 and page.locator(".sx-chart path.ln-breached").count() == 1
     assert page.locator(".sx-chart .mark-break").count() == 2                   # 08:30 and 08:45 (two requests share the second)
-    assert "Open 31" in text(page, ".sx-chart svg") and "Breached 4" in text(page, ".sx-chart svg")
+    assert "Open 31" in svg_text(page, ".sx-chart svg") and "Breached 4" in svg_text(page, ".sx-chart svg")
     assert "First went over the limit" in text(page, ".sx-legend")
     box = page.locator(".sx-chart rect.hit").bounding_box()
     page.mouse.move(box["x"] + box["width"] - 2, box["y"] + 20)
     page.wait_for_selector(".sx-tip:not([hidden])")
     assert "Scan at 09:00" in text(page, ".sx-tip")
     page.mouse.move(box["x"] + box["width"] * 0.62, box["y"] + 20)
-    page.wait_for_function("document.querySelector('.sx-tip').textContent.includes('passed 2 h')")
+    expect(page.locator(".sx-tip")).to_contain_text("passed 2 h")
     page.click("text=View as table")                                            # the same numbers without hovering
     assert page.locator(".sx-chart-table tbody tr").count() == 5 and not page.locator(".sx-chart").is_visible()
     page.click("text=View as chart")
@@ -518,7 +528,7 @@ def test_sla_run_now_reports_a_failed_scan(tab, hub, ops, clock):
     beat(ops, "sla", at=NOW + dt.timedelta(minutes=1), last_status="error", last_error="Login failed - check the password")
     page.wait_for_selector("text=The scan failed: Login failed - check the password", timeout=15000)
     assert not page.locator("button.btn-primary").is_disabled()
-    assert "The last scan failed" in text(page, ".sx-banner") and kpi(page, "open") == "31"   # the last good scan stays on screen
+    assert "The last scan failed" in text(page, ".sx-fresh") and kpi(page, "open") == "31"   # the last good scan stays on screen
     t.problems.clear()
 
 
@@ -542,14 +552,33 @@ def test_sla_banners_say_what_is_wrong(ops, tab, hub, clock):
     for job in schemas.JOBS:
         beat(ops, job, at=old)
     t.poll_now()
-    page.wait_for_function("document.querySelector('.sx-banner').textContent.includes('offline')")
-    assert "collector is offline" in text(page, ".sx-banner") and "09:00" in text(page, ".sx-banner")
+    expect(page.locator(".sx-fresh")).to_contain_text("offline")
+    assert "collector is offline" in text(page, ".sx-fresh") and "09:00" in text(page, ".sx-fresh")
     for job in schemas.JOBS:
         beat(ops, job, last_status="error", last_error="SSO portal did not answer")
     t.poll_now()
-    page.wait_for_function("document.querySelector('.sx-banner').textContent.includes('SSO portal did not answer')")
-    assert "The last scan failed" in text(page, ".sx-banner") and "Showing the scan from 09:00" in text(page, ".sx-banner")
+    expect(page.locator(".sx-fresh")).to_contain_text("SSO portal did not answer")
+    assert "The last scan failed" in text(page, ".sx-fresh") and "Showing the scan from 09:00" in text(page, ".sx-fresh")
     assert kpi(page, "open") == "31"
+    t.problems.clear()
+
+
+@pytest.mark.parametrize("path,api,ready", [("/sla", "sla", '[data-kpi="open"]'), ("/itsm", "itsm", ".sx-role")])
+def test_pages_keep_the_last_scan_and_say_so_when_the_server_fails(tab, hub, path, api, ready):
+    t = tab()
+    page = t.open(path, ready)
+    answer = {"status": 500, "content_type": "application/json", "body": '{"error": "Data folder problem"}'}
+    page.route(f"**/api/ops/{api}*", lambda route: route.fulfill(**answer))
+    t.poll_now()
+    expect(page.locator(".sx-fresh")).to_contain_text("The server reported a problem (Data folder problem)")
+    assert page.locator(ready).count() >= 1                                    # the numbers stay on screen
+    page.unroute(f"**/api/ops/{api}*")
+    page.route(f"**/api/ops/{api}*", lambda route: route.abort())
+    t.poll_now()
+    expect(page.locator(".sx-fresh")).to_contain_text("Cannot reach the server - retrying. Showing the scan from 09:00.")
+    page.unroute(f"**/api/ops/{api}*")
+    t.poll_now()
+    expect(page.locator(".sx-fresh")).to_contain_text("Live")
     t.problems.clear()
 
 
@@ -662,14 +691,14 @@ def test_itsm_expand_collapse_search_and_copy(tab, hub):
     assert page.locator(".sx-reqs li").count() == 9
 
     page.fill('input[aria-label="Search the requests"]', "100303")
-    page.wait_for_function("document.querySelectorAll('.sx-reqs li').length === 1")
+    expect(page.locator(".sx-reqs li")).to_have_count(1)
     assert page.locator(".sx-role").count() == 1 and role_card(page, ROLE_C).count() == 1
     page.fill('input[aria-label="Search the requests"]', "صلاحية")
-    page.wait_for_function("document.querySelectorAll('.sx-reqs li').length === 2")
+    expect(page.locator(".sx-reqs li")).to_have_count(2)
     page.fill('input[aria-label="Search the requests"]', "zzz")
     page.wait_for_selector("text=No request matches the search.")
     page.fill('input[aria-label="Search the requests"]', "")
-    page.wait_for_function("document.querySelectorAll('.sx-role').length === 3")
+    expect(page.locator(".sx-role")).to_have_count(3)
 
     page.click('button[aria-label="Copy request number 100101"]')
     page.wait_for_selector("text=Copied 100101")
@@ -714,7 +743,7 @@ def test_itsm_history_chart_and_table(tab, hub):
     assert page.locator(".sx-chart path.ln").count() == 2
     legend = text(page, ".sx-legend")
     assert IMPL in legend and ROLLBACK in legend
-    assert "Implementation 15" in text(page, ".sx-chart svg") and "Rollback 1" in text(page, ".sx-chart svg")
+    assert "Implementation 15" in svg_text(page, ".sx-chart svg") and "Rollback 1" in svg_text(page, ".sx-chart svg")
     box = page.locator(".sx-chart rect.hit").bounding_box()
     page.mouse.move(box["x"] + box["width"] - 2, box["y"] + 10)
     page.wait_for_selector(".sx-tip:not([hidden])")

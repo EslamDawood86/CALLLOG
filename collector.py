@@ -716,8 +716,8 @@ def cmd_service(args):
 
 # --------------------------------------------------------------------------------------------------- main
 def main(argv=None):
-    args = parse_args(argv)
     fix_console()
+    args = parse_args(argv)
     if args.run_job:
         return cmd_run_job(args)
     if args.remove_autostart:

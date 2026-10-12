@@ -35,7 +35,7 @@
     generatedAt: "",
     history: null,           // today's {points, first_breach}
     today: "",
-    offline: false,
+    failure: null,
     waiting: null,           // {since, generated, lastRun} while "Run scan now" waits
     filters: { status: "", user: "", q: "" },
     sort: { key: "priority", desc: false },
@@ -136,11 +136,13 @@
   }
 
   // ------------------------------------------------------------------ banner (freshness / offline)
+  function failureBanner(snap) {
+    const f = state.failure, lead = f.network ? "Cannot reach the server" : `The server reported a problem (${f.message})`;
+    return { level: "warn", icon: "wifi", text: `${lead} - retrying.${snap ? ` Showing the scan from ${hhmm(snap.generated_at)}.` : ""}` };
+  }
   function freshness() {
     const m = state.meta, snap = state.snap;
-    if (state.offline) {
-      return { level: "warn", icon: "wifi", text: snap ? `Cannot reach the server - retrying. Showing the scan from ${hhmm(snap.generated_at)}.` : "Cannot reach the server - retrying." };
-    }
+    if (state.failure) return failureBanner(snap);
     if (!m) return { level: "info", icon: "clock", text: "Loading…" };
     if (m.problem) return { level: "danger", icon: "alert", text: `The scan file cannot be read: ${m.problem}` };
     if (!snap) {
@@ -161,8 +163,10 @@
   }
 
   function renderBanner() {
-    const f = freshness();
-    el.banner.className = `sx-banner ${f.level}`;
+    const f = freshness(), key = `${f.level}|${f.text}`;
+    if (el.banner._key === key) return;                           // a live region must not repeat itself every few seconds
+    el.banner._key = key;
+    el.banner.className = `sx-banner sx-fresh ${f.level}`;
     el.banner.replaceChildren(glyph(f.icon), h("span", { class: "sx-banner-text", dir: "auto" }, f.text));
   }
 
@@ -568,9 +572,11 @@
   }
 
   // ------------------------------------------------------------------ "Run scan now"
-  function setWaiting(text) {
+  /** The sentence is a polite live region and changes only with the phase; the running clock beside it is silent. */
+  function setWaiting(text, clock) {
     el.runLine.hidden = !text;
-    el.runLine.textContent = text || "";
+    if (el.runText.textContent !== (text || "")) el.runText.textContent = text || "";
+    el.runTimer.textContent = clock || "";
   }
   function updateRunUI() {
     const w = state.waiting;
@@ -582,7 +588,7 @@
     const clock = `${Math.floor(secs / 60)}:${pad2(secs % 60)}`;
     const phase = m.running ? `The collector${m.host ? ` (${m.host})` : ""} is scanning now`
       : m.online === false ? "The collector looks offline - the request waits until it is back" : "Waiting for the collector to pick up the request";
-    setWaiting(`${phase}… ${clock}`);
+    setWaiting(`${phase}…`, clock);
   }
 
   async function runNow() {
@@ -628,10 +634,16 @@
   // ------------------------------------------------------------------ data loop
   let timer = null, failures = 0;
 
-  async function refresh(force) {
+  let inflight = null;
+  function refresh(force) {
+    if (!inflight) inflight = load(force).finally(() => { inflight = null; });
+    return inflight;
+  }
+
+  async function load(force) {
     const since = !force && state.generatedAt ? `?since=${encodeURIComponent(state.generatedAt)}` : "";
     const answer = await api("GET", `/api/ops/sla${since}`);
-    state.offline = false;
+    state.failure = null;
     state.meta = answer.meta;
     noteServerTime(answer.meta.server_time);
     state.today = String(answer.meta.server_time || "").slice(0, 10);
@@ -643,6 +655,7 @@
       if (isNew) await loadHistory();
     }
     render();
+    tick();                                         // the clock offset may have changed: ages move even when the scan did not
     checkWaiting();
   }
 
@@ -659,7 +672,7 @@
       failures = 0;
     } catch (e) {
       failures += 1;
-      state.offline = !!e.network;
+      state.failure = { network: !!e.network, message: e.message };
       if (!e.network && failures === 1) toast(e.message, "error");
       renderBanner();
     }
@@ -711,8 +724,10 @@
     el.runBtn = h("button", { type: "button", class: "btn btn-primary", onclick: runNow }, glyph("refresh"), "Run scan now");
     el.exportLink = h("a", { class: "btn btn-ghost", href: "/export/ops/sla.xlsx", download: "" }, glyph("download"), "Export Excel");
     el.scanInfo = h("span", { class: "hint sx-scan" });
-    el.banner = h("div", { class: "sx-banner info", role: "status" });
-    el.runLine = h("p", { class: "sx-runline", role: "status", "aria-live": "polite", hidden: true });
+    el.banner = h("div", { class: "sx-banner sx-fresh info", role: "status" });
+    el.runText = h("span");
+    el.runTimer = h("span", { class: "sx-timer", "aria-hidden": "true" });
+    el.runLine = h("p", { class: "sx-runline", role: "status", "aria-live": "polite", hidden: true }, el.runText, " ", el.runTimer);
     el.kpis = h("div", { class: "sx-kpis", role: "group", "aria-label": "Security request totals" });
 
     el.userHead = h("thead");
@@ -772,7 +787,7 @@
     loadView();
     build();
     state.filters.q && (el.search.value = state.filters.q);
-    refresh(true).catch((e) => { state.offline = !!e.network; renderBanner(); if (!e.network) toast(e.message, "error"); }).finally(() => schedule());
+    refresh(true).catch((e) => { state.failure = { network: !!e.network, message: e.message }; renderBanner(); if (!e.network) toast(e.message, "error"); }).finally(() => schedule());
     setInterval(tick, TICK_MS);
     document.addEventListener("visibilitychange", () => { if (!document.hidden) { tick(); schedule(0); } });
   }

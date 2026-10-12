@@ -486,6 +486,23 @@ def test_failed_report_is_retried_inside_the_window(store, clock, monkeypatch):
     assert r.step("email_report") == "idle"
 
 
+def test_a_skipped_run_is_reported_but_changes_nothing_else(store, clock, monkeypatch):
+    outcomes = [JobResult(ok=False, error="down"), JobResult(ok=True, skipped=True, summary="already sent today"),
+                JobResult(ok=True, summary="sent")]
+    monkeypatch.setitem(runner.JOBS, "email_report", lambda ctx: outcomes.pop(0))
+    hub_settings.patch(store, {"email": {"report": {"send_times": ["16:30", "16:40", "16:50"]}}})
+    r = make_runner(store, clock, jobs=("email_report",))
+    clock.value = datetime(2026, 10, 12, 16, 31)
+    r.step("email_report")                                                   # fails, all due slots stay open
+    clock.advance(minutes=20)
+    assert r.step("email_report") == "ran"
+    beat = hb(store, "email_report")
+    assert beat["last_status"] == "skipped" and beat["last_summary"] == "already sent today"
+    assert beat["runs_ok"] == 0 and beat["runs_failed"] == 1 and beat["last_error"] == "down"
+    assert [e["kind"] for e in fresh(store).read_events("2026-10-12")] == ["scan_failed"]
+    assert fresh(store).read_state("runner-email_report")["done"] == ["16:30", "16:40", "16:50"]   # one run covers every due slot
+
+
 def test_next_active_start():
     s, _ = hub_settings.validate({"general": {"holidays": ["2026-10-13"]}})
     assert runner.next_active_start(s, "sla", datetime(2026, 10, 12, 10, 0)) == datetime(2026, 10, 12, 10, 0)
@@ -622,30 +639,52 @@ def test_isolated_run_is_killed_on_timeout(store, clock, monkeypatch, tmp_path):
     assert fresh(store).read_snapshot("sla") is None
 
 
-def test_stopping_kills_the_job_process_tree(store, clock, monkeypatch, tmp_path):
-    r, _ = isolated_runner(store, clock, tmp_path, monkeypatch, "isolated_sleep")
-    worker = threading.Thread(target=r.step, args=("sla",))
+def start_sleeping_job(r, store, job):
+    """Run ``job`` (a child process that starts a grandchild and sleeps) in a thread; returns (thread, child pid, grandchild pid)."""
+    worker = threading.Thread(target=r.step, args=(job,))
     worker.start()
     pids_file = store.root / "pids.txt"
     deadline = time.time() + 40
     while time.time() < deadline and not pids_file.exists():
         time.sleep(0.1)
     assert pids_file.exists(), "the job process never started"
-    child, grandchild = (int(x) for x in pids_file.read_text().split())
+    time.sleep(0.3)
+    return (worker, *(int(x) for x in pids_file.read_text().split()))
+
+
+def test_stopping_kills_the_job_process_tree(store, clock, monkeypatch, tmp_path):
+    r, _ = isolated_runner(store, clock, tmp_path, monkeypatch, "isolated_sleep")
+    worker, child, grandchild = start_sleeping_job(r, store, "sla")
     r.request_stop()
     worker.join(30)
     assert not worker.is_alive()
+    assert hb(store)["state"] == "stopped" and hb(store)["running"] is False and hb(store).get("last_status") is None
     time.sleep(0.5)
-    for pid in (child, grandchild):
-        with pytest.raises(OSError):
-            os.kill(pid, 0) if not _is_zombie(pid) else (_ for _ in ()).throw(ProcessLookupError())
+    assert_gone(child)
+    assert_gone(grandchild)
 
 
-def _is_zombie(pid):
+def test_a_stopped_report_keeps_its_slot(store, clock, monkeypatch, tmp_path):
+    cc = write_config(tmp_path)
+    monkeypatch.setitem(runner.JOBS, "email_report", ("tests.test_runner", "isolated_sleep"))
+    clock.value = datetime(2026, 10, 12, 16, 35)
+    r = make_runner(store, clock, cc, jobs=("email_report",), isolate=True, script=REPO / "collector.py")
+    worker, _, _ = start_sleeping_job(r, store, "email_report")
+    r.request_stop()
+    worker.join(30)
+    assert fresh(store).read_state("runner-email_report") == {}                  # the slot is still open for the next start
+    assert hb(store, "email_report")["state"] == "stopped"
+
+
+def assert_gone(pid):
+    """The process no longer runs (a zombie waiting to be collected by its parent counts as gone)."""
     try:
-        return Path(f"/proc/{pid}/stat").read_text().split(")")[-1].split()[0] == "Z"
+        if Path(f"/proc/{pid}/stat").read_text().split(")")[-1].split()[0] == "Z":
+            return
     except OSError:
-        return False
+        pass
+    with pytest.raises(OSError):
+        os.kill(pid, 0)
 
 
 def test_a_crashing_job_process_becomes_a_failed_result(store, clock, monkeypatch, tmp_path):

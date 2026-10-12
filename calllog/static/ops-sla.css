@@ -225,3 +225,4 @@ table.sx-requests tr.st-breached td:first-child, table.sx-requests tr.st-reminde
   .sx-chip, .sx-count-chip, .sx-num.has { border: 1px solid CanvasText; }
   .sx-chart svg .ln { stroke: CanvasText !important; }
 }
+.sx-timer { margin-inline-start: 6px; font-variant-numeric: tabular-nums; color: var(--muted); }
