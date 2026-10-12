@@ -76,6 +76,12 @@ def clean_text(value, field, maxlen, required=False, minlen=0, multiline=False):
     return text
 
 
+def optional_body():
+    """The JSON object of a request that may also carry its arguments in the query string (DELETE)."""
+    body = request.get_json(silent=True)
+    return body if isinstance(body, dict) else {}
+
+
 def clean_message_id(value):
     text = str(value or "").strip()
     if not text or len(text) > 500 or any(ord(c) < 32 for c in text):
@@ -150,9 +156,22 @@ def _latest_override_stamp(ovr):
 
 
 def email_view(snap, scope_team=None, ovr=None):
-    """The e-mail snapshot data with overrides applied, narrowed to a team and recounted."""
+    """The e-mail snapshot data with overrides applied, narrowed to a team and recounted.
+
+    Many pages ask for the same thing every few seconds, so the result is shared for a moment (and until the snapshot
+    or an override changes). Callers must treat it as read-only."""
     ovr = ovr if ovr is not None else read_overrides()
-    return overlay.view_email_data(snap.get("data") or {}, ovr, scope_team, auth.now())
+    now = auth.now()
+    key = (snap.get("generated_at"), overrides_rev(ovr), scope_team, int(now.timestamp() // 5))
+    cache = current_app.extensions.setdefault("ops_view_cache", {})
+    hit = cache.get(key)
+    if hit is not None and hit[0] is snap:                # same parsed file, not just the same timestamp
+        return hit[1]
+    view = overlay.view_email_data(snap.get("data") or {}, ovr, scope_team, now)
+    if len(cache) >= 12:
+        cache.clear()
+    cache[key] = (snap, view)
+    return view
 
 
 def current_email_view(scope_team=None):
@@ -536,7 +555,7 @@ def module_answer(module):
     if request.args.get("since") == snap["generated_at"]:
         sent_rev = request.args.get("rev")
         same = (sent_rev == rev) if sent_rev is not None else (
-            not is_email or _latest_override_stamp(ovr) <= snap["generated_at"].replace(" ", "T"))
+            not is_email or _latest_override_stamp(ovr) < snap["generated_at"].replace(" ", "T"))
         if same:
             return jsonify(unchanged=True, meta=meta)
     out = dict(snap)
@@ -657,7 +676,7 @@ def email_assign():
 @bp.delete("/email/assign")
 @auth.ops_act_required
 def email_unassign():
-    body = request.get_json(silent=True) or {}
+    body = optional_body()
     message_id = clean_message_id(body.get("message_id") or request.args.get("message_id"))
     rows = current_rows(message_id)
     if not ops().overrides("assignments").get(message_id):
@@ -683,7 +702,7 @@ def email_no_action():
 @bp.delete("/email/no-action")
 @auth.ops_act_required
 def email_no_action_undo():
-    body = request.get_json(silent=True) or {}
+    body = optional_body()
     message_id = clean_message_id(body.get("message_id") or request.args.get("message_id"))
     if not ops().overrides("no_action").get(message_id):
         raise ApiError("That e-mail is not marked as needing no action.", 404)
@@ -772,7 +791,8 @@ def email_quality_appeal():
     mine = overlay.normalize_email(g.user.get("email"))
     review = ops().overrides("quality").get(message_id)
     if not review or not mine or overlay.normalize_email(review.get("replied_by_email")) != mine:
-        raise ApiError("You can only appeal a rating of your own reply.", 403 if review else 404)
+        # the same answer whether or not somebody else's rating exists, so nothing can be probed
+        raise ApiError("There is no rating of your own reply for that e-mail.", 404)
     if review.get("rating_withdrawn"):
         raise ApiError("That rating was already withdrawn.", 409)
     if review.get("appeal_decision"):
@@ -857,7 +877,7 @@ def classification_rule_add():
 @bp.delete("/email/classification/rule")
 @auth.ops_act_required
 def classification_rule_remove():
-    body = request.get_json(silent=True) or {}
+    body = optional_body()
     keyword = " ".join(str(body.get("keyword") or request.args.get("keyword") or "").split())
     if not keyword:
         raise ApiError("Say which keyword to remove.")

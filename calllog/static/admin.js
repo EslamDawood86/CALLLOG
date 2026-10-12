@@ -15,7 +15,14 @@
     password_changed: "Changed own password", record_created: "Logged a call", record_updated: "Edited a call",
     record_deleted: "Deleted a call", user_created: "Created user", user_updated: "Updated user",
     password_reset: "Reset a password", users_imported: "Imported users", branches_imported: "Imported the branch list", export: "Exported data",
+    ops_assign: "Assigned an e-mail", ops_unassign: "Removed an e-mail assignment", ops_no_action: "Marked an e-mail: no action needed",
+    ops_no_action_undo: "Undid a no-action mark", ops_team: "Changed the team of an e-mail", ops_quality: "Rated a reply",
+    ops_quality_appeal: "Appealed a rating", ops_quality_decision: "Decided a rating appeal",
+    ops_classification_rule: "Changed a classification rule", ops_run_job: "Started a collector job (Run now)",
+    ops_settings_saved: "Saved the Hub settings", ops_view_as: "Opened an employee's page", ops_export: "Exported Hub data",
+    ops_report_download: "Downloaded a report",
   };
+  const ROLE_NAMES = { admin: "Admin", manager: "Manager", user: "Employee" };
   const panel = (name) => $(`#tab-${name}`);
 
   // ------------------------------------------------------------- utilities
@@ -264,7 +271,9 @@
     const me = window.CL_ME;
     const rows = users.map((u) => h("tr", { class: u.active ? "" : "zero" },
       h("td", { class: "ip" }, u.user_id), h("td", {}, bidi(u.name)), h("td", {}, bidi(u.department)),
-      h("td", {}, u.role === "admin" ? h("span", { class: "pill" }, "Admin") : "Employee"),
+      h("td", {}, u.role === "user" ? ROLE_NAMES.user : h("span", { class: "pill" }, ROLE_NAMES[u.role] || u.role)),
+      h("td", { class: "ip", dir: "ltr" }, u.email || h("span", { class: "hint" }, "—")),
+      h("td", {}, u.team === "__all__" ? "All teams" : u.team || h("span", { class: "hint" }, "—")),
       h("td", {}, u.active ? h("span", { class: "pill on" }, "Active") : h("span", { class: "pill off" }, "Disabled"),
         u.must_change_password ? h("span", { class: "hint" }, "  must change password") : null),
       h("td", { class: "nowrap" }, u.last_login ? u.last_login.slice(0, 16) : h("span", { class: "hint" }, "never")),
@@ -275,9 +284,9 @@
     panel("employees").replaceChildren(h("div", { class: "card" },
       h("div", { class: "card-head" }, h("h2", {}, `${users.length} accounts`), h("span", { class: "grow" }),
         h("button", { class: "btn btn-ghost", type: "button", onclick: importUsers }, icon("upload"), "Import from Excel / CSV"),
-        h("button", { class: "btn btn-primary", type: "button", onclick: () => userForm(null) }, icon("plus"), "Add employee")),
+        h("button", { class: "btn btn-primary", type: "button", onclick: () => userForm(null) }, icon("plus"), "Add account")),
       h("div", { class: "table-wrap" }, h("table", { class: "data" },
-        h("thead", {}, h("tr", {}, ["User ID", "Name", "Department", "Role", "Status", "Last sign-in"].map((c) => h("th", {}, c)), h("th", { class: "actions-col" }, h("span", { class: "sr-only" }, "Actions")))),
+        h("thead", {}, h("tr", {}, ["User ID", "Name", "Department", "Role", "E-mail", "Team", "Status", "Last sign-in"].map((c) => h("th", {}, c)), h("th", { class: "actions-col" }, h("span", { class: "sr-only" }, "Actions")))),
         h("tbody", {}, rows)))));
   }
 
@@ -289,30 +298,51 @@
       h("p", { class: "hint" }, "This password is shown only once. The employee will be asked to choose their own at first sign-in.")) });
   }
 
+  /** Teams of the Hub settings for the account form (an empty list if the settings cannot be read). */
+  async function hubTeams() {
+    try {
+      const d = await api("GET", "/api/ops/settings");
+      return d.settings.email.teams || [];
+    } catch (e) { return []; }
+  }
+
   async function userForm(user) {
     const editing = !!user;
+    const teams = await hubTeams();
+    if (user && user.team && user.team !== "__all__" && !teams.includes(user.team)) teams.push(user.team);
     const f = {
       id: h("input", { value: user ? user.user_id : "", disabled: editing, autocomplete: "off", spellcheck: "false", "aria-label": "User ID" }),
       name: h("input", { value: user ? user.name : "", autocomplete: "off", maxlength: "80", dir: "auto", "aria-label": "Name" }),
       dept: h("input", { value: user ? user.department : "", autocomplete: "off", maxlength: "80", dir: "auto", "aria-label": "Department", list: "deptList" }),
-      role: h("select", { "aria-label": "Role" }, h("option", { value: "user" }, "Employee (logs calls)"), h("option", { value: "admin" }, "Administrator")),
+      role: h("select", { "aria-label": "Role" }, h("option", { value: "user" }, "Employee (logs calls, sees own work)"),
+        h("option", { value: "manager" }, "Manager (follows a team, no call logging)"), h("option", { value: "admin" }, "Administrator")),
+      email: h("input", { type: "email", value: user ? user.email || "" : "", autocomplete: "off", maxlength: "120", dir: "ltr", spellcheck: "false", "aria-label": "E-mail" }),
+      team: h("select", { "aria-label": "Team" }, h("option", { value: "" }, "Not set"), h("option", { value: "__all__" }, "All teams"),
+        teams.map((t) => h("option", { value: t }, t))),
+      secname: h("input", { value: user ? user.security_name || "" : "", autocomplete: "off", maxlength: "120", dir: "auto", "aria-label": "Name in the security portal" }),
       pw: h("input", { type: "text", autocomplete: "off", placeholder: "Leave empty to generate one", "aria-label": "Initial password" }),
     };
     f.role.value = user ? user.role : "user";
+    f.team.value = user ? user.team || "" : "";
     const depts = h("datalist", { id: "deptList" }, (state.departments || []).map((d) => h("option", { value: d })));
     const body = h("div", { class: "dlg-body" },
       h("label", { class: "field" }, "User ID (employee number)", f.id), h("label", { class: "field" }, "Full name", f.name),
       h("label", { class: "field" }, "Department", f.dept, depts), h("label", { class: "field" }, "Role", f.role),
+      h("label", { class: "field" }, "Work e-mail", f.email, h("span", { class: "hint" }, "Links this account to the e-mails assigned to or answered by this person.")),
+      h("label", { class: "field" }, "Team", f.team, h("span", { class: "hint" }, "A manager acts on this team's e-mails; “All teams” or “Not set” means every team.")),
+      h("label", { class: "field" }, "Name in the security portal", f.secname, h("span", { class: "hint" }, "Exactly as in the portal's “مستخدم السرية” column; shows this person their security requests.")),
       editing ? null : h("label", { class: "field" }, "Initial password", f.pw));
+    const profile = () => ({ name: f.name.value, department: f.dept.value, role: f.role.value, email: f.email.value,
+      team: f.team.value, security_name: f.secname.value });
     const result = await modal({
-      title: editing ? `Edit ${user.name}` : "Add employee", body, submitLabel: editing ? "Save changes" : "Create account",
+      title: editing ? `Edit ${user.name}` : "Add account", body, submitLabel: editing ? "Save changes" : "Create account",
       onSubmit: async () => {
         if (editing) {
-          await api("PUT", `/api/admin/users/${encodeURIComponent(user.user_id)}`, { name: f.name.value, department: f.dept.value, role: f.role.value });
+          await api("PUT", `/api/admin/users/${encodeURIComponent(user.user_id)}`, profile());
           toast("Account updated");
           return { updated: true };
         }
-        return api("POST", "/api/admin/users", { user_id: f.id.value, name: f.name.value, department: f.dept.value, role: f.role.value, password: f.pw.value });
+        return api("POST", "/api/admin/users", { user_id: f.id.value, ...profile(), password: f.pw.value });
       },
     });
     if (result && result.temp_password) {
@@ -347,7 +377,8 @@
     const file = h("input", { type: "file", accept: ".csv,.xlsx", "aria-label": "File to import" });
     const body = h("div", { class: "dlg-body" },
       h("p", { class: "muted" }, "Choose an Excel (.xlsx) or CSV file. The first row must contain column titles:"),
-      h("p", {}, h("code", {}, "user_id, name, department"), " and optionally ", h("code", {}, "password")),
+      h("p", {}, h("code", {}, "user_id, name, department"), " and optionally ", h("code", {}, "password"), ", ", h("code", {}, "role"),
+        " (user or manager), ", h("code", {}, "email"), ", ", h("code", {}, "team"), ", ", h("code", {}, "security_name")),
       h("p", { class: "hint" }, "Employees without a password get a generated one. You can download the list of passwords right after the import."),
       file);
     let report = null;
@@ -436,7 +467,17 @@
       case "record_created": return `IP ${d.ip_phone} · ${reason(d.reason)}` + (d.branch ? ` · ${d.branch}` : "") + (d.note ? ` · “${d.note}”` : "");
       case "record_updated": return Object.keys(d.after || {}).map((k) => `${k.replace("_", " ")}: ${k === "reason" ? reason(d.before[k]) : d.before[k] || "—"} → ${k === "reason" ? reason(d.after[k]) : d.after[k] || "—"}`).join(" · ") + who(d.owner);
       case "record_deleted": return `${d.date} ${hhmm(d.time || "")} · IP ${d.ip_phone} · ${reason(d.reason)}` + (d.branch ? ` · ${d.branch}` : "") + who(d.owner);
-      case "user_created": return `${d.name} (${d.role})`;
+      case "user_created": return `${d.name} (${d.role})` + (d.team ? ` · team ${d.team}` : "") + (d.email ? ` · ${d.email}` : "");
+      case "ops_assign": return `→ ${d.to}` + (d.note ? ` · “${d.note}”` : "") + (d.subject ? ` · ${d.subject}` : "");
+      case "ops_unassign": case "ops_no_action": case "ops_no_action_undo": case "ops_quality_appeal": return d.subject || "";
+      case "ops_team": return `${d.from || "—"} → ${d.to}` + (d.subject ? ` · ${d.subject}` : "");
+      case "ops_quality": return d.rating + (d.reasons ? ` · ${d.reasons}` : "") + (d.subject ? ` · ${d.subject}` : "");
+      case "ops_quality_decision": return d.decision + (d.subject ? ` · ${d.subject}` : "");
+      case "ops_classification_rule": return `${d.op === "remove" ? "removed" : "added"} “${e.target}” → ${d.team}`;
+      case "ops_run_job": return `job ${e.target}`;
+      case "ops_settings_saved": return `${d.count} setting(s): ${(d.changed || []).slice(0, 6).join(", ")}${(d.changed || []).length > 6 ? "…" : ""}`;
+      case "ops_view_as": return `employee ${e.target}`;
+      case "ops_export": case "ops_report_download": return e.target + (d.rows != null ? ` · ${fmtNum(d.rows)} rows` : "");
       case "user_updated": return Object.entries(d).map(([k, v]) => `${k}: ${v.from} → ${v.to}`).join(" · ");
       case "export": return `${e.target} · ${d.from} → ${d.to} · ${fmtNum(d.rows)} rows`;
       case "users_imported": return `${d.created} created, ${d.skipped} skipped`;
@@ -461,7 +502,7 @@
       h("thead", {}, h("tr", {}, ["Time", "User", "Action", "Details", "From"].map((c) => h("th", {}, c)))),
       h("tbody", {}, d.items.map((e) => h("tr", {},
         h("td", { class: "nowrap" }, e.ts), h("td", {}, bidi(e.actor_name || e.actor || "—"), e.actor_name ? h("span", { class: "hint" }, `  ${e.actor}`) : null),
-        h("td", { class: "nowrap" }, AUDIT_LABELS[e.action] || e.action), h("td", { class: "note" }, bidi(auditDetails(e)), e.target && !e.action.startsWith("export") && !e.action.startsWith("record") ? h("span", { class: "hint" }, ` ${e.target}`) : null),
+        h("td", { class: "nowrap" }, AUDIT_LABELS[e.action] || e.action), h("td", { class: "note" }, bidi(auditDetails(e)), e.target && !e.action.startsWith("export") && !e.action.startsWith("record") && !e.action.startsWith("ops_") ? h("span", { class: "hint" }, ` ${e.target}`) : null),
         h("td", { class: "nowrap hint" }, e.ip || "")))))) : h("p", { class: "empty" }, "No log entries match.");
     panel("audit").replaceChildren(h("div", { class: "card" },
       h("div", { class: "card-head" }, h("h2", {}, "Audit log"), h("span", { class: "hint" }, "every sign-in, edit, delete, account change and export"), h("span", { class: "grow" }),

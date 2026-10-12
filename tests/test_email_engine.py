@@ -459,6 +459,10 @@ def test_linked_teams_share_reply_credit(store):
     linked = make_ctx(store, email_settings(team_link_groups={"MFA Team": ["Open System"], "Open System": ["MFA Team"]}))
     out = scan(linked, original, answer)
     assert sorted((r["team"], r["status"]) for r in out.rows) == [("MFA Team", "Replied"), ("Open System", "Replied")]
+    # "team -> teams that answer for it": Open System mails may be answered by MFA Team, not the other way round
+    one_way = rules.Directory([], {}, {"Open System": ["MFA Team"]}, [])
+    assert one_way.linked_teams("MFA Team") == {"MFA Team", "Open System"}
+    assert one_way.linked_teams("Open System") == {"Open System"}
 
 
 def test_team_directory_routing_prefix_and_people_list():
@@ -582,8 +586,8 @@ def test_sla_met_breached_within_and_escalated(ctx):
     assert (s["sla_breached"], s["escalated_count"], s["sla_compliance_rate"]) == (2, 1, 50.0)
     assert [i["subject"] for i in s["escalated_items"]] == ["stale"] and s["escalated_items"][0]["current_waiting_time"] == "1 H 30 M"
     assert all(r["sla_minutes"] == 60 for r in out.rows)
-    assert make_ctx(ctx.store, email_settings(sla_target_minutes=120)) and \
-        scan(make_ctx(ctx.store, email_settings(sla_target_minutes=120)), stale).rows[0]["escalated"] is False
+    relaxed = make_ctx(ctx.store, email_settings(sla_target_minutes=120))             # the target comes from the settings
+    assert scan(relaxed, stale).rows[0]["escalated"] is False
 
 
 def test_unanswered_mail_from_yesterday_is_carried_over(ctx):
@@ -684,7 +688,7 @@ def test_statistics_numbers(ctx):
     a, b, c = mail(subject="a", minutes_ago=100), mail(subject="b", minutes_ago=100), mail(subject="c", minutes_ago=100)
     d = mail(subject="d", minutes_ago=30, body="Thank you")
     e = mail(subject="e", minutes_ago=24 * 60 + 60)
-    out = scan(ctx, a, reply(a, after=10), b, reply(b, sender=BOB, after=30, ), c, d, e)
+    out = scan(ctx, a, reply(a, after=10), b, reply(b, sender=BOB, after=30), c, d, e)
     s = out.stats
     assert (s["business_emails"], s["replied"], s["pending"], s["no_action_needed"], s["needed_reply"]) == (4, 2, 2, 1, 3)
     assert s["reply_rate"] == pytest.approx(2 / 3 * 100)
@@ -692,7 +696,7 @@ def test_statistics_numbers(ctx):
     assert (s["team_replies"], s["total_team_replies"]) == (2, 2)
     assert (s["conversation_matches"], s["no_matches"], s["conversation_index_matches"], s["subject_matches"]) == (2, 3, 0, 0)
     unclassified = s["team_stats"]["Unclassified"]
-    assert unclassified["business_emails"] == 4 + 1 - 1 + 1 - 1 or unclassified["business_emails"] == 5
+    assert unclassified["business_emails"] == 5 and unclassified["carryover_count"] == 1      # per-team counts include carry-over
     assert unclassified["response_minutes_sum"] == 40 and unclassified["response_count"] == 2
     assert unclassified["fastest_response_minutes"] == 10
     assert s["team_stats"]["Flex Cube"]["team_emails_sent"] == 2         # Alice and Bob each sent one
@@ -772,23 +776,12 @@ def test_snapshot_round_trips_through_the_store(ctx, store):
 
 
 def test_output_is_deterministic_with_a_frozen_clock(store):
-    first = json.dumps(eng.to_snapshot_data(eng.scan_and_analyze(make_ctx(store), archive(*busy_day())), make_ctx(store)),
-                       sort_keys=False, ensure_ascii=False)
+    def snapshot(items):
+        ctx = make_ctx(store)
+        return json.dumps(eng.to_snapshot_data(eng.scan_and_analyze(ctx, archive(*items)), ctx), ensure_ascii=False)
     items = busy_day()
-    second_ns = archive(*reversed(items))                              # a different folder order gives the same answer
-    second = json.dumps(eng.to_snapshot_data(eng.scan_and_analyze(make_ctx(store), second_ns), make_ctx(store)),
-                        sort_keys=False, ensure_ascii=False)
-    normalise = lambda text: text.replace("m1", "").replace("E", "")             # ids differ between the two builds
-    first_rows = [(r["subject"], r["team"], r["status"], r["response_minutes"], r["received_time"])
-                  for r in json.loads(first)["rows"]]
-    second_rows = [(r["subject"], r["team"], r["status"], r["response_minutes"], r["received_time"])
-                   for r in json.loads(second)["rows"]]
-    assert first_rows == second_rows and normalise(first)
-    same = json.dumps(eng.to_snapshot_data(eng.scan_and_analyze(make_ctx(store), archive(*items)), make_ctx(store)),
-                      ensure_ascii=False)
-    again = json.dumps(eng.to_snapshot_data(eng.scan_and_analyze(make_ctx(store), archive(*items)), make_ctx(store)),
-                       ensure_ascii=False)
-    assert same == again
+    assert snapshot(items) == snapshot(items)
+    assert snapshot(items) == snapshot(list(reversed(items)))            # the order Outlook hands items over does not matter
 
 
 def test_run_scan_returns_snapshot_summary_and_history_point(ctx):
@@ -968,3 +961,66 @@ def test_the_team_member_list_never_contains_real_data():
         text = path.read_text(encoding="utf-8")
         forbidden = ("nbe" + ".com.eg", "ahly" + ".bank", "base64" + ",")
         assert not any(word in text for word in forbidden), path.name
+
+
+# ------------------------------------------------------------------------ agreement with the web overlay
+def test_snapshot_uses_the_web_wording_for_durations_and_carries_override_details(store):
+    answered, waiting = mail(subject="answered", minutes_ago=100), mail(subject="waiting", minutes_ago=90)
+    store.set_override("quality", mid(answered), {"rating": "Good", "reviewed_by": "boss", "reviewed_at": "2026-10-11T10:00:00"})
+    store.set_override("quality", mid(waiting), {"rating": "Good"})                       # nobody replied: no rating shown
+    store.set_override("assignments", mid(waiting), {"assigned_to_email": DAVE, "assigned_to_name": "Dave", "note": "n",
+                                                     "marked_by": "boss", "marked_at": "2026-10-11T10:05:00"})
+    ctx = make_ctx(store)
+    out = scan(ctx, answered, reply(answered, after=65), waiting)
+    memory = {r["subject"]: r for r in out.rows}
+    assert memory["answered"]["first_response_time"] == "1 H 5 M" and memory["waiting"]["current_waiting_time"] == "1 H 30 M"
+    by = {r["subject"]: r for r in eng.to_snapshot_data(out, ctx)["rows"]}
+    assert by["answered"]["first_response_time"] == "1 H 5 Min" and by["answered"]["current_waiting_time"] == ""
+    assert by["waiting"]["current_waiting_time"] == "1 H 30 Min" and by["waiting"]["first_response_time"] == ""
+    assert (by["answered"]["quality_rating"], by["answered"]["quality_reviewed_by"]) == ("Good", "boss")
+    assert by["waiting"]["quality_rating"] == ""
+    assert (by["waiting"]["assigned_note"], by["waiting"]["assigned_by"], by["waiting"]["assigned_at"]) == (
+        "n", "boss", "2026-10-11T10:05:00")
+
+
+def test_the_web_overlay_agrees_with_the_collector_on_its_own_rows(store):
+    from calllog.ops import overlay
+    split = mail(subject="Two systems", conv="CONV-M", minutes_ago=90, body="FCUBS login fails and DWP is down")
+    thanks = mail(subject="Thanks", body="Thank you")
+    marked = mail(subject="Marked", minutes_ago=40)
+    answered = mail(subject="Rated", minutes_ago=100)
+    store.set_override("no_action", mid(marked), {"marked_by": "boss", "marked_at": "2026-10-11T09:30:00"})
+    store.set_override("quality", mid(answered), {"rating": "Excellent", "reviewed_by": "boss"})
+    store.set_override("assignments", mid(thanks), {"assigned_to_email": DAVE, "assigned_to_name": "Dave"})
+    store.set_override("team", mid(marked), {"team": "Third Party", "marked_by": "boss", "marked_at": "x"})
+    ctx = make_ctx(store)
+    out = scan(ctx, split, reply(split), thanks, marked, answered, reply(answered, sender=CAROL))
+    data = eng.to_snapshot_data(out, ctx)
+    overrides = {name: store.overrides(name) for name in schemas.OVERRIDES}
+    rows = overlay.apply_overrides(data["rows"], overrides, NOW)
+    key = lambda r: (r["row_id"], r["status"], r["team"], r["quality_rating"], r["assigned_to_email"], r["escalated"])
+    assert sorted(map(key, rows)) == sorted(map(key, data["rows"]))
+    recounted = overlay.recount(rows, data["stats"])
+    for name in ("business_emails", "replied", "pending", "no_action_needed", "needed_reply", "reply_rate",
+                 "sla_breached", "escalated_count", "carryover_count", "average_response"):
+        assert recounted[name] == pytest.approx(data["stats"][name]), name
+
+
+def test_the_substring_prefilter_never_changes_a_match():
+    """Each keyword is only run through its regex when its first word occurs in the text; prove that is a pure speed-up."""
+    r = rules.build_rules({"classification": {"system_team_map": {"Swift Alliance": "Third Party", "سويفت": "Third Party",
+                                                                  "FCUBS": "Third Party"}}})
+    texts = ["Flex-Cube E-form ACH reach", "المصادقه البيومتريه والاوراكل", "x" * 50, "", "OBDX FC GL fc gl"]
+    for words in rules.SYSTEM_KEYWORDS.values():
+        for w in words:
+            texts += [f"please check {w} today", w.upper(), w.lower() + "-x", "x" + w, w.replace(" ", "-"), w.replace(" ", "_")]
+    for text in texts:
+        normalised = rules.normalize_arabic(text)
+        for patterns in (r._builtin, r._mine):
+            brute = [(kw, team) for kw, team, pattern, _needle in patterns if pattern.search(normalised)]
+            assert r._scan(patterns, normalised) == brute, text
+    for phrase in rules.NO_ACTION_KEYWORDS_EN + rules.NO_ACTION_KEYWORDS_AR:
+        reason = r.explain_no_action("x", f"well, {phrase}.")[1]
+        assert reason.startswith("Matched closing phrase"), phrase
+    for word in rules.ACTION_SIGNAL_WORDS:
+        assert r.has_action_signal(rules.normalize_arabic(f"so {word} now".lower())), word

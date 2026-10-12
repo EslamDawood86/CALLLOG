@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
 from ..settings import DEFAULT_TEAMS
-from .common import OUTLOOK_LOCK, JobResult
+from .common import OUTLOOK_LOCK, JobResult, fmt_minutes
 from .email_rules import (
     UNCLASSIFIED, Directory, build_quality_leaderboard, build_quality_scorecard, build_rules,
     build_speed_quality_matrix, build_team_quality_index, candidate_words, clean_subject, format_duration,
@@ -56,7 +56,8 @@ PREVIEW_CHARS = 300                          # body text in the snapshot
 NEAREST_REPLY_MAX_GAP_MINUTES = 240
 TREND_METRICS = ("business_emails", "replied", "pending", "no_action_needed", "reply_rate", "average_response",
                  "sla_breached")
-TREND_HISTORY_FILES = 30                     # newest history day files read per scan (the trend needs 7 days, quality 14)
+STATS_HISTORY_FILES = 10                     # newest history day files read per scan: the trend looks back 7 days...
+QUALITY_HISTORY_FILES = 30                   # ...the quality trend 14 days that had a report
 
 
 class OutlookUnavailable(RuntimeError):
@@ -692,7 +693,8 @@ def _pending_status(cfg, waiting_minutes):
 
 def _new_row(cfg, customer, cls, ovr, status_info):
     key = customer.get("message_id", "")
-    review = ovr["quality"].get(key) or {}
+    # a rating belongs to a real reply: a mail nobody answered carries none (the web overlay applies the same rule)
+    review = (ovr["quality"].get(key) or {}) if status_info["status"] == "Replied" else {}
     assignment = ovr["assignments"].get(key) or {}
     first, last, replies = status_info["first_reply"], status_info["last_reply"], status_info["replies"]
     people_by_team = defaultdict(set)
@@ -756,6 +758,11 @@ def _new_row(cfg, customer, cls, ovr, status_info):
         "diag_no_action_reason": status_info["no_action_reason"],
         "assigned_to_email": assignment.get("assigned_to_email", ""),
         "assigned_to_name": assignment.get("assigned_to_name", ""),
+        "assigned_note": assignment.get("note", ""),
+        "assigned_by": assignment.get("marked_by", ""),
+        "assigned_at": assignment.get("marked_at", ""),
+        "quality_reviewed_by": review.get("reviewed_by", ""),
+        "quality_reviewed_at": review.get("reviewed_at", ""),
         "quality_rating": review.get("rating", ""),
         "quality_note": review.get("note", ""),
         "quality_reasons": review.get("reasons", ""),
@@ -823,7 +830,7 @@ def _split_rows(cfg, base_row, customer, replies, teams_replied, split_teams, no
                 escalated=escalated, is_carryover=age_days > 0,
                 # quality belongs to the reply that was given, not to a team that has not answered yet
                 quality_rating="", quality_note="", quality_reasons="", quality_appeal="", appeal_decision="",
-                rating_withdrawn=False)
+                rating_withdrawn=False, quality_reviewed_by="", quality_reviewed_at="")
         children.append(child)
     return children
 
@@ -1035,12 +1042,12 @@ def _history_docs(store, key, limit):
     return out
 
 
-def load_stats_history(store, limit=TREND_HISTORY_FILES):
+def load_stats_history(store, limit=STATS_HISTORY_FILES):
     """{day: {metric: value}} - the daily finals saved by the report."""
     return _history_docs(store, "final", limit)
 
 
-def load_quality_history(store, limit=TREND_HISTORY_FILES):
+def load_quality_history(store, limit=QUALITY_HISTORY_FILES):
     """{day: {person: {score, reviewed, needs, team}}}."""
     return _history_docs(store, "quality", limit)
 
@@ -1181,6 +1188,10 @@ def scan_and_analyze(ctx, namespace=None, keep_mail_items=False):
         raise ConfigProblem("No team member is set (Settings > E-mail > team_members).")
     now = ctx.now()
     info = {}
+    unknown = sorted(set(cfg.address_team_map) - cfg.business)
+    if unknown:
+        ctx.log(f"{len(unknown)} address_team_map mailbox(es) are not in business_emails, so their mail is not scanned: "
+                + ", ".join(unknown))
     with OUTLOOK_LOCK:                              # one Outlook COM conversation at a time in this process
         if namespace is None:
             _outlook, namespace = connect_outlook(ctx)
@@ -1209,6 +1220,9 @@ def snapshot_row(row, now):
         duration = _minutes_between(replied_at, received)
     elif status == "Pending Reply" and received:
         duration = _minutes_between(now, received)
+    # the web wording ("1 H 5 Min"); the in-memory rows keep the old reports' "1 H 5 M" for Excel and e-mails
+    first_response = fmt_minutes(row.get("response_minutes")) if row.get("response_minutes") is not None else ""
+    waiting = (fmt_minutes(max(0, _minutes_between(now, received))) if received and not replied_at else "")
     return {
         "subject": row.get("subject", ""),
         "entry_id": row.get("entry_id", ""),
@@ -1232,13 +1246,13 @@ def snapshot_row(row, now):
         "first_reply_by": row.get("first_reply_by", ""),
         "first_reply_email": row.get("first_reply_email", ""),
         "first_reply_time": _iso(replied_at),
-        "first_response_time": row.get("first_response_time", ""),
+        "first_response_time": first_response,
         "response_minutes": row.get("response_minutes"),
         "duration_minutes": duration,
         "reply_count": row.get("reply_count", 0),
         "multiple_team_reply": bool(row.get("multiple_team_reply")),
         "multiple_team_reply_team": row.get("multiple_team_reply_team", ""),
-        "current_waiting_time": row.get("current_waiting_time", ""),
+        "current_waiting_time": waiting,
         "status": status,
         "sla_minutes": row.get("sla_minutes", 0),
         "sla_status": row.get("sla_status", ""),
@@ -1252,6 +1266,11 @@ def snapshot_row(row, now):
         "reply_by_manager": bool(row.get("reply_by_manager")),
         "assigned_to_email": row.get("assigned_to_email", ""),
         "assigned_to_name": row.get("assigned_to_name", ""),
+        "assigned_note": row.get("assigned_note", ""),
+        "assigned_by": row.get("assigned_by", ""),
+        "assigned_at": row.get("assigned_at", ""),
+        "quality_reviewed_by": row.get("quality_reviewed_by", ""),
+        "quality_reviewed_at": row.get("quality_reviewed_at", ""),
         "quality_rating": row.get("quality_rating", ""),
         "quality_note": row.get("quality_note", ""),
         "quality_reasons": row.get("quality_reasons", ""),
@@ -1336,6 +1355,7 @@ def run_scan(ctx, namespace=None):
         outcome = scan_and_analyze(ctx, namespace)
         data = to_snapshot_data(outcome, ctx)
     except (ConfigProblem, OutlookUnavailable) as exc:
+        ctx.log(f"E-mail scan cannot run: {exc}")
         return JobResult(ok=False, error=str(exc))
     except Exception as exc:
         ctx.log(f"E-mail scan failed: {type(exc).__name__}: {exc}")

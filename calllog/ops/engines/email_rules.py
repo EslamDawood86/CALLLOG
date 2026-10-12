@@ -250,6 +250,9 @@ CUSTOM_PATTERNS = {
     "e form": re.compile(r"\be[\s\-_]?form\b", re.IGNORECASE),
 }
 
+# What a custom pattern must contain literally: lets the matcher skip it with a fast substring test.
+CUSTOM_NEEDLES = {"flex cube": "flex", "e form": "form"}
+
 SHORT_REPLY_WORD_LIMIT = 6
 FORWARD_FALLBACK_WORD_LIMIT = 10
 UNCLASSIFIED = "Unclassified"
@@ -460,6 +463,14 @@ def _system_pattern(keyword, strict=False):
     return re.compile(body, re.IGNORECASE)
 
 
+def _needle(keyword):
+    """A lower-case string every match of the keyword must contain (its first word). Checking ``needle in text`` is much
+    cheaper than running the regex, and most of ~140 keywords are absent from any given mail."""
+    first = CUSTOM_NEEDLES.get(_key(keyword)) or (normalize_arabic(keyword).split() or [""])[0]
+    low = first.lower()
+    return low if low == first.casefold() else ""
+
+
 # Words too generic to suggest as a rule keyword when a mail stays unclassified.
 _HINT_STOPWORDS = frozenset((
     "re", "fw", "fwd", "tr", "the", "and", "for", "with", "from", "this", "that", "please", "kindly", "request",
@@ -515,13 +526,13 @@ class Rules:
         signals |= {normalize_arabic(str(w).lower().strip()) for w in advanced.get("action_signal_words") or []
                     if str(w).strip()}
         self._signal_symbols = {w for w in signals if not any(c.isalpha() for c in w)}
-        self._signal_patterns = [compile_exact_phrase(w) for w in sorted(signals - self._signal_symbols)]
+        self._signal_patterns = [(w, compile_exact_phrase(w)) for w in sorted(signals - self._signal_symbols)]
 
     def has_action_signal(self, text):
         """``text`` already lower-cased and Arabic-normalised."""
         if any(symbol in text for symbol in self._signal_symbols):
             return True
-        return any(p.search(text) for p in self._signal_patterns)
+        return any(word in text and pattern.search(text) for word, pattern in self._signal_patterns)
 
     def is_short_no_action_reply(self, subject, body):
         """A very short message with no request / question signal in it."""
@@ -537,7 +548,7 @@ class Rules:
         combined = normalize_arabic(f"{subject or ''} {body or ''}".lower())
         signal = self.has_action_signal(combined)
         for keyword, pattern in self._no_action:
-            if pattern.search(combined):
+            if keyword in combined and pattern.search(combined):
                 if signal:
                     return False, (f'Matched closing phrase "{keyword}", but an action-request signal was also '
                                    "present - kept as Pending instead.")
@@ -577,21 +588,24 @@ class Rules:
 
     # ------------------------------------------------------------------ systems and teams
     def _build_systems(self, classification, advanced):
+        def usable(word, team):
+            return bool(team) and bool(normalize_arabic(str(word)).split())
+
         builtin = {}
         for team, words in SYSTEM_KEYWORDS.items():
             for word in words:
                 builtin[_key(word)] = (word, team)
         for word, team in (advanced.get("system_team_map") or {}).items():
-            if str(word).strip() and team:
+            if usable(word, team):
                 builtin[_key(word)] = (str(word).strip(), team)
         mine = {}
         for word, team in (classification.get("system_team_map") or {}).items():
-            if str(word).strip() and team:
+            if usable(word, team):
                 mine[_key(word)] = (str(word).strip(), team)
         for key in mine:                 # an admin rule replaces the built-in rule for the same keyword
             builtin.pop(key, None)
-        self._builtin = [(kw, team, _system_pattern(kw)) for kw, team in builtin.values()]
-        self._mine = [(kw, team, _system_pattern(kw, strict=True)) for kw, team in mine.values()]
+        self._builtin = [(kw, team, _system_pattern(kw), _needle(kw)) for kw, team in builtin.values()]
+        self._mine = [(kw, team, _system_pattern(kw, strict=True), _needle(kw)) for kw, team in mine.values()]
 
     def _strip_noise(self, text):
         text = str(text or "")
@@ -599,7 +613,9 @@ class Rules:
 
     @staticmethod
     def _scan(patterns, text):
-        return [(kw, team) for kw, team, pattern in patterns if pattern.search(text)]
+        lowered = text.lower()
+        return [(kw, team) for kw, team, pattern, needle in patterns
+                if (not needle or needle in lowered) and pattern.search(text)]
 
     def _pick_team(self, matches):
         """Owner of a set of matches: the team with the most DISTINCT applications; a tie goes by team priority."""
@@ -664,12 +680,13 @@ class Rules:
 def build_rules(email_settings):
     """Rules for an e-mail settings section (``ctx.settings``). Cached: compiling ~250 patterns once per setting set."""
     settings = email_settings or {}
-    key = json.dumps([settings.get("classification"), settings.get("advanced")], sort_keys=True, default=str)
+    classification, advanced = settings.get("classification") or {}, settings.get("advanced") or {}
+    key = json.dumps([classification, advanced], sort_keys=True, default=str)
     rules = _RULES_CACHE.get(key)
     if rules is None:
         if len(_RULES_CACHE) > 8:
             _RULES_CACHE.clear()
-        rules = _RULES_CACHE[key] = Rules(settings.get("classification"), settings.get("advanced"))
+        rules = _RULES_CACHE[key] = Rules(classification, advanced)
     return rules
 
 
@@ -688,8 +705,19 @@ class Directory:
         for members in self.members_by_team.values():
             self.members |= members
         self.managers = norm_set(managers)
-        self.link_groups = {team: set(group or ()) for team, group in (link_groups or {}).items()}
+        self._covers = self._build_covers(link_groups or {})
         self._lookup = self._build_lookup()
+
+    @staticmethod
+    def _build_covers(link_groups):
+        """``link_groups`` is "team -> [teams that answer for it]" (settings ``team_link_groups``). Inverted: a reply from
+        a member of X covers X and every team that lists X. A symmetric group (the old Open System <-> MFA Team pair)
+        therefore works in both directions."""
+        covers = defaultdict(set)
+        for team, answering in link_groups.items():
+            for other in answering or ():
+                covers[other].add(team)
+        return covers
 
     def _build_lookup(self):
         lookup, stripped = {}, []
@@ -708,8 +736,8 @@ class Directory:
         return self._lookup.get(norm_email(email))
 
     def linked_teams(self, team):
-        """Teams that share reply credit with ``team`` (always includes ``team`` itself)."""
-        return {team} | self.link_groups.get(team, set())
+        """Teams a reply from a member of ``team`` answers (always includes ``team`` itself)."""
+        return {team} | self._covers.get(team, set())
 
     def is_manager(self, email):
         return norm_email(email) in self.managers

@@ -404,7 +404,7 @@ def test_recount_is_idempotent_without_overrides_and_math_after_overrides():
     assert stats["reply_rate"] == round(2 / 3 * 100, 2)
     assert stats["assigned_count"] == 1 and stats["escalated_count"] == 1
     flex, card = stats["team_stats"]["Flex Cube"], stats["team_stats"]["Card Management"]
-    assert (flex["business_emails"], flex["replied"], flex["no_action_needed"]) == (4, 1, 2)
+    assert (flex["business_emails"], flex["replied"], flex["no_action_needed"]) == (5, 1, 2)       # like the collector, a team's count includes its carry-over rows
     assert (card["business_emails"], card["replied"]) == (1, 1) and card["fastest_response_minutes"] == 90
     assert stats["quality"]["reviewed"] == 2 and stats["quality"]["excellent"] == 1
     assert stats["quality"]["needs_improvement"] == 1 and stats["quality"]["appeals"] == 1
@@ -458,6 +458,22 @@ def test_manager_sees_only_their_team_with_recounted_stats(admin, flex_mgr, mgr,
     assert "Card limit change" not in json.dumps(mine) and "Card limit change" in json.dumps(full)
     assert len(mgr.get("/api/ops/email").get_json()["data"]["rows"]) == 6          # team "__all__" = everything
     assert mine["options"]["people"] == [] and mine["options"]["scope"] == "Flex Cube"
+
+
+def test_manager_quality_sections_carry_nothing_about_other_teams(admin, flex_mgr, hub, ops):
+    data = email_data([email_row("<q1>"), replied_row("<q2>", "bob@example.test")])
+    data["quality"] = {
+        "scorecard": [{"name": "Bob F", "team": "Flex Cube", "score": 90}, {"name": "Cora C", "team": "Card Management", "score": 40}],
+        "team_index": {"Flex Cube": 90, "Card Management": 40},
+        "leaderboard_top": [{"name": "Bob F", "team": "Flex Cube"}, {"name": "Cora C", "team": "Card Management"}],
+        "person_trends": [{"name": "No Team Given"}], "repeat_issue_alerts": [{"issue": "x", "team": "Card Management"}]}
+    put_snapshot(ops, "email", data)
+    mine = flex_mgr.get("/api/ops/email").get_json()["data"]
+    assert [p["name"] for p in mine["quality"]["scorecard"]] == ["Bob F"]
+    assert mine["quality"]["team_index"] == {"Flex Cube": 90}
+    assert [p["name"] for p in mine["quality"]["leaderboard_top"]] == ["Bob F"]
+    assert mine["quality"]["person_trends"] == [] and mine["quality"]["repeat_issue_alerts"] == []
+    assert len(admin.get("/api/ops/email").get_json()["data"]["quality"]["scorecard"]) == 2
 
 
 def test_options_people_come_from_settings_and_are_scoped(admin, flex_mgr, hub):
@@ -590,8 +606,8 @@ def test_appeal_and_decision_flow(app, admin, mgr, flex_mgr, make_account, hub, 
     assert mgr.post("/api/ops/email/quality", {"message_id": "<r1@x>", "rating": "Needs Improvement",
                                                "reasons": "Too slow"}).status_code == 200
     # only the replier may appeal
-    assert carol.post("/api/ops/email/quality/appeal", {"message_id": "<r1@x>", "appeal": "not mine"}).status_code == 403
-    assert admin.post("/api/ops/email/quality/appeal", {"message_id": "<r1@x>", "appeal": "admin cannot"}).status_code == 403
+    assert carol.post("/api/ops/email/quality/appeal", {"message_id": "<r1@x>", "appeal": "not mine"}).status_code == 404
+    assert admin.post("/api/ops/email/quality/appeal", {"message_id": "<r1@x>", "appeal": "admin cannot"}).status_code == 404
     assert bob.post("/api/ops/email/quality/appeal", {"message_id": "<r1@x>", "appeal": "ok"}).status_code == 400   # too short
     assert bob.post("/api/ops/email/quality/appeal", {"message_id": "<nope>", "appeal": "unfair rating"}).status_code == 404
     assert bob.post("/api/ops/email/quality/appeal", {"message_id": "<r1@x>", "appeal": "The customer asked late"}).status_code == 200
@@ -609,6 +625,16 @@ def test_appeal_and_decision_flow(app, admin, mgr, flex_mgr, make_account, hub, 
     assert rows["<r1@x>"]["rating_withdrawn"] is True and rows["<r1@x>"]["appeal_decision"] == "Accepted"
     acts = [a[0] for a in audit_actions(app, clock)]
     assert {"ops_quality", "ops_quality_appeal", "ops_quality_decision"} <= set(acts)
+
+
+def test_appeal_needs_a_signed_in_user_and_csrf(app, emp, hub):
+    body = {"message_id": "<r1@x>", "appeal": "please look again"}
+    anon = app.test_client()
+    with anon.session_transaction() as s:
+        s["csrf"] = "tok"
+    assert anon.post("/api/ops/email/quality/appeal", json=body, headers={"X-CSRF-Token": "tok"}).status_code == 401
+    assert emp.client.post("/api/ops/email/quality/appeal", json=body).status_code == 400
+    assert emp.post("/api/ops/email/quality/appeal", body).status_code == 404         # alice has no rating on that mail
 
 
 def test_decision_needs_an_appeal_and_team_access(admin, mgr, make_account, hub, ops):
@@ -673,6 +699,8 @@ def test_classification_rule_validation(admin, hub):
                  {"keyword": "swift"}, {"team": "Flex Cube"}):
         assert admin.post("/api/ops/email/classification/rule", body).status_code == 400, body
     assert admin.delete("/api/ops/email/classification/rule", json={}).status_code == 400
+    assert admin.delete("/api/ops/email/classification/rule", json=[1, 2]).status_code == 400          # not an object
+    assert admin.delete("/api/ops/email/assign", json=[1]).status_code == 400
 
 
 def test_manager_rules_are_limited_to_their_own_team(admin, flex_mgr, mgr, hub, ops):
