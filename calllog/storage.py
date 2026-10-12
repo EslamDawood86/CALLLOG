@@ -176,6 +176,7 @@ class Store:
     TTL_SMALL = 2.0             # users.json
     TTL_LISTS = 10.0            # reasons.json, branches.json
     SHARE_TTL = 2.0             # how long a computed admin result is shared
+    STALE_FACTOR = 10           # ... and how long (x SHARE_TTL) it may still be served while another request re-computes it
     ROLLUP_TTL_OLD = 300.0      # a past day's summary is re-built at most every 5 minutes (edits here: at once)
     IO_THREADS = 16             # parallel reads when a lot of files are needed
 
@@ -300,12 +301,19 @@ class Store:
                     del self._rollups[k]
 
     def memo(self, key, compute, ttl=None):
-        """Compute ``compute()`` once and share the result for a moment (heavy admin aggregates)."""
+        """Compute ``compute()`` once and share the result for a moment (heavy admin aggregates).
+
+        While somebody else is already re-computing an expired result, a request that holds the previous one (younger
+        than ``STALE_FACTOR`` x the sharing time) uses it instead of waiting - nobody queues behind a slow share."""
         ttl = self.SHARE_TTL if ttl is None else ttl
         with self._cache_lock:
             hit = self._memo.get(key)
             if hit and time.monotonic() - hit[0] < ttl:
                 return hit[1]
+        if hit and time.monotonic() - hit[0] < ttl * self.STALE_FACTOR:
+            if not self._compute_lock.acquire(blocking=False):
+                return hit[1]
+            self._compute_lock.release()
         with self._compute_lock:      # everybody else waits for the first one, then reuses its result
             with self._cache_lock:
                 hit = self._memo.get(key)

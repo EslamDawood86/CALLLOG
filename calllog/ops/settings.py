@@ -4,6 +4,7 @@ No secret is stored here - portal passwords live in Windows Credential Manager (
 Unknown keys are kept as they are; known keys are checked and normalised (e-mail addresses lower-case, de-duplicated).
 """
 import copy
+import json
 import re
 
 DEFAULT_TEAMS = ["MFA Team", "Flex Cube", "Card Management", "Third Party", "Open System", "Unclassified"]
@@ -114,14 +115,18 @@ class SettingsError(ValueError):
 
 
 def deep_merge(base, over):
-    """``over`` on top of ``base``: dicts merge key by key, everything else is replaced."""
+    """``over`` on top of ``base``: dicts merge key by key, everything else is replaced. Neither argument is changed."""
     out = copy.deepcopy(base)
+    _merge_into(out, over)
+    return out
+
+
+def _merge_into(out, over):
     for k, v in (over or {}).items():
         if isinstance(v, dict) and isinstance(out.get(k), dict) and k not in _FREE_DICTS:
-            out[k] = deep_merge(out[k], v)
+            _merge_into(out[k], v)
         else:
             out[k] = copy.deepcopy(v)
-    return out
 
 
 # dict-valued settings whose KEYS are data (teams, names), so a saved dict must replace the default, not merge into it
@@ -413,9 +418,16 @@ def validate(raw):
 
 
 def load(store):
-    """Current settings (defaults + saved file). A damaged value falls back to the default for that key."""
-    clean, _ = validate(store.read_settings_raw())
-    return clean
+    """Current settings (defaults + saved file). A damaged value falls back to the default for that key.
+
+    Checking all the settings takes a moment and nearly every page request needs them, so the checked result is kept
+    until the saved file changes. The caller gets its own copy and may change it."""
+    raw = store.read_settings_raw()
+    cached = getattr(store, "_validated_settings", None)
+    if cached is None or not (cached[0] is raw or cached[0] == raw):
+        clean, _ = validate(raw)
+        cached = store._validated_settings = (raw, json.dumps(clean, ensure_ascii=False))
+    return json.loads(cached[1])
 
 
 def save(store, new_settings):

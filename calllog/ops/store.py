@@ -19,6 +19,7 @@ from . import schemas
 
 LOG_ROTATE_BYTES = 1_000_000
 HISTORY_KEEP_DAYS = 60
+_MISSING = object()        # cached "this file does not exist"
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$")
 
 
@@ -32,7 +33,9 @@ def now_iso(now=None):
 
 
 class OpsStore:
-    TTL = 1.0       # seconds a parsed file is reused before the share is asked again
+    TTL = 1.0           # seconds a parsed file is reused before the share is asked again
+    STALE_LIMIT = 15.0  # ... with the background refresher running: how old it may get before a request re-checks it
+    IDLE_DROP = 300.0   # the refresher stops watching a file nobody asked for in this many seconds
 
     def __init__(self, data_dir):
         self.root = Path(data_dir) / "ops"
@@ -48,8 +51,12 @@ class OpsStore:
         self.reports_dir = self.root / "reports"
         self.locks_dir = self.root / "locks"
         self.settings_path = self.root / "settings.json"
-        self._cache = {}
+        self._cache = {}                        # path -> (size/mtime signature, parsed data or _MISSING, time checked)
+        self._used = {}                         # path -> time of the last request for it
         self._cache_lock = threading.Lock()
+        self._refresher = None
+        self._refresher_stop = threading.Event()
+        self._last_round = 0.0
         self._locks = {}
         self._locks_guard = threading.Lock()
 
@@ -99,21 +106,30 @@ class OpsStore:
             lock._thread_lock.release()
 
     def read_json(self, path, default=None):
-        """Parsed JSON file (cached for TTL seconds, re-read when its size/mtime changed). Treat as read-only."""
+        """Parsed JSON file (cached, re-read when its size/mtime changed). Treat as read-only.
+
+        A file is re-checked on the share at most every ``TTL`` seconds - or, while the background refresher runs
+        (``start_refresher``), by the refresher only, so a page request never waits for the share. A file that does not
+        exist is remembered too (``default`` is returned) instead of being asked for again and again."""
         path = Path(path)
         key, now = str(path), time.monotonic()
         with self._cache_lock:
             hit = self._cache.get(key)
-            if hit and now - hit[2] < self.TTL:
-                return hit[1]
+            self._used[key] = now
+            if hit and (now - hit[2] < self.TTL or (now - hit[2] < self.STALE_LIMIT and self._refresher_alive(now))):
+                return default if hit[1] is _MISSING else hit[1]
+        return self._load(key, path, hit, now, default)
+
+    def _load(self, key, path, hit, now, default):
+        """Check ``path`` on the share and (re)parse it if it changed. ``hit`` is the cache entry seen by the caller."""
         try:
             st = path.stat()
         except FileNotFoundError:
             with self._cache_lock:
-                self._cache.pop(key, None)
+                self._cache[key] = (None, _MISSING, now)
             return default
         sig = (st.st_mtime_ns, st.st_size)
-        if hit and hit[0] == sig:
+        if hit and hit[0] == sig and hit[1] is not _MISSING:
             with self._cache_lock:
                 self._cache[key] = (sig, hit[1], now)
             return hit[1]
@@ -127,6 +143,55 @@ class OpsStore:
             if len(self._cache) > 400:
                 self._cache.clear()
         return data
+
+    # ------------------------------------------------------- background refresher
+    def start_refresher(self, interval=1.0, warm=None):
+        """Re-check, once per ``interval`` seconds, the files that pages have asked for lately - so requests are answered
+        from memory and never wait for the shared folder. ``warm()`` (optional) runs every round, e.g. to rebuild a
+        shared result. Safe to call twice. Without the refresher every request re-checks an expired file itself."""
+        with self._cache_lock:
+            if self._refresher is not None and self._refresher.is_alive():
+                return
+            self._refresher_stop.clear()
+            self._last_round = time.monotonic()
+            self._refresher = threading.Thread(target=self._refresh_loop, args=(float(interval), warm),
+                                               name="ops-refresher", daemon=True)
+            self._refresher.start()
+
+    def stop_refresher(self):
+        self._refresher_stop.set()
+        thread = self._refresher
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=5)
+        self._refresher = None
+
+    def _refresher_alive(self, now):
+        thread = self._refresher
+        return thread is not None and thread.is_alive() and now - self._last_round < self.STALE_LIMIT
+
+    def _refresh_loop(self, interval, warm):
+        while not self._refresher_stop.is_set():
+            started = time.monotonic()
+            with self._cache_lock:
+                keys = [k for k in self._cache if started - self._used.get(k, 0) < self.IDLE_DROP]
+                for k in [k for k in self._used if started - self._used[k] >= self.IDLE_DROP]:
+                    del self._used[k]
+            for key in keys:
+                with self._cache_lock:
+                    hit = self._cache.get(key)
+                if hit is None:
+                    continue
+                try:
+                    self._load(key, Path(key), hit, time.monotonic(), None)
+                except (StorageError, OSError, ValueError):
+                    pass                               # a bad file: the next request that needs it reports it
+            if warm is not None:
+                try:
+                    warm()
+                except Exception:                      # noqa: BLE001 - the refresher must never die
+                    pass
+            self._last_round = time.monotonic()
+            self._refresher_stop.wait(max(0.05, interval - (time.monotonic() - started)))
 
     def write_json(self, path, data):
         path = Path(path)

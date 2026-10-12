@@ -46,6 +46,32 @@ def bootstrap_admin(store, clock):
     return password
 
 
+def start_refresher(app, interval=1.0):
+    """Keep the files and shared results that pages keep asking for fresh in the background, so a request is answered
+    from memory and never waits for the shared folder (60 people, one slow share). ``run.py`` calls this once the app
+    exists; tests and one-off scripts simply do not. Everything is read once before the first visitor arrives."""
+    from .ops import api as ops_api, schemas
+
+    def warm():
+        with app.app_context():
+            ops_api.hub_cfg()
+            ops_api.job_states()
+            ops_api.current_overrides()
+            email, _ = ops_api.read_snapshot("email")
+            for module in schemas.MODULES:
+                ops_api.read_snapshot(module)
+            if email:
+                ovr, rev = ops_api.current_overrides()
+                ops_api.email_view(email, None, ovr, False, rev)                 # the administrators' view of the mails
+            ops_api.calls_totals(app.config["CLOCK"]().date().isoformat())
+
+    try:
+        warm()
+    except Exception as exc:                                                       # noqa: BLE001 - warming is optional
+        app.logger.warning("warm-up skipped: %s", exc)
+    app.extensions["ops"].start_refresher(interval, warm=warm)
+
+
 def create_app(overrides=None):
     cfg = load_config()
     cfg.update(overrides or {})
@@ -124,6 +150,21 @@ def create_app(overrides=None):
         return resp
 
     app.register_error_handler(ApiError, api_error_response)
+
+    @app.get("/healthz")
+    def healthz():
+        """For a monitoring tool or a quick look in the browser: no sign-in, no names, nothing but yes/no and the time."""
+        from .ops import health as ops_health, settings as hub_settings
+        ops = app.extensions["ops"]
+        now = app.config["CLOCK"]()
+        try:
+            store.users()                                              # the data folder can be read
+            states = ops_health.job_states(ops, hub_settings.load(ops), now)
+        except Exception as exc:                                       # noqa: BLE001 - this page must always answer
+            app.logger.error("healthz: %s", exc)
+            return jsonify(ok=False, time=now.isoformat(timespec="seconds"), collectors={}), 503
+        return jsonify(ok=True, time=now.isoformat(timespec="seconds"),
+                       collectors={job: bool(state.get("online")) for job, state in states.items()})
 
     @app.errorhandler(StorageError)
     def storage_error(exc):
