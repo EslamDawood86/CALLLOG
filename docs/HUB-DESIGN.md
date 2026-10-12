@@ -63,28 +63,52 @@ testable here. Do not add pandas to the project.
 | role | home page | can |
 |---|---|---|
 | `admin` | `/hub` **Admin dashboard** | everything: all modules, all teams, settings, collectors, users, audit, "view as employee" |
-| `manager` | `/hub` | sees the same dashboards, acts on e-mails (assign, no-action, team, quality, classification rules) for **their team** (`user.team`; empty or `__all__` = all teams); no settings, no user management; cannot log calls |
+| `manager` | `/hub` | sees the same dashboards, acts on e-mails (assign, no-action, team, quality, classification rules) for **their teams** (`user.teams`; empty or `__all__` = all teams); no settings, no user management; cannot log calls |
 | `user` (employee) | `/my` **My work** | logs calls as today (`/dashboard`), and sees *everything that is theirs* under their own user (section 3.2) plus the shared team strip |
 
 User profile fields (all optional): `email` (their mailbox, lower-case; links replies and assignments to the account),
-`team` (a team name or `__all__`), `security_name` (their name exactly as in the portal's "مستخدم السرية" column; links
-SLA requests to the account).
+`teams` (a list of team names; a manager may hold `__all__` = every team), `security_name` (their name exactly as in the
+portal's "مستخدم السرية" column; links SLA requests to the account).
 
-### 3.1 Shared information (same numbers for admin, manager and employee)
+**An account (employee or manager) may belong to more than one team** and then sees the union of those teams. The older
+single `team` field is still read (an account with only `team` counts as `[team]`) and still exposed in `public_user`
+(the first team) so existing pages and scripts keep working; new code reads and writes `teams`. A team name renamed or
+removed in the settings never blocks editing an account that already holds it. An **employee is never put in
+"Unclassified"**: that bucket is for managers/admins only (classification is adjusted in Settings, section 5.5).
+
+### 3.1 Shared information (same numbers for the same viewer, wherever the strip is drawn)
 `GET /api/ops/shared` returns **counts only, never subjects, customers or names**: calls today (team total), e-mails
 (business / replied / pending / reply rate / SLA breached), security requests (open / reminder / breached), ITSM
 (per category totals), collector freshness (online, last update). The same "Team status" strip component renders it on
-the Admin dashboard and on My work, so both always agree.
+the Admin dashboard and on My work, so both always agree for the same viewer.
+
+Calls, security requests and ITSM are **sector-wide** counts for everyone. The **e-mail numbers are scoped to the
+viewer**: an administrator (and a manager of every team) counts all rows; a manager or employee counts only the rows of
+their own teams, and an employee never counts an "Unclassified" mail. The e-mail block says which with `scope`
+(`"all"` | `"teams"`) and `teams` (the viewer's team names, `[]` for "all" or "no team"). So two different viewers may
+see different e-mail numbers, but every dashboard shows the *same* viewer the *same* numbers.
 
 ### 3.2 My work (`/my`, employee; admin/manager may open it for anyone with `?as=<user_id>`, read-only)
 `GET /api/ops/my[?as=uid]` returns the signed-in user's own data:
 * **calls**: today / yesterday / last 7 days totals, split by status, calls per hour today (from the existing call storage);
-* **e-mails**: assigned to my `email` (pending / done, waiting time), e-mails I replied to today (count, average first-reply
-  minutes, SLA met / breached), my quality reviews and appeals;
+* **e-mails** (`email`):
+  * `assigned` / `replied` - the mails that are mine *by name*: assigned to my `email` (pending / done, waiting time) and
+    the ones I replied to today (count, average first-reply minutes, SLA met / breached). A mail that is mine stays visible
+    even if it later becomes "Unclassified" (it was explicitly handed to me).
+  * `team_emails` - the e-mails of **my own team(s)**: overlaid rows whose `team` or any of `all_teams` is one of my teams,
+    status Pending or Replied, **never the "Unclassified" bucket**, pending-first then oldest-first, at most 300. Only a
+    whitelist of fields is returned (`row_id, message_id, subject, customer_name, team, status, received_time,
+    current_waiting_time, sla_status, escalated, is_carryover, first_reply_by, first_reply_time, assigned_to_name,
+    detected_systems`) - no body text, no customer address, no quality notes, nothing of another team.
+  * `team_summary` - the headline numbers (`teams, all_teams, pending, replied, no_action, sla_breached, escalated,
+    reply_rate, listed, more`) of exactly those team rows.
+  * `team_emails_hint` - `"no_team"` when the account has no team (empty `team_emails`), otherwise `""`.
+* **quality**: my quality reviews and appeals;
 * **security requests**: SLA requests whose `security_user` equals my `security_name` (status, age) - empty state when no
   `security_name` is set on the account;
-* **shared**: the section 3.1 strip.
-An employee never receives anybody else's rows.
+* **shared**: the section 3.1 strip (viewer-scoped, see 3.1).
+An employee never receives anybody else's rows, and never an "Unclassified" one through `team_emails`. A manager opening
+`?as=<uid>` sees only what **both** of them may see (the intersection of the two scopes).
 
 ## 4. Data layout (inside `data_dir`, i.e. the shared folder)
 
@@ -265,15 +289,15 @@ Rules every job follows:
 | method + path | role | notes |
 |---|---|---|
 | `GET /overview` | admin, manager | Home data: per-module headline numbers, `attention` list, collector health, calls today |
-| `GET /<module>?since=<generated_at>` | admin, manager | snapshot or `{"unchanged": true}`; adds `meta` (heartbeat, `online`, `stale`, `last_error`); email rows are team-scoped for managers and have overrides applied (`overlay.py`); the email answer also carries `options` = `{teams, quality_reasons, ratings, people: [{email, name, team}]}` |
+| `GET /<module>?since=<generated_at>` | admin, manager | snapshot or `{"unchanged": true}`; adds `meta` (heartbeat, `online`, `stale`, `last_error`); email rows are scoped to the viewer's team set (a manager with teams sees only those teams, never anybody else's rows) and have overrides applied (`overlay.py`); the email answer also carries `options` = `{teams, quality_reasons, ratings, people: [{email, name, team}]}` |
 | `GET /<module>/history?days=14` | admin, manager | list of history days |
-| `GET /shared` | any signed-in | section 3.1 numbers, counts only |
-| `GET /my[?as=uid]` | any signed-in (`as`: admin, manager) | section 3.2 |
+| `GET /shared` | any signed-in | section 3.1 numbers, counts only; e-mail block carries `scope` + `teams` (viewer-scoped, an employee never counts Unclassified) |
+| `GET /my[?as=uid]` | any signed-in (`as`: admin, manager) | section 3.2; the e-mail block has `assigned`/`replied` (mine by name) plus `team_emails`/`team_summary`/`team_emails_hint` (my team(s), never Unclassified) |
 | `GET /events?day=` | admin, manager | timeline events, newest first |
-| `POST /email/classification/rule` `{keyword, team}` / `DELETE` | admin, manager (own team) | adds / removes a `system_team_map` entry |
-| `POST /email/assign` `{message_id, assigned_to_email, assigned_to_name, note}` | admin, manager | |
-| `POST /email/no-action` `{message_id}` / `DELETE` to undo | admin, manager | |
-| `POST /email/team` `{message_id, team}` | admin, manager | |
+| `POST /email/classification/rule` `{keyword, team}` / `DELETE` | admin, manager (own teams) | adds / removes a `system_team_map` entry; 403 if `team` is outside the manager's team set |
+| `POST /email/assign` `{message_id, assigned_to_email, assigned_to_name, note}` | admin, manager | 403 if the mail is outside the manager's team set |
+| `POST /email/no-action` `{message_id}` / `DELETE` to undo | admin, manager | 403 if the mail is outside the manager's team set |
+| `POST /email/team` `{message_id, team}` | admin, manager | 403 if the mail is outside the manager's team set |
 | `POST /email/quality` `{message_id, rating, note, reasons}`; `/email/quality/appeal`, `/email/quality/decision` | admin, manager (appeal: the replier) | |
 | `GET /jobs` | admin | heartbeats + pending requests + online flag + `collector_info` (written by the collector into `ops/state/collector_info.json`: host, config path, pinned keys, per-account `username` + `has_password`; never a password) |
 | `POST /jobs/<job>/run` | admin, manager (`email`,`sla`,`itsm`), admin (`email_report`) | writes a request file; returns `{queued: true}` |

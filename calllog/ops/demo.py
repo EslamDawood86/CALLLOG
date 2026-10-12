@@ -287,7 +287,7 @@ def _special_rows(now, rng, n):
         received = _received(now, rng, 90, 240)
         for team, answered in ((first, replied_first), (second, not replied_first)):
             row = _mail_row(n, subject, system, team, received, now)
-            row.update(row_id=f"{row['message_id']}|{team}", all_teams=[first, second], is_split_child=True,
+            row.update(row_id=f"{row['message_id']}|{team}", all_teams=[team], is_split_child=True,
                        split_sibling_teams=[second if team == first else first])
             if answered:
                 _make_replied(row, TEAM_PEOPLE[team][0], 35, now)

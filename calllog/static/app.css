@@ -29,8 +29,10 @@
   --shadow: 0 1px 2px rgba(11, 11, 11, 0.04);
 }
 
+/* Theme: "Auto" follows the device (prefers-color-scheme); the switch in the top bar (theme.js) can force
+   Light or Dark by setting data-theme on <html>. The dark values are therefore written twice - keep both in sync. */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     color-scheme: dark;
     --page: #0d0d0d;
     --surface: #1a1a19;
@@ -54,6 +56,30 @@
     --series-3: #3987e5;
     --shadow: none;
   }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface: #1a1a19;
+  --ink: #f0efec;
+  --ink-2: #c3c2b7;
+  --grid: #2c2c2a;
+  --axis: #383835;
+  --hair: rgba(255, 255, 255, 0.10);
+  --wash: rgba(255, 255, 255, 0.06);
+  --brand: #1fa77a;
+  --accent: #e0621f;
+  --btn: #0b7d5a;
+  --btn-hover: #12946a;
+  --accent-text: #4fd1a1;
+  --neutral-bar: #8a98a8;
+  --danger: #e66767;
+  --danger-text: #ee8a8a;
+  --ok-text: #0ca30c;
+  --series-1: #1fa77a;
+  --series-2: #d95926;
+  --series-3: #3987e5;
+  --shadow: none;
 }
 
 * { box-sizing: border-box; }
@@ -96,9 +122,11 @@ a { color: var(--accent-text); }
 .logo { width: 32px; height: 32px; display: block; flex: none; }
 .logo-lg { width: 72px; height: 72px; }
 @media (prefers-color-scheme: dark) {
-  .logo { background: #fff; border-radius: 9px; padding: 2px; }
-  .logo-lg { border-radius: 16px; padding: 4px; }
+  :root:not([data-theme="light"]) .logo { background: #fff; border-radius: 9px; padding: 2px; }
+  :root:not([data-theme="light"]) .logo-lg { border-radius: 16px; padding: 4px; }
 }
+:root[data-theme="dark"] .logo { background: #fff; border-radius: 9px; padding: 2px; }
+:root[data-theme="dark"] .logo-lg { border-radius: 16px; padding: 4px; }
 
 /* ---------- top bar ---------- */
 .topbar {
@@ -121,6 +149,17 @@ a { color: var(--accent-text); }
   cursor: pointer; text-decoration: none;
 }
 .link:hover { text-decoration: underline; }
+
+/* ---------- theme switch (theme.js): Auto / Light / Dark ---------- */
+.theme-toggle {
+  display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; font: inherit; font-size: 0.85rem;
+  color: var(--ink-2); background: var(--surface); border: 1px solid var(--axis); border-radius: 99px; cursor: pointer;
+  white-space: nowrap;
+}
+.theme-toggle:hover { background: var(--wash); color: var(--ink); }
+.theme-toggle:focus-visible { outline: 2px solid var(--accent-text); outline-offset: 2px; }
+.theme-ico { font-size: 1rem; line-height: 1; }
+.theme-corner { position: fixed; top: 12px; inset-inline-end: 12px; z-index: 5; }
 
 /* ---------- page layout ---------- */
 .page { max-width: 1280px; margin: 0 auto; padding: 20px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 18px; }

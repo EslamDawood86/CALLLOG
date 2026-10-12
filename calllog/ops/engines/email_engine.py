@@ -247,7 +247,8 @@ def _dispatch_outlook():
         import pythoncom
         import win32com.client
     except ImportError as exc:
-        raise OutlookUnavailable(f"pywin32 is not installed ({exc}); see requirements-collector.txt.") from exc
+        raise OutlookUnavailable(f"Outlook cannot be opened: pywin32 is not installed ({exc}); "
+                                 "see requirements-collector.txt.") from exc
     pythoncom.CoInitialize()                       # every thread needs its own COM apartment
     return win32com.client.Dispatch("Outlook.Application")
 

@@ -23,6 +23,7 @@
   </nav>
   <div class="topbar-right">
     {% block topbar_extra %}{% endblock %}
+    {% include "_theme_toggle.html" %}
     <span class="who" dir="auto">{{ current_user.name }}</span>
     <a class="link" href="{{ url_for('pages.password') }}">Password</a>
     <form method="post" action="{{ url_for('pages.logout') }}">

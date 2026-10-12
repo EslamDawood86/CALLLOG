@@ -4,6 +4,7 @@ Fake engines are registered into ``runner.JOBS``; a fake clock and calls to ``Ru
 (user 1001, password "secret-pw", example.test addresses). A few tests start real child processes (``collector.py --run-job``)
 to prove the timeout / kill / crash handling of isolated runs; none of them touches Outlook, a browser or the network.
 """
+import importlib.util
 import json
 import os
 import subprocess
@@ -14,6 +15,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
+
+# pywin32 is intentionally not installed where these tests run (so nothing can reach a real Outlook). The
+# fully-provisioned "all good" collector check needs it, so that one test skips when it is absent - like the
+# Chromium-dependent browser tests.
+HAS_PYWIN32 = importlib.util.find_spec("win32com") is not None
 
 import collector
 from calllog.ops import collector_config, runner, schemas
@@ -754,6 +760,7 @@ def test_check_without_a_config_file_says_what_to_do(tmp_path):
     assert "user: NOT SET" in done.stdout and done.returncode == 1
 
 
+@pytest.mark.skipif(not HAS_PYWIN32, reason="collector --check needs pywin32/Outlook; not installed here (Outlook safety)")
 def test_check_all_good_returns_zero(tmp_path, monkeypatch):
     (tmp_path / "data").mkdir()
     cfg = tmp_path / "collector_config.json"

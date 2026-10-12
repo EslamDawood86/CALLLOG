@@ -8,6 +8,7 @@
   <title>{% block title %}Call Log{% endblock %}</title>
   <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='nbe-logo.svg') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+  <script src="{{ url_for('static', filename='theme.js') }}"></script>
 </head>
 <body class="{% block body_class %}{% endblock %}">
 {% block body %}{% endblock %}

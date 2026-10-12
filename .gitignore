@@ -14,3 +14,5 @@ venv/
 /docs/out/
 /collector_config.json
 /ops-demo/
+/HANDOFF-PROMPT.md
+/NBE-OpsHub-source-checkpoint*.zip

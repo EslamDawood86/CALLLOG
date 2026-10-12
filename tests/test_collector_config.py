@@ -1,5 +1,6 @@
 """collector_config.json: accounts, pinned settings, and the rule that secrets never reach the settings."""
 import json
+import os
 
 import pytest
 
@@ -63,6 +64,8 @@ def test_broken_json_gets_a_helpful_message(tmp_path):
 
 
 def test_data_dir_override(tmp_path):
-    cc = collector_config.load(write(tmp_path, {"data_dir": "/srv/calllog/data"}))
-    assert cc.data_dir() == "/srv/calllog/data"
+    # An absolute path in the file is kept as-is; spelling differs per OS (UNC / drive on Windows, / on POSIX).
+    absolute = "C:\\srv\\calllog\\data" if os.name == "nt" else "/srv/calllog/data"
+    cc = collector_config.load(write(tmp_path, {"data_dir": absolute}))
+    assert cc.data_dir() == absolute
     assert collector_config.load(write(tmp_path, {})).data_dir("/x") == "/x"

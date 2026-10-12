@@ -28,7 +28,7 @@
   --op-radius: 12px;
 }
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     --op-danger: #e66767;  --op-danger-text: #f09a9a;
     --op-warn: #e0a030;    --op-warn-text: #f2c277;
     --op-ok: #2fb55a;      --op-ok-text: #6fd694;
@@ -36,6 +36,14 @@
     --op-na: #8a98a8;      --op-na-text: #c3c2b7;
     --op-c0: #3987e5;  --op-c1: #d95926;  --op-c2: #199e70;  --op-c3: #d55181;  --op-c4: #9085e9;
   }
+}
+:root[data-theme="dark"] {
+  --op-danger: #e66767;  --op-danger-text: #f09a9a;
+  --op-warn: #e0a030;    --op-warn-text: #f2c277;
+  --op-ok: #2fb55a;      --op-ok-text: #6fd694;
+  --op-info: #3987e5;    --op-info-text: #86b6ef;
+  --op-na: #8a98a8;      --op-na-text: #c3c2b7;
+  --op-c0: #3987e5;  --op-c1: #d95926;  --op-c2: #199e70;  --op-c3: #d55181;  --op-c4: #9085e9;
 }
 
 .op-t-danger { --tone: var(--op-danger); --tone-text: var(--op-danger-text); }
