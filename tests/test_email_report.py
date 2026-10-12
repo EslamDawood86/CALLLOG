@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import zipfile
 from collections import Counter
 from datetime import date, datetime, timedelta
@@ -72,6 +73,20 @@ class FailingMailer(FakeMailer):
     def send(self, to, cc=(), subject="", html_body="", attachments=(), inline_images=None, display_only=None, bcc=()):
         if any(w in subject for w in self.words):
             raise MailError("simulated failure")
+        super().send(to, cc, subject, html_body, attachments, inline_images, display_only, bcc)
+
+
+class FlakyMailer(FakeMailer):
+    """Refuses the first mail whose subject contains ``word`` (a hiccup of Outlook), then behaves."""
+
+    def __init__(self, word):
+        super().__init__()
+        self.word, self.refused = word, 0
+
+    def send(self, to, cc=(), subject="", html_body="", attachments=(), inline_images=None, display_only=None, bcc=()):
+        if self.word in subject and not self.refused:
+            self.refused += 1
+            raise MailError("simulated hiccup")
         super().send(to, cc, subject, html_body, attachments, inline_images, display_only, bcc)
 
 
@@ -204,19 +219,61 @@ def test_old_workbooks_are_pruned_and_other_files_stay(store):
     assert er.prune_reports(folder, date(2026, 10, 11)) == 0
 
 
-def test_a_workbook_open_in_excel_is_not_overwritten(store, monkeypatch):
-    real, calls = os.replace, []
+def lock_workbook(monkeypatch, name="Team_Reply_Analytics_2026-10-11.xlsx"):
+    """Windows refuses to replace a workbook that is open in Excel. Only that file is locked: the store's own atomic
+    JSON writes (which retry on PermissionError) must keep working. Returns the list of refused replacements."""
+    real, refused = os.replace, []
 
-    def locked_once(src, dst):
-        calls.append(dst)
-        if len(calls) == 1:
+    def replace(src, dst):
+        if Path(dst).name == name:
+            refused.append(str(dst))
             raise PermissionError("the file is open in Excel")
         return real(src, dst)
-    monkeypatch.setattr(er.os, "replace", locked_once)
-    result = run(make_ctx(store), *busy_day()[0])
-    assert result.ok
-    names = sorted(p.name for p in store.report_dir("email").iterdir())
-    assert len(names) == 1 and re.match(r"Team_Reply_Analytics_2026-10-11_\d{6}\.xlsx$", names[0])   # no .tmp left behind
+    monkeypatch.setattr(er.os, "replace", replace)
+    return refused
+
+
+def test_a_workbook_open_in_excel_is_not_overwritten(store, monkeypatch):
+    folder = store.report_dir("email")
+    (folder / "Team_Reply_Analytics_2026-10-11.xlsx").write_bytes(b"the copy a person is reading in Excel")
+    refused = lock_workbook(monkeypatch)
+    mailer = FakeMailer()
+    result = run(make_ctx(store, mailer), *busy_day()[0])
+    assert result.ok, result.error
+    assert len(refused) == 1
+    names = sorted(p.name for p in folder.iterdir())
+    assert len(names) == 2 and not any(n.startswith(".tmp") for n in names)           # no half-written file left behind
+    assert names[0] == "Team_Reply_Analytics_2026-10-11.xlsx" and re.match(r"Team_Reply_Analytics_2026-10-11_170000\.xlsx$", names[1])
+    assert (folder / names[0]).read_bytes() == b"the copy a person is reading in Excel"      # the open copy is untouched
+    assert load_workbook(folder / names[1]).sheetnames[0] == "Dashboard"
+    assert mailer.sent[0]["attachments"] == [str(folder / names[1])]                    # the mail carries the new one
+
+
+def test_a_workbook_that_cannot_be_written_anywhere_fails_the_step_and_leaves_no_temp_file(store, monkeypatch):
+    real = os.replace
+
+    def replace(src, dst):
+        if str(dst).endswith(".xlsx"):
+            raise PermissionError("locked")
+        return real(src, dst)
+    monkeypatch.setattr(er.os, "replace", replace)
+    mailer = FakeMailer()
+    result = run(make_ctx(store, mailer), *busy_day()[0])
+    assert not result.ok and result.error.startswith("excel: PermissionError") and len(mailer.sent) == 2
+    assert list(store.report_dir("email").iterdir()) == []
+
+
+def test_leftovers_of_a_killed_run_are_cleaned_up_after_a_day(store):
+    folder = store.report_dir("email")
+    old, fresh = folder / ".tmp-Team_Reply_Analytics_2026-10-01.xlsx", folder / ".tmp-Team_Reply_Analytics_2026-10-11.xlsx"
+    keep = folder / ".tmp-somebody-elses.xlsx"
+    for path in (old, fresh, keep):
+        path.write_bytes(b"x")
+    long_ago = old.stat().st_mtime - 3 * 24 * 3600
+    os.utime(old, (long_ago, long_ago))
+    os.utime(keep, (long_ago, long_ago))
+    er.prune_reports(folder, date(2026, 10, 11))
+    assert not old.exists() and fresh.exists() and keep.exists()
 
 
 # ------------------------------------------------------------------------------------------------- main mail
@@ -242,7 +299,8 @@ def test_main_report_html_has_the_kpis_and_escapes_hostile_text(store):
     ctx = make_ctx(store)
     outcome = eng.scan_and_analyze(ctx, archive(hostile, *busy_day()[0]))
     html = er.build_email_html(outcome.stats, outcome.today, include_charts=True)
-    for label, value in (("Business Emails", 4), ("Replied", 1), ("Pending", 3), ("Reply Rate", "25.0%"),
+    # the hostile mail plus the four of busy_day: 5 business mails, one of them "no action" -> 1 / (5 - 1)
+    for label, value in (("Business Emails", 5), ("Replied", 1), ("Pending", 3), ("No Action Needed", 1), ("Reply Rate", "25.0%"),
                          ("Avg First Response", "10 Min"), ("SLA Breached (&gt;60m)", 3), ("Escalated (Pending)", 3)):
         assert re.search(rf"{re.escape(label)}</div><div[^>]*>{re.escape(str(value))}</div>", html), label
     assert "<script" not in html.lower() and "<img src=x" not in html and "onerror=alert(2)>" not in html.replace("&gt;", "")
@@ -449,7 +507,7 @@ def test_a_failed_notice_is_retried_and_does_not_flag_the_assignment(store):
 
 
 def test_the_notified_flag_is_not_set_on_an_assignment_changed_meanwhile(store):
-    item = SimpleNamespace(mid="<x@example.test>")
+    item = SimpleNamespace(mid="<x@example.test>", Subject="Subject of x")
     assign(store, item, to=ALICE, note="old")
     sent_info = dict(store.overrides("assignments")["<x@example.test>"])
     assign(store, item, to=BOB, name="Bob", note="old")                  # re-assigned after we read it
@@ -686,6 +744,142 @@ def test_the_job_never_raises(store):
                             log=lambda text: None, mailer=None)
     result = er.run_report(mailerless, archive(*busy_day()[0]))              # no mailer -> Outlook COM -> not here
     assert not result.ok and "report e-mail" in result.error and result.snapshot_data
+
+
+def test_a_failed_report_mail_is_retried_alone(store):
+    items, _ = busy_day()
+    first = run(make_ctx(store, FailingMailer("Daily Team Reply")), *items)
+    assert not first.ok and first.emails_sent == 1 and "report e-mail" in first.error      # the summary still went out
+    assert store.read_state("email_report")["slots"]["16:30"]["failed"] == ["main"]
+    mailer = FakeMailer()
+    second = run(make_ctx(store, mailer), *items)
+    assert second.ok and not second.skipped
+    assert subjects(mailer) == ["Daily Team Reply Analytics - 11/10/2026"]                 # only the missing report
+    assert second.summary == "report sent: 4 mails, 2 pending"
+    assert er.run_report(make_ctx(store, mailer), None).skipped
+
+
+def test_a_retry_after_a_failed_part_sends_only_the_parts_that_are_missing(store):
+    items = [mail(subject=f"Flex {i}", body="flexcube is down", minutes_ago=100 + i) for i in range(5)]
+    items.append(mail(subject="x", body="flexcube is down"))
+    email = team_settings(max_pending_attachments=2)
+    flaky = FlakyMailer("Part 2 of 3")
+    first = run(make_ctx(store, flaky, email=email), *items)
+    assert not first.ok and "team follow-up Flex Cube" in first.error
+    assert [m["subject"].rsplit(" - ", 1)[-1] for m in sent_to(flaky, FLEX_TEAM)] == ["Part 1 of 3"]
+    assert store.read_state("email_report")["slots"]["16:30"]["failed"] == ["team:Flex Cube"]
+    mailer = FakeMailer()
+    second = run(make_ctx(store, mailer, email=email), *items)
+    assert second.ok
+    assert [m["subject"].rsplit(" - ", 1)[-1] for m in sent_to(mailer, FLEX_TEAM)] == ["Part 2 of 3", "Part 3 of 3"]
+    assert not [s for s in subjects(mailer) if s.startswith("Daily Team Reply Analytics - 11/10/2026") and "Pending" not in s]
+    assert second.summary.startswith("report already sent earlier today: 6 mails")
+
+
+def test_a_failure_that_no_longer_applies_does_not_keep_the_day_open(store):
+    items, _ = busy_day()
+    first = run(make_ctx(store, FailingMailer("Pending:"), email=team_settings()), *items)
+    assert not first.ok and store.read_state("email_report")["slots"]["16:30"]["failed"] == ["team:Flex Cube"]
+    off = make_ctx(store, FakeMailer(), email=team_settings(send=False))
+    assert run(off, *items).ok                                              # the team mails are off now ...
+    assert store.read_state("email_report")["slots"]["16:30"]["failed"] == []
+    assert er.run_report(make_ctx(store, FakeMailer(), email=team_settings()), None).skipped     # ... nothing left to retry
+
+
+def test_end_of_day_follows_the_daily_report_switch_and_its_own_recipients(store):
+    items, _ = busy_day()
+    mailer = FakeMailer()
+    explicit = email_settings(report={"send": False}, end_of_day={"to": ["eod@example.test"]})
+    ctx = make_ctx(store, mailer, email=explicit)
+    assert run(ctx, *items).ok and mailer.sent == []                       # report.send=false: not even to its own list
+    assert any("report.send" in line for line in ctx.logs)
+    for end_of_day in ({"to": []}, {"send": False}):                        # nobody to send to / switched off
+        silent = make_ctx(store, mailer, email=email_settings(report={"to": []}, end_of_day=end_of_day))
+        assert run(silent, *items).ok and mailer.sent == []
+    own = make_ctx(store, mailer, email=email_settings(report={"to": []}, end_of_day={"to": ["eod@example.test"]}))
+    assert run(own, *items).ok                                             # no report recipient, but a summary list
+    assert subjects(mailer) == ["End of Day Summary - Team Reply Analytics - 11/10/2026"] and mailer.sent[0]["to"] == ["eod@example.test"]
+
+
+def test_with_the_report_switched_off_no_msg_file_is_saved_and_no_chart_is_drawn(store, monkeypatch):
+    drawn = []
+    monkeypatch.setattr(er, "render_charts", lambda stats, today: drawn.append(1) or {})
+    items, named = busy_day(cls=SavingItem)
+    mailer = FakeMailer()
+    assert run(make_ctx(store, mailer, email=team_settings(send=False)), *items).ok
+    assert mailer.sent == [] and named["flex"].saved == [] and named["mfa"].saved == [] and drawn == []
+
+
+def test_a_rerun_that_only_delivers_a_new_assignment_saves_no_msg_files_and_draws_no_charts(store, tmp_path, monkeypatch):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    items, named = busy_day(cls=SavingItem)
+    mailer = FakeMailer()
+    assert run(make_ctx(store, mailer, email=team_settings()), *items).ok
+    assert named["flex"].saved and named["mfa"].saved                       # the first run saved them
+    for item in (named["flex"], named["mfa"]):
+        item.saved.clear()
+    drawn = []
+    real = er.render_charts
+    monkeypatch.setattr(er, "render_charts", lambda stats, today: drawn.append(1) or real(stats, today))
+    assign(store, named["flex"])
+    result = run(make_ctx(store, mailer, email=team_settings()), *items)
+    assert result.ok and not result.skipped and len(sent_to(mailer, ALICE)) == 1
+    assert named["flex"].saved == [] and named["mfa"].saved == [] and drawn == []
+    assert result.summary == "report already sent earlier today: 4 mails, 2 pending, 1 assignment notice(s)"
+
+
+def test_a_forced_run_sends_and_saves_everything_again(store, tmp_path, monkeypatch):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    items, named = busy_day(cls=SavingItem)
+    mailer = FakeMailer()
+    run(make_ctx(store, mailer, email=team_settings()), *items)
+    named["flex"].saved.clear()
+    before = len(mailer.sent)
+    run(make_ctx(store, mailer, email=team_settings(), options={"force": True}), *items)
+    assert named["flex"].saved and len(mailer.sent) == 2 * before
+
+
+def test_an_assignment_with_two_addresses_in_one_field_is_not_mailed(store):
+    items, named = busy_day()
+    assign(store, named["flex"], to="alice@example.test; boss@example.test")
+    mailer = FakeMailer()
+    ctx = make_ctx(store, mailer)
+    result = run(ctx, *items)
+    assert result.ok and not [s for s in subjects(mailer) if s.startswith("Action Required")]
+    assert any("not a single valid e-mail address" in line for line in ctx.logs)
+    assert er.addresses(" Boss@Example.test; a@b.test, bad, two@@x.test ") == ["a@b.test", "boss@example.test"]
+    assert er.single_address("a@b.test, c@d.test") == "" and er.single_address(" A@B.test ") == "a@b.test"
+
+
+def test_the_footers_do_not_claim_an_attachment_that_is_not_there(store):
+    items, _ = busy_day()
+    mailer = FakeMailer()
+    run(make_ctx(store, mailer, email=email_settings(report={"attach_excel": False})), *items)
+    assert all(m["attachments"] == [] and "workbook is attached" not in m["html"] for m in mailer.sent)
+    mailer = FakeMailer()
+    run(make_ctx(store, mailer, now=NOW + timedelta(days=1)), *items)
+    assert all("workbook is attached" in m["html"] for m in mailer.sent) and len(mailer.sent) == 2
+
+
+def test_stale_work_folders_of_killed_runs_are_removed(store, tmp_path, monkeypatch):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    old, fresh, other = (tmp_path / n for n in ("nbe-email-report-old", "nbe-email-report-fresh", "somebody-elses"))
+    for folder in (old, fresh, other):
+        folder.mkdir()
+        (folder / "x.msg").write_bytes(b"x")
+    long_ago = time.time() - 3 * 24 * 3600
+    for folder in (old, other):
+        os.utime(folder, (long_ago, long_ago))
+    assert run(make_ctx(store), *busy_day()[0]).ok
+    assert not old.exists() and fresh.exists() and other.exists()
+
+
+def test_the_temp_folder_is_gone_even_when_a_send_fails(store, tmp_path, monkeypatch):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    items, _ = busy_day(cls=SavingItem)
+    result = run(make_ctx(store, FailingMailer("Pending:", "Daily Team Reply"), email=team_settings()), *items)
+    assert not result.ok
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith("nbe-email-report-")]
 
 
 # ------------------------------------------------------------------------------------------ results and data

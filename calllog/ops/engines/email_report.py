@@ -18,22 +18,33 @@ in ``JobResult.error`` and the run is then not ``ok`` (the mails that did go out
     [6] report + team lists   main report to report.to/cc, one follow-up per team that has pending mail
     [7] assignment notices    only assignments not yet "notified" (the flag is written back to the assignments override)
     [7b] quality feedback     only reviews not yet sent (state "email_quality_sent")
-    [8] end-of-day summary
+    [8] end-of-day summary    to end_of_day.to (else the report recipients)
 
-Every mail step has its own settings flag (``report.send``, ``assignment_notifications.send``, ``quality_feedback.send``,
-``end_of_day.send``), its own recipients and respects ``ctx.can_email()``. ``ctx.no_email`` builds everything and sends
-nothing (no state, no "notified" flag); ``ctx.dry_run`` additionally writes nothing into the data folder.
+Switches. ``report.send`` is the switch of the daily report: it turns off the main report, the team follow-ups AND the
+end-of-day summary (which is the wrap-up of that report, even when it has its own recipient list). Assignment notices
+and quality feedback have their own flags (``assignment_notifications.send``, ``quality_feedback.send``) because a
+manager acts on them all day, not only at report time. Every mail step also needs recipients and ``ctx.can_email()``:
+``ctx.no_email`` builds everything and sends nothing (no state, no "notified" flag); ``ctx.dry_run`` additionally writes
+nothing into the data folder. Nothing is sent to an address that is not exactly one well-formed address.
 
 Idempotence: ``ctx.store`` state "email_report" remembers, per day and report slot (the latest ``report.send_times``
-entry that has passed, or "manual"), which mails went out. A second call for the same slot sends no report again - and
-returns ``skipped`` without touching Outlook when nothing else is waiting - unless ``ctx.options["force"]``; a step that
-failed last time is retried. Assignment notices and quality feedback are never repeated, they carry their own flags, so
-a "Run now" still delivers an assignment made after the report. No weekend / holiday logic: the runner owns it.
+entry that has passed, or "manual"), which mails went out - the report, every part of every team follow-up, the
+summary. A second call for the same slot sends no report again - and returns ``skipped`` without touching Outlook when
+nothing else is waiting - unless ``ctx.options["force"]``. A step that failed is remembered and retried alone next
+time (a team's parts that already went out are not sent twice); a failure that no longer applies (the step was
+switched off meanwhile) is forgotten. Assignment notices and quality feedback are never repeated, they carry their own
+flags, so a "Run now" still delivers an assignment made after the report; such a run does not save the ``.msg`` files or
+draw the charts again. No weekend / holiday logic: the runner owns it.
+
+Files. The workbook is written under a hidden temp name and moved into place; a copy open in Excel is not overwritten
+(the new one gets ``_<HHMMSS>`` in its name). The ``.msg`` files, zips and charts live in one temp folder that is deleted
+when the run ends, even after a failure; folders a killed run left behind are removed after a day.
 
 HTML rules: tables, inline styles and bgcolor attributes only (Outlook's Word engine), no SVG / grid / flex, every
 dynamic value HTML-escaped (subjects and names are hostile input), NBE colours from common.py, the logo as an inline
 CID image (``assets/nbe_logo.png``; a text badge when the file is missing).
 """
+import contextlib
 import copy
 import io
 import os
@@ -41,9 +52,10 @@ import random
 import re
 import shutil
 import tempfile
+import time
 import zipfile
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from openpyxl import Workbook
@@ -91,11 +103,21 @@ def _section(settings, name):
     return value if isinstance(value, dict) else {}
 
 
+_ADDRESS = re.compile(r"^[^@\s;,<>]+@[^@\s;,<>]+$")
+
+
+def single_address(value):
+    """The lower-case address, or "" when ``value`` is not exactly one address (``a@x; b@y`` must never reach two
+    people through a field that was meant for one)."""
+    value = norm_email(value)
+    return value if _ADDRESS.match(value) else ""
+
+
 def addresses(values):
     """Lower-case, de-duplicated, sorted e-mail addresses (the settings already store them that way)."""
     if isinstance(values, str):
         values = re.split(r"[;,\s]+", values)
-    return sorted({norm_email(v) for v in (values or ()) if norm_email(v)})
+    return sorted({single_address(v) for v in (values or ()) if single_address(v)})
 
 
 def one_line(text):
@@ -181,6 +203,11 @@ def safe_name(text, max_len=50, default="email"):
     if not text:
         return default
     return "_" + text if text.split(".")[0].lower() in _RESERVED_NAMES else text
+
+
+def file_stem(text, max_len=50, default="email"):
+    """``safe_name`` with underscores instead of spaces: attachment names travel through mail gateways and browsers."""
+    return re.sub(r"\s+", "_", safe_name(text, max_len, default))
 
 
 def pending_rows_by_team(rows):
@@ -453,10 +480,13 @@ def create_workbook(rows, team_replies, stats, today):
     return workbook
 
 
-def create_excel(rows, team_replies, stats, today, folder):
-    """Write ``Team_Reply_Analytics_<YYYY-MM-DD>.xlsx`` into ``folder`` and return its path. The file is written under a
-    hidden name and moved into place, so a reader never sees half a workbook; a copy somebody has open in Excel
-    (Windows locks it) is not overwritten - the new one gets the time in its name."""
+def create_excel(rows, team_replies, stats, today, folder, now=None):
+    """Write ``Team_Reply_Analytics_<YYYY-MM-DD>.xlsx`` into ``folder`` and return its path.
+
+    The workbook is saved under a hidden temp name and moved into place, so a reader on the share never sees half a
+    file. Windows refuses to replace a workbook somebody has open in Excel (PermissionError): then the new one is kept
+    next to it as ``..._<HHMMSS>.xlsx`` instead of the run failing or the open copy being clobbered. The temp file
+    never survives the call."""
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     final = folder / f"{REPORT_PREFIX}{today:%Y-%m-%d}.xlsx"
@@ -466,7 +496,7 @@ def create_excel(rows, team_replies, stats, today, folder):
         try:
             os.replace(temp, final)
         except PermissionError:
-            final = folder / f"{REPORT_PREFIX}{today:%Y-%m-%d}_{datetime.now():%H%M%S}.xlsx"
+            final = folder / f"{REPORT_PREFIX}{today:%Y-%m-%d}_{(now or datetime.now()):%H%M%S}.xlsx"
             os.replace(temp, final)
     finally:
         if temp.exists():
@@ -475,10 +505,13 @@ def create_excel(rows, team_replies, stats, today, folder):
 
 
 _REPORT_NAME = re.compile(rf"^{REPORT_PREFIX}(\d{{4}}-\d{{2}}-\d{{2}})(_\d{{6}})?\.xlsx$")
+_LEFTOVER_NAME = re.compile(rf"^\.tmp-{REPORT_PREFIX}\d{{4}}-\d{{2}}-\d{{2}}\.xlsx$")
+STALE_TEMP_SECONDS = 24 * 3600
 
 
 def prune_reports(folder, today, keep_days=REPORT_KEEP_DAYS):
-    """Delete this job's workbooks older than ``keep_days`` (other files in the folder are never touched). Returns the count."""
+    """Delete this job's workbooks older than ``keep_days`` and its own temp files that a killed run left behind
+    (other files in the folder are never touched). Returns the number of workbooks removed."""
     removed = 0
     cutoff = today - timedelta(days=keep_days)
     try:
@@ -486,11 +519,13 @@ def prune_reports(folder, today, keep_days=REPORT_KEEP_DAYS):
     except OSError:
         return 0
     for path in names:
-        match = _REPORT_NAME.match(path.name)
-        if not match:
-            continue
         try:
-            if datetime.strptime(match.group(1), "%Y-%m-%d").date() < cutoff:
+            if _LEFTOVER_NAME.match(path.name):
+                if time.time() - path.stat().st_mtime > STALE_TEMP_SECONDS:
+                    path.unlink()
+                continue
+            match = _REPORT_NAME.match(path.name)
+            if match and datetime.strptime(match.group(1), "%Y-%m-%d").date() < cutoff:
                 path.unlink()
                 removed += 1
         except (ValueError, OSError):
@@ -658,10 +693,12 @@ def _table(headers, rows, empty_text="Nothing to show.", header_color=NBE_GREEN)
 
 
 def _kpi(label, value, accent=BLUE, trend=""):
+    # the accent border sits on the cell: Outlook's Word engine ignores borders on a <table>
     return (f'<td width="25%" valign="top" style="padding:5px;">'
             f'<table width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="{CARD_BG}" '
-            f'style="background:{CARD_BG};border-top:3px solid {accent};"><tr>'
-            f'<td align="center" style="padding:13px 6px;font-family:{FONT_STACK};">'
+            f'style="background:{CARD_BG};"><tr>'
+            f'<td align="center" bgcolor="{CARD_BG}" style="background:{CARD_BG};border-top:3px solid {accent};'
+            f'padding:13px 6px;font-family:{FONT_STACK};">'
             f'<div style="font-size:11px;color:{MUTED};text-transform:uppercase;letter-spacing:0.4px;">{esc(label)}</div>'
             f'<div style="font-size:23px;font-weight:700;color:{NBE_GREEN};margin-top:4px;">{esc(value)}</div>'
             f'{trend}</td></tr></table></td>')
@@ -869,9 +906,11 @@ def _quality_section(stats, sample):
     return html_out
 
 
-def build_email_html(stats, today, include_charts=False, pending_attached=0, pending_team_emails=0, review_sample_rows=()):
+def build_email_html(stats, today, include_charts=False, pending_attached=0, pending_team_emails=0, review_sample_rows=(),
+                     excel_attached=True):
     """The main report. ``include_charts``: the body points at the inline images ``cid:reply_status_chart`` /
-    ``cid:team_chart`` (the caller attaches them); otherwise the same numbers are drawn as table bars."""
+    ``cid:team_chart`` (the caller attaches them); otherwise the same numbers are drawn as table bars.
+    ``excel_attached``: the footer only claims the workbook is attached when it really is."""
     body = _kpi_grid(_kpi_cards(stats))
     body += (f'<div style="font-size:11px;color:{GREY};margin-top:6px;">'
              'Reply Rate = Replied &divide; (Business Emails &minus; No Action Needed)</div>')
@@ -884,7 +923,8 @@ def build_email_html(stats, today, include_charts=False, pending_attached=0, pen
         body += _note(f"<b>{_int(pending_attached)}</b> unanswered e-mail(s) are attached as zipped .msg files, sent in "
                       f"<b>{_int(pending_team_emails)}</b> follow-up e-mail(s) - one per team - so this e-mail carries the "
                       "summary, the charts and the Excel workbook.")
-    body += _footer("Automated Outlook current-day Team Reply report. The detailed Excel workbook is attached to this message.")
+    body += _footer("Automated Outlook current-day Team Reply report."
+                    + (" The detailed Excel workbook is attached to this message." if excel_attached else ""))
     return _page("Daily Team Reply Analytics", _subtitle(today) + " &nbsp;&bull;&nbsp; Current Day Analysis", body)
 
 
@@ -965,7 +1005,7 @@ def _trend_arrow(direction):
     return {"improving": ("&#9650;", GREEN), "declining": ("&#9660;", RED)}.get(direction, ("&#8594;", MUTED))
 
 
-def build_end_of_day_html(rows, stats, today):
+def build_end_of_day_html(rows, stats, today, excel_attached=True):
     """The wrap-up of the day. Built from the same rows and stats as the other mails, so they can never disagree."""
     team_table = [_tr(_td(t, bold=True), _td(d["business_emails"]), _td(d["replied"], bold=True, color=GREEN),
                       _td(d["pending"], bold=True, color=RED), _td(d["no_action_needed"], bold=True, color=AMBER))
@@ -1013,7 +1053,8 @@ def build_end_of_day_html(rows, stats, today):
     if alerts:
         body += _heading("Repeated Quality Issues", BROWN) + _table(["Team member", "Team", "Recent issues"], alerts,
                                                                     header_color=BROWN)
-    body += _footer("Automated end-of-day wrap-up from Team Reply Daily Analytics. The detailed Excel workbook is attached.")
+    body += _footer("Automated end-of-day wrap-up from Team Reply Daily Analytics."
+                    + (" The detailed Excel workbook is attached." if excel_attached else ""))
     return _page("End of Day Summary", _subtitle(today), body, width=860)
 
 
@@ -1094,7 +1135,7 @@ def build_team_parts(rows, files, max_per_part, zip_folder):
             paths = [files[id(r)] for r in chunk if id(r) in files]
             zip_path = None
             if paths:
-                stem = safe_name(team, 30, UNCLASSIFIED) + "_Pending" + (f"_Part{number}of{len(chunks)}" if len(chunks) > 1 else "")
+                stem = file_stem(team, 30, UNCLASSIFIED) + "_Pending" + (f"_Part{number}of{len(chunks)}" if len(chunks) > 1 else "")
                 suffix, name = 1, f"{stem}.zip"
                 while name.lower() in used:
                     suffix += 1
@@ -1127,6 +1168,11 @@ def slot_name(cfg, now, options=None):
     return passed[-1] if passed else "manual"
 
 
+def part_id(team, number, total):
+    """The state key of one follow-up e-mail of a team (a retry skips the parts that already went out)."""
+    return f"team:{team}:{number}of{total}"
+
+
 def _unsent_reviews(store):
     """[(message_id, review)] of ratings that were not e-mailed to the person who replied yet."""
     sent = store.read_state(QUALITY_SENT_STATE) or {}
@@ -1146,12 +1192,35 @@ def _unsent_reviews(store):
 def _notifications_waiting(ctx, cfg):
     """Is there anything the assignment / quality steps would still send? (Decided without Outlook, from the lists.)"""
     try:
-        if cfg.assign_send and any(isinstance(a, dict) and not a.get("notified") and norm_email(a.get("assigned_to_email"))
+        if cfg.assign_send and any(isinstance(a, dict) and not a.get("notified") and single_address(a.get("assigned_to_email"))
                                    for a in ctx.store.overrides("assignments").values()):
             return True
-        return cfg.quality_send and any(norm_email(r.get("replied_by_email")) for _, r in _unsent_reviews(ctx.store))
+        return cfg.quality_send and any(single_address(r.get("replied_by_email")) for _, r in _unsent_reviews(ctx.store))
     except Exception:
         return True                                    # let the real run meet (and report) the problem
+
+
+WORK_PREFIX = "nbe-email-report-"
+STALE_WORK_SECONDS = 24 * 3600
+
+
+def cleanup_stale_work_dirs():
+    """A run the runner killed on its timeout cannot delete its temp folder (.msg files, zips): remove such leftovers
+    once they are a day old. Returns how many folders went. Never raises."""
+    removed = 0
+    try:
+        names = list(Path(tempfile.gettempdir()).iterdir())
+    except OSError:
+        return 0
+    for path in names:
+        try:
+            if (path.name.startswith(WORK_PREFIX) and path.is_dir() and not path.is_symlink()
+                    and time.time() - path.stat().st_mtime > STALE_WORK_SECONDS):
+                shutil.rmtree(path, ignore_errors=True)
+                removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1172,6 +1241,7 @@ class Run:
         self.sent = 0
         self.errors = []                                # "step: reason" for the JobResult
         self.sent_parts = []                            # fragments of the summary
+        self.main_state = None                          # "sent" now / "earlier" today / None
         self.excel = None
         self.charts = {}
         self.parts = {}
@@ -1215,6 +1285,25 @@ class Run:
             self.record["failed"].append(step_id)
         self._save_state()
 
+    def clear_failed(self, step_ids):
+        """These steps do not apply any more (switched off, no recipient, nothing pending): a failure remembered for
+        them must not keep the day's record "open" and force a re-scan on every call."""
+        if not self.persist:
+            return
+        gone = [i for i in self.record["failed"] if i in step_ids]
+        if gone:
+            self.record["failed"] = [i for i in self.record["failed"] if i not in step_ids]
+            self._save_state()
+
+    @contextlib.contextmanager
+    def guarded(self, step_id):
+        """A send that raises marks its step failed - the next run retries exactly that step - and re-raises."""
+        try:
+            yield
+        except Exception:
+            self.mark_failed(step_id)
+            raise
+
     def send(self, to, cc, subject, body, attachments=(), images=None):
         self.mailer.send(to=list(to), cc=list(cc), subject=one_line(subject), html_body=body,
                          attachments=[str(a) for a in attachments if a], inline_images=images or mail_images())
@@ -1243,7 +1332,7 @@ def _quality_history_step(run):
 def _excel_step(run):
     """[3] The workbook goes to the shared report folder (a dry run builds it in the temp folder instead)."""
     folder = Path(run.work) / "excel" if run.ctx.dry_run else run.ctx.store.report_dir("email")
-    path = create_excel(run.rows, run.outcome.team_replies, run.stats, run.today, folder)
+    path = create_excel(run.rows, run.outcome.team_replies, run.stats, run.today, folder, now=run.ctx.now())
     run.excel = path
     run.log(f"Excel created: {path.name}")
     if not run.ctx.dry_run:
@@ -1252,8 +1341,15 @@ def _excel_step(run):
             run.log(f"{removed} workbook(s) older than {REPORT_KEEP_DAYS} days removed.")
 
 
+def _main_report_due(run):
+    """Will this run send the main report? (It decides whether charts are worth drawing.)"""
+    return run.cfg.send and bool(run.cfg.to) and not run.already_sent("main")
+
+
 def _charts_step(run):
     """[4] Charts are an extra: without matplotlib (or when drawing fails) the mail uses table bars instead."""
+    if not _main_report_due(run):
+        return
     try:
         images = render_charts(run.stats, run.today)
     except ImportError:
@@ -1270,10 +1366,28 @@ def _charts_step(run):
         run.charts[cid] = str(path)
 
 
+def _msgs_wanted(run):
+    """Saving the .msg files is the slow, COM-heavy part: do it only when a mail that carries them will go out now (a
+    re-run that only delivers a new assignment must not save forty mails again)."""
+    cfg = run.cfg
+    if not (cfg.send and cfg.attach_msg and run.ctx.can_email()):
+        return False
+    if run.force or _main_report_due(run):
+        return True
+    for team, rows in pending_rows_by_team(run.rows).items():
+        own_to = cfg.team_recipients.get(team, ([], []))[0]
+        if not (own_to or cfg.to):
+            continue                                    # nobody could receive this team's list anyway
+        total = len(chunk_list(rows, cfg.max_per_zip))
+        if not all(run.already_sent(part_id(team, n, total)) for n in range(1, total + 1)):
+            return True
+    return False
+
+
 def _pending_step(run):
     """[5] .msg files + zips per team. Without Outlook items it still builds the (zip-less) parts for the follow-ups."""
     files, failed = {}, 0
-    if run.cfg.attach_msg and run.ctx.can_email():
+    if _msgs_wanted(run):
         files, failed = save_pending_msgs(run.rows, Path(run.work) / "msg", run.log)
     run.parts = build_team_parts(run.rows, files, run.cfg.max_per_zip, Path(run.work) / "zips")
     attached = sum(p["count"] for parts in run.parts.values() for p in parts)
@@ -1284,21 +1398,25 @@ def _pending_step(run):
 def _main_report_step(run):
     cfg = run.cfg
     if not cfg.send:
+        run.clear_failed({"main"})
         return run.log("Report e-mail is switched off (report.send).")
     if not cfg.to:
+        run.clear_failed({"main"})
         return run.log("Report e-mail skipped: no recipient (email.report.to).")
     if run.already_sent("main"):
+        run.main_state = "earlier"
         return run.log(f"Report e-mail already sent today ({run.slot} slot).")
-    attached = sum(p["count"] for parts in run.parts.values() for p in parts)
-    team_mails = sum(len(parts) for team, parts in run.parts.items() if _team_recipients(cfg, team, parts))
-    sample = review_sample(run.rows, cfg.sample_size, run.today)
-    body = build_email_html(run.stats, run.today, include_charts=len(run.charts) == 2, pending_attached=attached,
-                            pending_team_emails=team_mails, review_sample_rows=sample)
-    files = [run.excel] if cfg.attach_excel and run.excel and Path(run.excel).is_file() else []
-    run.send(cfg.to, cfg.cc, f"{cfg.subject_prefix} - {_day_text(run.today)}", body, files,
-             mail_images(run.charts))
+    with run.guarded("main"):
+        attached = sum(p["count"] for parts in run.parts.values() for p in parts)
+        team_mails = sum(len(parts) for team, parts in run.parts.items() if _team_recipients(cfg, team, parts))
+        sample = review_sample(run.rows, cfg.sample_size, run.today)
+        files = [run.excel] if cfg.attach_excel and run.excel and Path(run.excel).is_file() else []
+        body = build_email_html(run.stats, run.today, include_charts=len(run.charts) == 2, pending_attached=attached,
+                                pending_team_emails=team_mails, review_sample_rows=sample, excel_attached=bool(files))
+        run.send(cfg.to, cfg.cc, f"{cfg.subject_prefix} - {_day_text(run.today)}", body, files, mail_images(run.charts))
     run.mark_done("main")
-    run.sent_parts.insert(0, "report sent")
+    run.main_state = "sent"
+    run.sent_parts.append("report sent")
 
 
 def _team_recipients(cfg, team, parts):
@@ -1315,29 +1433,38 @@ def _team_recipients(cfg, team, parts):
 def _team_step(run):
     cfg = run.cfg
     if not cfg.send:
+        run.clear_failed({i for i in run.record["failed"] if i.startswith("team:")})
         return
-    sent_teams, skipped = 0, []
+    sent_teams, skipped, applicable = 0, [], set()
     for team, parts in run.parts.items():
-        step_id = f"team:{team}"
         recipients = _team_recipients(cfg, team, parts)
         if recipients is None:
             skipped.append(team)
             continue
+        step_id = f"team:{team}"
+        applicable.add(step_id)
         if run.already_sent(step_id):
             continue
+        to, cc = recipients
+        sent_now = False
         try:
-            to, cc = recipients
             for number, part in enumerate(parts, 1):
+                pid = part_id(team, number, len(parts))
+                if run.already_sent(pid):                # an earlier try of this slot delivered this part
+                    continue
                 suffix = f" - Part {number} of {len(parts)}" if len(parts) > 1 else ""
                 body = build_team_pending_email_html(run.today, team, part["count"], number, len(parts), part["rows"])
                 run.send(to, cc, f"{cfg.subject_prefix} - {_day_text(run.today)} - Pending: {team}{suffix}", body,
                          [part["zip"]] if part["zip"] else [])
+                run.mark_done(pid)
+                sent_now = True
             run.mark_done(step_id)
-            sent_teams += 1
+            sent_teams += sent_now
         except Exception as exc:
             run.mark_failed(step_id)
             run.errors.append(f"team follow-up {team}: {type(exc).__name__}: {exc}")
             run.log(f"WARNING: could not send the pending e-mail for {team}: {type(exc).__name__}: {exc}")
+    run.clear_failed({i for i in run.record["failed"] if i.startswith("team:") and i not in applicable})
     if skipped:
         run.log("No recipients for the pending list of: " + ", ".join(skipped) + " (email.report.team_recipients).")
     if sent_teams:
@@ -1359,9 +1486,13 @@ def _assignment_step(run):
         return run.log("Assignment notices are switched off.")
     by_person = defaultdict(list)
     for message_id, info in (store.overrides("assignments") or {}).items():
-        email = norm_email(info.get("assigned_to_email")) if isinstance(info, dict) else ""
-        if email and not info.get("notified"):
+        if not isinstance(info, dict) or info.get("notified") or not norm_email(info.get("assigned_to_email")):
+            continue
+        email = single_address(info.get("assigned_to_email"))
+        if email:
             by_person[email].append((message_id, info))
+        else:
+            run.log("An assignment was skipped: its address is not a single valid e-mail address.")
     if not by_person:
         return run.log("No new assignments to notify.")
     rows_by_id = _rows_by_message(run.rows)
@@ -1384,9 +1515,12 @@ def _assignment_step(run):
 
 
 def _mark_notified(run, message_id, sent_info):
-    """Flag the assignment as notified - but only if it is still the one we mailed (it may have been re-assigned meanwhile)."""
+    """Flag the assignment as notified - but only if it is still the one we mailed (it may have been re-assigned meanwhile).
+    The web API clears the flag the same way when the person or the note changes."""
     def change(old):
-        same = (old and norm_email(old.get("assigned_to_email")) == norm_email(sent_info.get("assigned_to_email"))
+        if not isinstance(old, dict):
+            return old                                  # deleted meanwhile: never re-create it
+        same = (norm_email(old.get("assigned_to_email")) == norm_email(sent_info.get("assigned_to_email"))
                 and (old.get("note") or "") == (sent_info.get("note") or ""))
         return {**old, "notified": True} if same else old
     try:
@@ -1404,7 +1538,8 @@ def _quality_step(run):
     rows_by_id = _rows_by_message(run.rows)
     by_person = defaultdict(list)
     for message_id, review in _unsent_reviews(store):
-        email = norm_email(review.get("replied_by_email")) or norm_email(rows_by_id.get(message_id, {}).get("first_reply_email"))
+        email = (single_address(review.get("replied_by_email"))
+                 or single_address(rows_by_id.get(message_id, {}).get("first_reply_email")))
         if email:
             by_person[email].append((message_id, review))
     if not by_person:
@@ -1441,16 +1576,24 @@ def _save_quality_sent(run, sent_state):
 
 
 def _end_of_day_step(run):
+    """The wrap-up goes to ``end_of_day.to`` (else the report recipients). It belongs to the daily report: with
+    ``report.send`` off it is not sent either."""
     cfg = run.cfg
     if not cfg.eod_send:
+        run.clear_failed({"end_of_day"})
         return run.log("End-of-day summary is switched off.")
+    if not cfg.send:
+        run.clear_failed({"end_of_day"})
+        return run.log("End-of-day summary skipped: the daily report is switched off (report.send).")
     if not cfg.eod_to:
+        run.clear_failed({"end_of_day"})
         return run.log("End-of-day summary skipped: no recipient.")
     if run.already_sent("end_of_day"):
         return run.log(f"End-of-day summary already sent today ({run.slot} slot).")
-    body = build_end_of_day_html(run.rows, run.stats, run.today)
-    files = [run.excel] if run.excel and Path(run.excel).is_file() else []
-    run.send(cfg.eod_to, cfg.eod_cc, f"{END_OF_DAY_SUBJECT} - {_day_text(run.today)}", body, files)
+    with run.guarded("end_of_day"):
+        files = [run.excel] if cfg.attach_excel and run.excel and Path(run.excel).is_file() else []
+        body = build_end_of_day_html(run.rows, run.stats, run.today, excel_attached=bool(files))
+        run.send(cfg.eod_to, cfg.eod_cc, f"{END_OF_DAY_SUBJECT} - {_day_text(run.today)}", body, files)
     run.mark_done("end_of_day")
     run.sent_parts.append("end-of-day summary")
 
@@ -1458,11 +1601,15 @@ def _end_of_day_step(run):
 def _summary(run, outcome):
     s = outcome.stats
     head = f"{s['business_emails']} mails, {s['pending']} pending"
-    if "report sent" in run.sent_parts:
-        parts = [f"report sent: {head}"] + [p for p in run.sent_parts if p != "report sent"]
+    others = [p for p in run.sent_parts if p != "report sent"]
+    if run.main_state == "sent":
+        parts = [f"report sent: {head}"] + others
+    elif run.main_state == "earlier":
+        parts = [f"report already sent earlier today: {head}"] + others
     else:
-        reason = ("e-mail is off for this run" if not run.ctx.can_email() else "nothing sent")
-        parts = [f"report built ({reason}): {head}"] + run.sent_parts
+        reason = ("e-mail is off for this run" if not run.ctx.can_email()
+                  else "no report e-mail" if run.sent else "nothing sent")
+        parts = [f"report built ({reason}): {head}"] + others
     text = ", ".join(parts)
     if run.errors:
         text += f" - {len(run.errors)} step(s) failed"
@@ -1497,7 +1644,7 @@ def _run(ctx, namespace):
 
     ctx.log("[1] Scanning Outlook and analysing the day...")
     try:
-        outcome = eng.scan_and_analyze(ctx, namespace, keep_mail_items=cfg.attach_msg and ctx.can_email())
+        outcome = eng.scan_and_analyze(ctx, namespace, keep_mail_items=cfg.send and cfg.attach_msg and ctx.can_email())
     except (eng.ConfigProblem, eng.OutlookUnavailable) as exc:
         ctx.log(f"E-mail report cannot run: {exc}")
         return JobResult(ok=False, error=str(exc))
@@ -1505,7 +1652,8 @@ def _run(ctx, namespace):
         ctx.log(f"E-mail report failed: {type(exc).__name__}: {exc}")
         return JobResult(ok=False, error=f"{type(exc).__name__}: {exc}")
 
-    work = tempfile.mkdtemp(prefix="nbe-email-report-")
+    cleanup_stale_work_dirs()
+    work = tempfile.mkdtemp(prefix=WORK_PREFIX)
     try:
         run = Run(ctx, cfg, outcome, work, slot, state, _mailer(ctx) if ctx.can_email() else None)
         if not ctx.can_email():

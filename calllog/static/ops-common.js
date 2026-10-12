@@ -18,6 +18,8 @@
      chip(text, tone, iconName) -> <span class="op-chip">      tone: danger | warn | ok | info | na  (icon + label, never colour alone)
      statusChip(status) -> chip for "Replied", "Pending Reply", "No Action Needed", "Met", "Breached", "Within SLA",
                            and the SLA codes within | reminder | breached | no_date
+     jobChip(job) -> chip for a collector job: Online / Offline / Running now / Last run failed / Login failed - paused / ...
+     JOB_LABELS -> {email, email_report, sla, itsm} -> readable names
      kpi({label, value, sub, tone, href, onclick, icon, key, hero}) -> tile; setKpi(tile, {value, sub, tone})
      emptyState({title, text, icon, action}) -> <div class="op-empty">      card(title, {hint, actions, cls}, ...body) -> <section class="card">
      tip(target, content | () => content)   hover/focus tooltip for any element
@@ -32,15 +34,20 @@
 
    Data
      loader({url, interval, query, since, onData, onUnchanged, onMeta, onError}) -> {start, stop, refresh, answer, busy}
-         GET url every `interval` ms (default 15000, random +0..20 %, doubled after each failure up to x8, paused while the tab is hidden,
-         immediate refresh when it becomes visible). It sends ?since=<generated_at>&rev=<meta.rev> so an unchanged scan costs almost
-         nothing: onData(answer) runs only for a new answer, onUnchanged(answer) for {unchanged:true}, onMeta(meta, answer) for both.
-         refresh() fetches at once WITHOUT since (use it after the user changed something); query() may return extra parameters.
+         GET url every `interval` ms (default 15000). The first answer comes at once, the next poll after a random 0.5 - 1.5 x interval
+         (so sixty browsers opened at 08:00 do not move in lockstep), later ones after interval + 0..20 %; every failure doubles the
+         wait (up to x8); nothing is fetched while the tab is hidden and coming back fetches after a short random pause.
+         It sends ?since=<generated_at>&rev=<meta.rev> so an unchanged scan costs almost nothing: onData(answer) runs only for a
+         new answer, onUnchanged(answer) for {unchanged:true}, onMeta(meta, answer) for both; an exception inside one of them is
+         logged and never stops the polling. `since:false` = always ask for the full answer (overview, events, jobs, health).
+         refresh() fetches at once WITHOUT since (use it after the user changed something; a refresh asked while one is in flight
+         runs right after it); query() may return extra parameters; url may be a function.
      freshnessInfo(meta) -> {tone, icon, text}       meta = the "meta" block of GET /api/ops/<module>
      freshnessBanner() -> {el, update(meta)}         "Last updated 09:15 · collector PC-123 · OK", or failed / offline / stale / outside hours
      live() -> {el, ok(text), bad(text)}             the green "Live · updated ..." dot of the Call Log pages
      sharedStrip(host, {poll, interval, links}) -> {update(data), refresh(), stop()}     the "Team status" strip (GET /api/ops/shared)
          poll:false = the page feeds it with update(data) (Home does, from /api/ops/overview); links:true = tiles link to the module pages
+         (links:{calls:false, system:false} = those tiles stay plain: a manager cannot open them)
 
    Tables
      table({columns, rows, pageSize, pageSizes, sort, rowKey, onRowClick, rowClass, empty, search, copy, toolbar, caption, filter})
@@ -158,6 +165,17 @@
     const [tone, label] = STATUS_CHIPS[status] || ["na", String(status || "—")];
     return chip(label, tone);
   }
+  const JOB_LABELS = { email: "E-mail scan", email_report: "E-mail daily report", sla: "Security requests", itsm: "ITSM" };
+  /** Chip for one collector job (an entry of `collectors` in /api/ops/overview or `jobs` in /api/ops/jobs). */
+  function jobChip(job) {
+    if (!job || !job.present) return chip("Not started", "na", "dash");
+    if (job.enabled === false) return chip("Switched off", "na", "pause");
+    if (job.paused) return chip("Login failed - paused", "danger", "alert");
+    if (job.last_status === "error") return chip("Last run failed", "danger", "alert");
+    if (!job.online) return chip("Offline", "danger", "alert");
+    if (job.running) return chip("Running now", "info", "refresh");
+    return chip("Online", "ok", "check");
+  }
   function kpi({ label, value, sub, tone, href, onclick, icon: iconName, key, hero }) {
     const tag = href ? "a" : onclick ? "button" : "div";
     return h(tag, { class: "op-kpi" + (hero ? " op-hero" : "") + (tone ? ` op-t-${tone}` : ""), href, type: tag === "button" ? "button" : null,
@@ -229,6 +247,7 @@
   const SERIES = ["op-s0", "op-s1", "op-s2", "op-s3", "op-s4"];
   const sizeObserver = typeof ResizeObserver === "function" ? new ResizeObserver((entries) => {
     for (const e of entries) {
+      if (!e.target.isConnected) { sizeObserver.unobserve(e.target); continue; }       // a re-drawn page: stop watching the old chart
       const w = Math.floor(e.contentRect.width);
       if (e.target._draw && w > 0 && w !== e.target._w) { e.target._w = w; e.target._draw(w); }
     }
@@ -329,54 +348,65 @@
   }
 
   // ------------------------------------------------------------------------------------------------- loader
+  /** Polling rules of docs/HUB-DESIGN.md section 14, in one place so every page keeps them:
+      * the first answer is fetched at once; the NEXT poll starts after a random 0.5 - 1.5 x interval (sixty people who open the
+        page at 08:00 must not hit the server in the same second), later ones after interval + 0 - 20 %;
+      * every failure doubles the wait (x2, x4, x8 at most); one good answer resets it;
+      * nothing is fetched while the tab is hidden; coming back fetches after a short random pause;
+      * `?since=<generated_at>&rev=<meta.rev>` lets the server answer {"unchanged": true} for a few bytes. */
   function loader(opts) {
     const interval = opts.interval || 15000;
-    let timer = null, busy = false, running = false, fails = 0, generated = "", rev = null, answer = null;
+    let timer = null, busy = false, running = false, fails = 0, generated = "", rev = null, answer = null, first = true, again = false;
 
-    function url() {
-      const base = typeof opts.url === "function" ? opts.url() : opts.url;
-      return base;
-    }
+    const settle = (fn) => { try { if (fn) fn(); } catch (e) { console.error(e); } };      // a drawing bug must not stop the polling
     async function load(force) {
-      if (busy) return;
+      if (busy) { if (force) again = true; return; }
       busy = true;
       clearTimeout(timer);
+      let got = null;
       try {
         const params = new URLSearchParams(opts.query ? opts.query() : {});
         if (opts.since !== false && generated && !force) {
           params.set("since", generated);
           if (rev != null) params.set("rev", rev);
         }
-        const base = url(), qs = params.toString();
-        const got = await api("GET", qs ? `${base}${base.includes("?") ? "&" : "?"}${qs}` : base);
+        const base = typeof opts.url === "function" ? opts.url() : opts.url, qs = params.toString();
+        got = await api("GET", qs ? `${base}${base.includes("?") ? "&" : "?"}${qs}` : base);
+        // CL.api turns a body it cannot read (a page being left, a proxy error page) into {}; that is a failed poll, not an answer
+        if (!got || typeof got !== "object" || !Object.keys(got).length) { got = null; throw new Error("The server sent an empty answer."); }
         fails = 0;
+      } catch (e) {
+        fails++;
+        settle(() => opts.onError && opts.onError(e, fails));
+      }
+      if (got) {
         if (got.unchanged) {
-          if (opts.onUnchanged) opts.onUnchanged(got);
+          settle(() => opts.onUnchanged && opts.onUnchanged(got));
         } else {
           answer = got;
           generated = got.generated_at || "";
           rev = got.meta && got.meta.rev != null ? got.meta.rev : null;
-          if (opts.onData) opts.onData(got);
+          settle(() => opts.onData && opts.onData(got));
         }
-        if (opts.onMeta) opts.onMeta(got.meta || null, got);
-      } catch (e) {
-        fails++;
-        if (opts.onError) opts.onError(e, fails);
-      } finally {
-        busy = false;
-        schedule();
+        settle(() => opts.onMeta && opts.onMeta(got.meta || null, got));
       }
+      busy = false;
+      if (again) { again = false; load(true); return; }
+      schedule();
     }
     function schedule() {
       clearTimeout(timer);
       if (!running || document.hidden) return;
-      const wait = interval * Math.min(8, 2 ** fails) * (1 + Math.random() * 0.2);
-      timer = setTimeout(() => load(false), wait);
+      const spread = first ? 0.5 + Math.random() : 1 + Math.random() * 0.2;
+      first = false;
+      timer = setTimeout(() => load(false), interval * Math.min(8, 2 ** fails) * spread);
     }
-    document.addEventListener("visibilitychange", () => { if (running && !document.hidden) load(false); });
+    document.addEventListener("visibilitychange", () => {
+      if (running && !document.hidden) { clearTimeout(timer); timer = setTimeout(() => load(false), Math.random() * 1500); }
+    });
     window.addEventListener("online", () => { if (running) load(false); });
     return {
-      start() { running = true; load(true); },
+      start() { running = true; first = true; load(true); },
       stop() { running = false; clearTimeout(timer); },
       refresh() { return load(true); },
       get answer() { return answer; },
@@ -430,59 +460,76 @@
     const body = [h("span", { class: "op-strip-label" }, icon(opts.icon), opts.label),
       h("strong", { class: "op-strip-value" }, opts.value),
       h("span", { class: "op-strip-sub" }, ...opts.sub)];
-    return link ? h("a", { class: "op-strip-group", href: link }, body) : h("div", { class: "op-strip-group" }, body);
+    const group = link ? h("a", { class: "op-strip-group", href: link }, body) : h("div", { class: "op-strip-group" }, body);
+    if (opts.title) group.title = opts.title;
+    return group;
   }
   const note = (tone, text) => h("span", { class: `op-note op-t-${tone}` }, icon(LEVEL_ICON[tone]), text);
   const short = (category) => String(category).replace(/ requests?$/i, "");
 
+  /** Five groups from GET /api/ops/shared. Counts only. The e-mail numbers are the VIEWER's: an administrator sees every team,
+      everybody else the e-mails of their own teams (e.scope === "teams", e.teams = their names; never the Unclassified bucket). */
   function renderStrip(d, links) {
-    const link = (path) => (links ? path : null);
+    const link = (key, path) => (links && (links === true || links[key] !== false) ? path : null);
     const c = d.calls || {}, e = d.email || {}, s = d.sla || {}, i = d.itsm || {}, col = d.collector || {};
     const groups = [];
     groups.push(stripGroup({ icon: "phone", label: "Calls today", value: fmtNum(c.total || 0),
-      sub: [`${c.active_employees || 0} of ${c.employees || 0} employees took calls`] }, link("/calls")));
-    groups.push(e.available
-      ? stripGroup({ icon: "mail", label: "E-mails pending", value: fmtNum(e.pending || 0),
-        sub: [`${fmtPct(e.reply_rate)} replied · `, (e.sla_breached || 0) ? note("danger", `${e.sla_breached} past SLA`) : note("ok", "none past SLA")] }, link("/email"))
-      : stripGroup({ icon: "mail", label: "E-mails pending", value: "—", sub: ["No e-mail data yet"] }, link("/email")));
+      sub: [`${c.active_employees || 0} of ${c.employees || 0} employees took calls`] }, link("calls", "/calls")));
+    const own = e.scope === "teams", teams = (e.teams || []).join(", ");
+    const mailLabel = own ? "Team e-mails pending" : "E-mails pending";
+    if (own && !(e.teams || []).length) {
+      groups.push(stripGroup({ icon: "mail", label: mailLabel, value: "—", sub: ["No team is set on your account"] }, link("email", "/email")));
+    } else if (e.available) {
+      groups.push(stripGroup({ icon: "mail", label: mailLabel, value: fmtNum(e.pending || 0), title: own ? `E-mails of ${teams}` : "E-mails of every team",
+        sub: [`${fmtPct(e.reply_rate)} replied · `, (e.sla_breached || 0) ? note("danger", `${e.sla_breached} past SLA`) : note("ok", "none past SLA")] }, link("email", "/email")));
+    } else {
+      groups.push(stripGroup({ icon: "mail", label: mailLabel, value: "—", sub: ["No e-mail data yet"] }, link("email", "/email")));
+    }
     groups.push(s.available
       ? stripGroup({ icon: "shield", label: "Security requests open", value: fmtNum(s.open || 0),
-        sub: [(s.breached || 0) ? note("danger", `${s.breached} breached`) : note("ok", "none breached"), ` · ${s.reminder || 0} at reminder`] }, link("/sla"))
-      : stripGroup({ icon: "shield", label: "Security requests open", value: "—", sub: ["No SLA data yet"] }, link("/sla")));
+        sub: [(s.breached || 0) ? note("danger", `${s.breached} breached`) : note("ok", "none breached"), ` · ${s.reminder || 0} at reminder`] }, link("sla", "/sla"))
+      : stripGroup({ icon: "shield", label: "Security requests open", value: "—", sub: ["No SLA data yet"] }, link("sla", "/sla")));
     const totals = (i.totals && Object.entries(i.totals)) || [];
     groups.push(i.available
       ? stripGroup({ icon: "server", label: "ITSM requests", value: fmtNum(totals.reduce((a, [, n]) => a + (n || 0), 0)),
-        sub: [totals.map(([k, n]) => `${short(k)} ${n}`).join(" · ") || "No categories"] }, link("/itsm"))
-      : stripGroup({ icon: "server", label: "ITSM requests", value: "—", sub: ["No ITSM data yet"] }, link("/itsm")));
+        sub: [totals.map(([k, n]) => `${short(k)} ${n}`).join(" · ") || "No categories"] }, link("itsm", "/itsm"))
+      : stripGroup({ icon: "server", label: "ITSM requests", value: "—", sub: ["No ITSM data yet"] }, link("itsm", "/itsm")));
     const mods = Object.values(col.modules || {}), up = mods.filter((m) => m.online).length;
     const tone = col.online ? "ok" : up ? "warn" : "danger";
     groups.push(stripGroup({ icon: "activity", label: "Collectors",
       value: col.online ? "Online" : up ? `${up} of ${mods.length} online` : "Offline",
-      sub: [note(tone, col.last_update ? `data from ${fmtWhen(col.last_update, d.generated_at)}` : "no data yet")] }, link("/system")));
+      sub: [note(tone, col.last_update ? `data from ${fmtWhen(col.last_update, d.generated_at)}` : "no data yet")] }, link("system", "/system")));
     return groups;
   }
 
+  /** The "Team status" strip. `host` = an element (usually a <section class="card">). Returns {update(data), refresh(), stop(), data}.
+      Polls GET /api/ops/shared by itself (random start offset, back-off on errors, silent while the tab is hidden) unless
+      `poll: false` - then the page feeds it with update(data), as Home does with the `shared` block of /api/ops/overview. */
   function sharedStrip(host, opts) {
-    const o = opts || {};
-    let timer = null, seen = "", stopped = false, last = null;
+    const o = opts || {}, every = o.interval || 15000;
+    let timer = null, seen = "", stopped = false, last = null, fails = 0, first = true;
     host.classList.add("op-strip");
     host.setAttribute("aria-label", "Team status");
     const title = h("h2", {}, "Team status"), stamp = h("span", { class: "hint" });
     const body = h("div", { class: "op-strip-groups" });
     host.replaceChildren(h("div", { class: "op-strip-head" }, title, stamp), body);
     function update(d) {
+      if (!d || typeof d !== "object" || !Object.keys(d).length) return;
       const key = JSON.stringify(d, (k, v) => (k === "generated_at" ? undefined : v));
       last = d;
       stamp.textContent = d.generated_at ? `updated ${fmtClock(d.generated_at, true)}` : "";
+      host.classList.remove("op-strip-error");
       if (key === seen) return;
       seen = key;
-      body.replaceChildren(...renderStrip(d, !!o.links));
+      body.replaceChildren(...renderStrip(d, o.links));
     }
     async function refresh() {
+      clearTimeout(timer);
       try {
         update(await api("GET", "/api/ops/shared"));
-        host.classList.remove("op-strip-error");
+        fails = 0;
       } catch (e) {
+        fails++;
         host.classList.add("op-strip-error");
         stamp.textContent = e.network ? "offline - retrying" : e.message;
       }
@@ -491,10 +538,14 @@
     function schedule() {
       clearTimeout(timer);
       if (o.poll === false || stopped || document.hidden) return;
-      timer = setTimeout(refresh, (o.interval || 15000) * (1 + Math.random() * 0.2));
+      const spread = first ? 0.5 + Math.random() : 1 + Math.random() * 0.2;
+      first = false;
+      timer = setTimeout(refresh, every * Math.min(8, 2 ** fails) * spread);
     }
     if (o.poll !== false) {
-      document.addEventListener("visibilitychange", () => { if (!stopped && !document.hidden) refresh(); });
+      document.addEventListener("visibilitychange", () => {
+        if (!stopped && !document.hidden) { clearTimeout(timer); timer = setTimeout(refresh, Math.random() * 1500); }
+      });
       refresh();
     }
     return { update, refresh, stop() { stopped = true; clearTimeout(timer); }, get data() { return last; } };
@@ -619,7 +670,7 @@
   }
 
   window.OPS = { parseNaive, fmtClock, fmtDate, fmtWhen, fmtDuration, fmtAgo, fmtPct, fmtBytes, fmtUptime, debounce, localNowIso,
-    icon, chip, statusChip, kpi, setKpi, emptyState, card, tip, copyText, LEVEL_ICON, LEVEL_RANK,
+    icon, chip, statusChip, jobChip, JOB_LABELS, kpi, setKpi, emptyState, card, tip, copyText, LEVEL_ICON, LEVEL_RANK,
     donut, hbars, stackbar, sparkline, loader, freshnessInfo, freshnessBanner, live, sharedStrip, table,
     modal: CL.modal, confirm: CL.confirmDialog, text: CL.bidi };
 })();

@@ -40,13 +40,16 @@ TEAM_PEOPLE = {
 MANAGER = ("flexcube.mona.adel", "Mona Adel")
 BUSINESS_ADDRESSES = {"Flex Cube": "flexcube.support", "Card Management": "cards.support", "MFA Team": "mfa.support",
                       "Third Party": "thirdparty.support", "Open System": "opensystem.support"}
+GENERAL_ADDRESS = "general.support"             # a business mailbox no rule maps to a team: its mails may stay Unclassified
+ADDRESS_RULES = ("MFA Team", "Third Party")     # teams whose business mailbox is mapped to them in the demo settings (address_team_map)
+CLASSIFIED_BY = ("system", "address", "default_team", "override", "none")
 SECURITY_USERS = ["ياسمين فاروق", "هاني جمال", "مصطفى عبد الرحمن", "دينا مختار", "كريم البنا"]
 
-EMPLOYEES = [   # user id, name, department, mailbox, security name
-    ("1001", "Alice Hassan", "Identity Management", f"flexcube.alice.hassan@{DOMAIN}", SECURITY_USERS[0]),
-    ("1002", "Omar Fathy", "Identity Management", f"flexcube.omar.fathy@{DOMAIN}", SECURITY_USERS[1]),
-    ("1003", "Tarek Mansour", "Application Support", "", ""),
-    ("1004", "Nada Ibrahim", "Application Support", "", ""),
+EMPLOYEES = [   # user id, name, department, mailbox, security name, teams (1002 belongs to two teams)
+    ("1001", "Alice Hassan", "Identity Management", f"flexcube.alice.hassan@{DOMAIN}", SECURITY_USERS[0], ["Flex Cube"]),
+    ("1002", "Omar Fathy", "Identity Management", f"flexcube.omar.fathy@{DOMAIN}", SECURITY_USERS[1], ["Flex Cube", "Card Management"]),
+    ("1003", "Tarek Mansour", "Application Support", "", "", []),
+    ("1004", "Nada Ibrahim", "Application Support", "", "", []),
 ]
 MANAGER_ID = "mgr.flex"
 
@@ -114,7 +117,7 @@ def _user(uid, name, role, dept, now, **profile):
     return {"user_id": uid, "name": name, "department": dept, "role": role, "active": True,
             "must_change_password": False, "created_at": iso_now(now - timedelta(days=30)),
             "last_login": iso_now(now - timedelta(minutes=90)), "password_hash": security.hash_password(DEMO_PASSWORD),
-            "email": "", "team": "", "security_name": "", **profile}
+            "email": "", "team": "", "teams": [], "security_name": "", **profile}
 
 
 def _call_times(rng, count, start, end):
@@ -140,17 +143,18 @@ def _make_calls(call_store, rng, day, uid, count, start, end, reasons, branches)
 
 
 def seed_users_and_calls(call_store, now=None):
-    """Create the demo accounts (4 employees, 1 manager of Flex Cube) and about 60 calls today plus some yesterday.
+    """Create the demo accounts (4 employees - one of them in two teams - and 1 manager of Flex Cube) and about 60 calls today
+    plus some yesterday.
 
     Existing accounts and days that already have calls are left alone, so running it twice adds nothing. Returns the
     credentials for tests: ``{"password", "users": {uid: {...}}, "employees": [uid], "manager": uid, "records": {...}}``."""
     now = (now or datetime.now()).replace(microsecond=0)
     users = {}
-    for uid, name, dept, mailbox, secname in EMPLOYEES:
-        team = "Flex Cube" if mailbox else ""
-        users[uid] = _user(uid, name, "user", dept, now, email=mailbox, team=team, security_name=secname)
+    for uid, name, dept, mailbox, secname, teams in EMPLOYEES:
+        users[uid] = _user(uid, name, "user", dept, now, email=mailbox, team=teams[0] if teams else "", teams=list(teams),
+                           security_name=secname)
     users[MANAGER_ID] = _user(MANAGER_ID, MANAGER[1], "manager", "IT Operations", now,
-                              email=f"{MANAGER[0]}@{DOMAIN}", team="Flex Cube")
+                              email=f"{MANAGER[0]}@{DOMAIN}", team="Flex Cube", teams=["Flex Cube"])
     for user in users.values():
         try:
             call_store.create_user(user)
@@ -169,7 +173,7 @@ def seed_users_and_calls(call_store, now=None):
         y0 = _day_start(now) - timedelta(days=1) + timedelta(hours=8)
         made_yesterday += _make_calls(call_store, rng, yesterday, uid, spread[uid], y0, y0 + timedelta(hours=8), reasons, branches)
     return {"password": DEMO_PASSWORD, "employees": [e[0] for e in EMPLOYEES], "manager": MANAGER_ID,
-            "users": {uid: {"name": u["name"], "role": u["role"], "email": u["email"], "team": u["team"],
+            "users": {uid: {"name": u["name"], "role": u["role"], "email": u["email"], "team": u["team"], "teams": u["teams"],
                             "security_name": u["security_name"], "password": DEMO_PASSWORD} for uid, u in users.items()},
             "records": {"today": made_today, "yesterday": made_yesterday}}
 
@@ -182,14 +186,15 @@ def _address(local):
 def _mail_row(n, subject, system, team, received, now, hint=None, classified_by="system"):
     customer = CUSTOMERS[n % len(CUSTOMERS)]
     arabic = any("؀" <= c <= "ۿ" for c in subject)
+    message_id = f"<demo-{n:04d}@mail.{DOMAIN}>"
     return {
-        "subject": subject, "entry_id": f"00000000DEMO{n:04d}", "message_id": f"<demo-{n:04d}@mail.{DOMAIN}>",
-        "row_id": f"demo-{n:04d}", "detected_systems": system, "team": team, "all_teams": [team],
+        "subject": subject, "entry_id": f"00000000DEMO{n:04d}", "message_id": message_id,
+        "row_id": message_id, "detected_systems": system, "team": team, "all_teams": [team],
         "teams_pending": [], "teams_replied": [], "classified_by": classified_by,
         "classification_hint": hint if hint is not None else system.lower(), "customer_name": customer,
         "customer_email": _address(customer.lower().replace(" ", ".")), "received_time": _iso(received),
         "received_time_display": f"{received:%H:%M}", "mailbox": "IT Support shared mailbox", "folder": "Inbox",
-        "business_addresses_in_to": _address(BUSINESS_ADDRESSES.get(team, "it.support")),
+        "business_addresses_in_to": _address(BUSINESS_ADDRESSES.get(team, GENERAL_ADDRESS)),
         "match_method": "No Match", "first_reply_by": "", "first_reply_email": "", "first_reply_time": None,
         "first_response_time": "", "response_minutes": None, "duration_minutes": None, "reply_count": 0,
         "multiple_team_reply": False, "multiple_team_reply_team": "", "current_waiting_time": "",
@@ -282,7 +287,7 @@ def _special_rows(now, rng, n):
         received = _received(now, rng, 90, 240)
         for team, answered in ((first, replied_first), (second, not replied_first)):
             row = _mail_row(n, subject, system, team, received, now)
-            row.update(row_id=f"demo-{n:04d}-{team.split()[0].lower()}", all_teams=[first, second], is_split_child=True,
+            row.update(row_id=f"{row['message_id']}|{team}", all_teams=[first, second], is_split_child=True,
                        split_sibling_teams=[second if team == first else first])
             if answered:
                 _make_replied(row, TEAM_PEOPLE[team][0], 35, now)
@@ -426,6 +431,21 @@ def _email_stats(rows, now):
     return stats
 
 
+def _tag_classification(rows, overrides):
+    """How each row got its team, as the engine writes it: a mail sent to a mapped business mailbox is 'address' (every other
+    one of those teams' mails here), a team set by hand is 'override'; the rest keep 'system' / 'none'."""
+    by_address = {}
+    for row in rows:
+        if row["classified_by"] == "system" and row["team"] in ADDRESS_RULES and not row.get("is_split_child"):
+            count = by_address[row["team"]] = by_address.get(row["team"], 0) + 1
+            if count % 2:
+                row.update(classified_by="address", detected_systems=f"{row['team']} (recipient address)",
+                           classification_hint=f"{row['team']} (recipient address)")
+    for row in rows:
+        if row["message_id"] in overrides["team"]:
+            row["classified_by"] = "override"
+
+
 def email_snapshot_data(now):
     """(data, overrides) of the e-mail snapshot: the mails of 'today' with the manual actions already folded in."""
     rng = random.Random("email")
@@ -434,13 +454,14 @@ def email_snapshot_data(now):
     overrides = _build_overrides(rows, now)
     _rate(rows, overrides, now)
     rows = overlay.apply_overrides(rows, overrides, now)
+    _tag_classification(rows, overrides)
     rows.sort(key=lambda r: (r["received_time"], r["row_id"]))
     stats = _email_stats(rows, now)
-    unclassified = sum(1 for r in rows if r["team"] == "Unclassified")
+    counts = Counter(r["classified_by"] for r in rows)
     data = {"date": now.date().isoformat(), "sla_target_minutes": SLA_TARGET, "teams": list(TEAMS), "stats": stats, "rows": rows,
             "quality": _quality_block(rows),
-            "classification": {"counts": dict(Counter(r["classified_by"] for r in rows)), "unclassified": unclassified,
-                               "unclassified_team": ""}}
+            "classification": {"counts": {k: counts.get(k, 0) for k in CLASSIFIED_BY},
+                               "unclassified": sum(1 for r in rows if r["team"] == "Unclassified"), "unclassified_team": ""}}
     return data, overrides
 
 
@@ -626,7 +647,7 @@ def _write_events(ops, now, events):
 
 
 # ======================================================================================== collector state
-def _heartbeats(ops, now, stale_job, failed_job, stats):
+def _heartbeats(ops, now, stale_job, failed_job, stats, paused_job=None):
     summaries = {"email": f"{stats['business_emails']} mails, {stats['pending']} pending",
                  "email_report": "Report sent: 2 e-mails, 3 attachments", "sla": "33 open, 5 breached",
                  "itsm": "7 open requests"}
@@ -639,16 +660,19 @@ def _heartbeats(ops, now, stale_job, failed_job, stats):
         last_run = now - timedelta(minutes=interval // 2 + 1)
         if job == stale_job:
             beat_at = last_run = now - timedelta(hours=3)
-        failed = job == failed_job
+        paused = job == paused_job
+        failed = job == failed_job or paused
         doc = {
             "job": job, "host": HOST, "pid": 4120, "running": False, "enabled": True, "state": "idle",
-            "last_status": "error" if failed else "ok", "last_error": JOB_ERRORS[job] if failed else None,
+            "last_status": "error" if failed else "ok",
+            "last_error": "The login failed: wrong or missing user name / password" if paused else JOB_ERRORS[job] if failed else None,
             "last_summary": "" if failed else summaries[job], "last_run_at": _iso(last_run),
             "last_ok_at": _iso(last_run - timedelta(minutes=interval if failed else 0)),
             "last_duration_seconds": 41.5 if job == "email" else 12.4,
             "next_run_at": _iso(report_next if job == "email_report" else last_run + timedelta(minutes=interval)),
             "runs_ok": 18 if not failed else 17, "runs_failed": 1 if failed else 0, "consecutive_failures": 3 if failed else 0,
-            "paused": None, "version": "NBE Operations Hub 1.0", "updated_at": _iso(beat_at), "updated_ts": round(beat_at.timestamp(), 1)}
+            "paused": "auth" if paused else None, "paused_since": _iso(last_run) if paused else None,
+            "paused_reason": "login failed - fix the password, retries paused" if paused else None, "version": "NBE Operations Hub 1.0", "updated_at": _iso(beat_at), "updated_ts": round(beat_at.timestamp(), 1)}
         if job == "email_report":
             doc["last_run_at"] = _iso(report_time - timedelta(days=1))
             doc["last_ok_at"] = doc["last_run_at"]
@@ -665,7 +689,7 @@ def _collector_info(ops, now):
         "jobs": list(JOB_NAMES), "isolated": True, "python": "3.12.4", "updated_at": _iso(now - timedelta(minutes=2))})
 
 
-def _logs(ops, now, failed_job, stats):
+def _logs(ops, now, failed_job, stats, paused_job=None):
     lines = {
         "email": ["Started: read-only scan of today", f"Read {stats['business_emails'] + 20} mails, {stats['business_emails']} business mails",
                   f"Finished OK - {stats['business_emails']} mails, {stats['pending']} pending (41.5 s)"],
@@ -675,6 +699,8 @@ def _logs(ops, now, failed_job, stats):
     }
     if failed_job:
         lines[failed_job][-1] = f"FAILED - {JOB_ERRORS[failed_job]} (9.1 s)"
+    if paused_job:
+        lines[paused_job][-1] = "FAILED - the login failed (wrong or missing user name / password); scheduled runs are paused (9.1 s)"
     ops.logs_dir.mkdir(parents=True, exist_ok=True)
     for job, items in lines.items():
         stamps = [now - timedelta(minutes=12 - 5 * i, seconds=40 - 4 * i) for i in range(len(items))]
@@ -705,23 +731,25 @@ def _demo_settings(ops):
         return False
     members = {team: [_address(m) for m, _ in people] for team, people in TEAM_PEOPLE.items()}
     hub_settings.patch(ops, {"email": {
-        "business_emails": [_address(a) for a in BUSINESS_ADDRESSES.values()], "team_members_by_team": members,
-        "team_members": sorted(a for addrs in members.values() for a in addrs), "manager_emails": [_address(MANAGER[0])]},
+        "business_emails": [_address(a) for a in (*BUSINESS_ADDRESSES.values(), GENERAL_ADDRESS)], "team_members_by_team": members,
+        "team_members": sorted(a for addrs in members.values() for a in addrs), "manager_emails": [_address(MANAGER[0])],
+        "classification": {"address_team_map": {_address(BUSINESS_ADDRESSES[t]): t for t in ADDRESS_RULES}}},
         "sla": {"owner_emails": {SECURITY_USERS[0]: _address("yasmin.farouk"), SECURITY_USERS[1]: _address("hany.gamal")}}})
     return True
 
 
 # ===================================================================================================== seed
-def seed(ops, now=None, with_history=True, itsm_error=False, failed_job=None, stale_job="itsm", with_settings=True):
+def seed(ops, now=None, with_history=True, itsm_error=False, failed_job=None, stale_job="itsm", with_settings=True, paused_job=None):
     """Write the demo files into ``ops`` (an OpsStore) as if collectors had been running all morning.
 
     ``itsm_error``  one ITSM role could not be read (Set Role button not found)
     ``failed_job``  that job's last run failed (email | email_report | sla | itsm), its snapshot stays the last good one
     ``stale_job``   that job's collector stopped answering three hours ago ("" for none); its snapshot is that old too
+    ``paused_job``  that job (sla | itsm) stopped retrying after a wrong password ("login failed - paused")
     ``with_history`` history points of the last 8 hours, the finals of the last week and today's timeline events
     Returns a few counts for the caller. Deterministic for a given ``now``; seeding twice leaves the same files."""
     now = (now or datetime.now()).replace(microsecond=0)
-    for job in (failed_job, stale_job):
+    for job in (failed_job, stale_job, paused_job):
         if job and job not in JOB_NAMES:
             raise ValueError(f"unknown job {job!r}")
     day = now.date().isoformat()
@@ -749,9 +777,9 @@ def seed(ops, now=None, with_history=True, itsm_error=False, failed_job=None, st
         _replace_history(ops, "itsm", _itsm_points(itsm_at, itsm))
         _previous_finals(ops, now, email["stats"])
         _write_events(ops, now, _events(now, failed_job, sla, email))
-    _heartbeats(ops, now, stale_job, failed_job, email["stats"])
+    _heartbeats(ops, now, stale_job, failed_job, email["stats"], paused_job)
     _collector_info(ops, now)
-    _logs(ops, now, failed_job, email["stats"])
+    _logs(ops, now, failed_job, email["stats"], paused_job)
     _reports(ops, now)
     configured = _demo_settings(ops) if with_settings else False
     return {"email_rows": len(email["rows"]), "sla_requests": len(sla["requests"]), "itsm_roles": len(itsm["roles"]),

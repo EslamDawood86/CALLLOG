@@ -11,11 +11,11 @@
   const page = $("#hub-page");
   const ROLE = page.dataset.role;
   const IS_ADMIN = ROLE === "admin";
-  const JOBS = [["email", "E-mail scan"], ["email_report", "E-mail daily report"], ["sla", "Security requests"], ["itsm", "ITSM"]];
+  const JOBS = Object.entries(OPS.JOB_LABELS);
   const MODULE_NAMES = { email: "E-mail", sla: "Security requests", itsm: "ITSM", calls: "Calls" };
   const LEVEL_NAMES = { danger: "Critical", warn: "Warning", info: "For information", ok: "Good news" };
   const state = { day: OPS.localNowIso().slice(0, 10), seen: {}, overview: null };
-  const strip = OPS.sharedStrip($("#hubStrip"), { poll: false, links: true });
+  const strip = OPS.sharedStrip($("#hubStrip"), { poll: false, links: IS_ADMIN ? true : { calls: false, system: false } });
 
   // ------------------------------------------------------------------------------------------------ helpers
   /** Re-draw a section only when its data changed, so hover tooltips and scroll positions survive the 15 s refresh. */
@@ -34,13 +34,14 @@
   /** Home links that point to the System page only work for administrators. */
   const systemHref = (hash) => (IS_ADMIN ? `/system${hash}` : null);
 
+  /** Small chip in a module card: when the data is from, or why it cannot be trusted. Short on purpose (the cards are narrow). */
   function freshness(moduleKey, overview) {
-    const m = ((overview.shared || {}).collector || {}).modules || {};
-    const info = m[moduleKey];
-    if (!info) return OPS.chip("No data", "na", "dash");
-    if (!info.online) return OPS.chip("Collector offline", "danger", "alert");
-    if (info.stale) return OPS.chip("Data is old", "warn", "clock");
-    return OPS.chip(info.updated_at ? `Updated ${OPS.fmtClock(info.updated_at)}` : "Waiting", "ok", "check");
+    const info = (((overview.shared || {}).collector || {}).modules || {})[moduleKey];
+    const make = (text, tone, iconName, title) => { const c = OPS.chip(text, tone, iconName); if (title) c.title = title; return c; };
+    if (!info) return make("No data", "na", "dash");
+    if (!info.online) return make("Collector offline", "danger", "alert", info.updated_at ? `Last data from ${OPS.fmtWhen(info.updated_at, overview.server_time)}` : "");
+    if (info.stale) return make("Data is old", "warn", "clock", info.updated_at ? `Last data from ${OPS.fmtWhen(info.updated_at, overview.server_time)}` : "");
+    return info.updated_at ? make(OPS.fmtClock(info.updated_at), "ok", "check", `Data updated at ${OPS.fmtWhen(info.updated_at, overview.server_time)}`) : make("Waiting", "info", "clock");
   }
 
   // -------------------------------------------------------------------------------------- needs attention
@@ -66,21 +67,13 @@
   }
 
   // ------------------------------------------------------------------------------------------- collectors
-  function jobChip(job) {
-    if (!job.present) return OPS.chip("Not started", "na", "dash");
-    if (job.paused) return OPS.chip("Login failed - paused", "danger", "alert");
-    if (job.last_status === "error") return OPS.chip("Last run failed", "danger", "alert");
-    if (!job.online) return OPS.chip("Offline", "danger", "alert");
-    if (job.running) return OPS.chip("Running now", "info", "refresh");
-    return OPS.chip("Online", "ok", "check");
-  }
   function renderCollectors(d) {
     const now = d.server_time;
     $("#colBody").replaceChildren(h("ul", { class: "op-jobs" }, JOBS.map(([key, label]) => {
       const job = (d.collectors || {})[key] || { present: false };
       const when = (stamp) => (stamp ? OPS.fmtWhen(stamp, now) : "—");
       return h("li", { class: "op-job" },
-        h("div", { class: "op-job-main" }, h("strong", {}, label), jobChip(job)),
+        h("div", { class: "op-job-main" }, h("strong", {}, label), OPS.jobChip(job)),
         job.present
           ? h("div", { class: "op-job-sub" }, `last OK ${when(job.last_ok_at)}`, job.next_run_at ? ` · next ${when(job.next_run_at)}` : "", job.host ? ` · ${job.host}` : "")
           : h("div", { class: "op-job-sub" }, "The collector has not reported yet."),
@@ -132,6 +125,7 @@
           h("span", { class: "op-legend-item" }, h("i", { class: "op-swatch op-t-ok" }), fmtNum(e.replied), h("span", { class: "muted" }, " replied")),
           h("span", { class: "op-legend-item" }, h("i", { class: "op-swatch op-t-warn" }), fmtNum(e.pending), h("span", { class: "muted" }, " pending")),
           h("span", { class: "op-legend-item" }, h("i", { class: "op-swatch op-t-na" }), fmtNum(e.no_action_needed), h("span", { class: "muted" }, " no action")))),
+        e.carryover_count ? h("p", { class: "hint" }, `The split above also counts ${fmtNum(e.carryover_count)} still-open e-mail${e.carryover_count === 1 ? "" : "s"} from earlier days.`) : null,
         h("dl", { class: "op-facts" },
           fact("Past the SLA", fmtNum(e.sla_breached), e.sla_breached ? "danger" : null), fact("Escalated (no reply)", fmtNum(e.escalated_count), e.escalated_count ? "danger" : null),
           fact("Carried over", e.carryover_count ? `${fmtNum(e.carryover_count)} (oldest ${e.carryover_oldest_days} d)` : "0", e.carryover_count ? "warn" : null),
@@ -241,6 +235,11 @@
   }
 
   // ------------------------------------------------------------------------------------------------ loading
+  /** The timeline asks for the SERVER's day, which the overview tells; so it starts after the first overview (or its first failure). */
+  let timelineStarted = false;
+  function startTimeline() {
+    if (!timelineStarted) { timelineStarted = true; timeline.start(); }
+  }
   function showOverview(d) {
     state.overview = d;
     state.day = d.date || state.day;
@@ -252,10 +251,12 @@
     paint("cards", [d.calls, d.email, d.sla, d.itsm, d.shared.collector], () => renderCards(d));
     paint("teams", d.email, () => renderTeams(d));
     setLive(true, `Live · updated ${OPS.fmtClock(d.server_time, true)}`);
+    startTimeline();
   }
   function showError(e) {
     setLive(false, e.network ? "Offline · retrying…" : e.message);
     if (!state.overview && !e.network) toast(e.message, "error");
+    startTimeline();
   }
 
   const overview = OPS.loader({ url: "/api/ops/overview", interval: 15000, since: false, onData: showOverview, onError: showError });
@@ -270,5 +271,4 @@
   if (picker) picker.addEventListener("change", () => { if (picker.value) $("#viewAsForm").submit(); });
 
   overview.start();
-  timeline.start();
 })();

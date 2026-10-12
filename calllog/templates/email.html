@@ -2,7 +2,7 @@
 {% block title %}E-mail · NBE Operations Hub{% endblock %}
 {% block body %}
 {% include "_topbar.html" %}
-<main class="page op-page" id="email-page" data-role="{{ current_user.role }}" data-team="{{ current_user.team or '' }}" data-user-email="{{ current_user.email or '' }}">
+<main class="page op-page" id="email-page" data-role="{{ current_user.role }}" data-team="{{ current_user.team or '' }}" data-teams="{{ (current_user.teams or ([current_user.team] if current_user.team else []))|join('; ') }}" data-user-email="{{ current_user.email or '' }}">
   <noscript><p class="form-error">This page needs JavaScript.</p></noscript>
   <p class="empty" id="pageLoading">Loading the e-mail dashboard…</p>
 </main>
