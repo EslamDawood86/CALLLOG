@@ -352,3 +352,24 @@ keep private state in `ctx.store.read_state/write_state`, and never write snapsh
 
 `calllog/ops/demo.py` writes contract-valid snapshots, history and heartbeats into an `OpsStore`
 (`python manage.py seed-demo`), used by tests, screenshots and for trying the pages before any collector runs.
+
+## 14. Performance budget - 60 people at the same time
+
+Planning load: ~50 employees on `/my` (poll every 30 s) or logging calls (existing page, already tuned and measured in the README),
+~10 admins / managers on Home, Email, SLA, ITSM (poll every 15 s), everybody signing in around 08:00. About 3-5 requests per second
+sustained on a 4-core server PC with the data on a network share.
+
+What keeps it cheap, and what every endpoint must respect:
+
+* The web app reads **three snapshot files and a few small state files** - never the collector, never Outlook, never the call records of
+  other days. A request must not scan a folder whose size grows (events, history, reports are read by day / by name only).
+* A snapshot file is parsed **once per change per process** (OpsStore keys its cache on size + mtime and re-checks the share at most once
+  per second). `?since=<generated_at>` is answered from the cached envelope without serialising anything (< 5 ms).
+* Anything computed from a snapshot for many people is computed **once and shared** (like `Store.memo` for the Call Log): the overlaid + team-scoped
+  e-mail answer per (team scope, snapshot version, overrides version), the `shared` strip, the Home overview, per-user indexes for `/my`
+  (rows by assigned e-mail / replier e-mail / security name built once per snapshot). Large JSON answers are cached serialised and gzipped.
+* Employees only ever get their own rows (small answers). Admin answers are the big ones; they are cached per scope.
+* Browsers poll with a random start offset, back off on errors, stop while the tab is hidden, and never poll faster than the numbers above.
+* Targets on the reference demo data (500 e-mail rows, 300 SLA requests): `?since=` unchanged < 5 ms, full e-mail answer p95 < 150 ms,
+  `/my` p95 < 100 ms, `/shared` < 20 ms, with 60 simulated users and an extra 5 ms delay on every file operation. `tools/loadtest_hub.py`
+  measures this and its result is quoted in the README.
