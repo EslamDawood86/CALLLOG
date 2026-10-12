@@ -61,6 +61,7 @@ class JobContext:
     host: str = field(default_factory=socket.gethostname)
     data_dir: str = ""
     headed: bool = False              # show the browser (SLA / ITSM) for troubleshooting
+    options: dict = field(default_factory=dict)   # per-run extras, e.g. {"send_mail": True} from "Run now", {"requested_by": "admin"}
     credentials: callable = None      # credentials(kind) -> password; default get_password
 
     def password(self, kind, username):
