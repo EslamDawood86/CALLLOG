@@ -1,0 +1,319 @@
+# NBE Operations Hub - design and contracts
+
+The Call Log app grows into one application that follows the whole sector: **Calls**, **Email**
+(team reply analytics), **SLA** (security requests) and **ITSM** (implementation / rollback requests).
+This file is the single source of truth for everybody who writes code for it. If code and this file
+disagree, fix the code or change this file in the same commit.
+
+## 1. The idea in one picture
+
+```
+ Windows PC with Outlook / Chrome            shared folder \\10.104.46.34\calllog           server PC (run.py --service)
+ ┌───────────────────────────────┐   write   ┌─────────────────────────────────┐   read    ┌───────────────────────┐
+ │ collector.py                  │ ────────▶ │ data\ops\snapshots\*.json       │ ────────▶ │ Flask app (calllog\)  │──▶ browsers
+ │  jobs: email, email_report,   │           │ data\ops\history, overrides,    │ ◀──────── │  Home / Calls / Email │
+ │        sla, itsm              │ ◀──────── │ jobs\requests (run-now), logs   │   write   │  SLA / ITSM / System  │
+ │  (Outlook COM, Playwright,    │   read    └─────────────────────────────────┘ overrides └───────────────────────┘
+ │   Chrome DevTools)            │
+ └───────────────────────────────┘
+```
+
+* **Collectors** are the only code that touches Outlook, the SSO portal or ITSM. They run where those
+  tools are (a user PC that is logged in), write plain JSON into the shared folder and send the
+  e-mails the three old scripts used to send.
+* **The web app never talks to Outlook / portals.** It only reads snapshots, lets people act
+  (assign an e-mail, mark "no action", review quality, press "Run now") and shows collector health.
+* Nothing needs a database. Everything is a file in `data\ops\` written atomically under a lock
+  (same rules as the Call Log: `calllog/storage.py`).
+* **Accounts and passwords live in one file you edit in Notepad: `collector_config.json`** (next to `collector.py`,
+  see section 10). Only the collector reads it - never the web server. It is git-ignored and left out of the ZIP.
+  No password is ever stored in the repo, in `settings.json`, in a snapshot, in a log, or sent to a browser.
+
+## 2. Code layout
+
+```
+calllog/ops/
+  __init__.py
+  store.py        OpsStore: every read/write under data\ops (see section 4)       [foundation, done]
+  settings.py     defaults, validation, load/save of data\ops\settings.json       [foundation, done]
+  collector_config.py  reads collector_config.json (accounts + pinned settings)      [foundation, done]
+  schemas.py      constants (module names, status codes) + light snapshot validators
+  overlay.py      applies e-mail overrides on top of an e-mail snapshot (pure functions)
+  api.py          Flask blueprint  /api/ops/...   (section 7)
+  views.py        HTML pages /hub /email /sla /itsm /system                       (section 8)
+  exports.py      /export/ops/... (xlsx/csv built from snapshots, report download)
+  engines/
+    common.py     JobContext, JobResult, html/brand helpers, Outlook mail sender, time helpers
+    email_engine.py   scan + analysis (port of Daily_Team_Reply_Analytics_Fast_Scan_2026.py)
+    email_report.py   Excel workbook + HTML e-mails (report, team pending, assignment, quality, end-of-day)
+    sla_engine.py     port of SLA.PY
+    itsm_engine.py    port of itsm_status.py
+  runner.py       scheduler used by collector.py (section 6)
+  legacy_import.py  reads the three old scripts (never executes them) -> settings.json
+collector.py      launcher (top level, next to run.py)
+requirements-collector.txt
+```
+
+Engines and `store.py` must **import on Linux/macOS without Outlook, Chrome, pywin32, Playwright or
+pandas installed** (import those lazily inside the functions that need them). This is what makes them
+testable here. Do not add pandas to the project.
+
+## 3. Roles
+
+| role | who | can |
+|---|---|---|
+| `admin` | existing | everything: settings, collectors, users, all modules, all teams |
+| `manager` | new | sees Home/Email/SLA/ITSM/Calls dashboards, acts on e-mails (assign, no-action, team, quality) for **their team** (`user.team`; empty or `__all__` = all teams); cannot change settings/users; cannot log calls |
+| `user` | existing employee | logs calls exactly as today. May see "My e-mails" (e-mails assigned to `user.email`) |
+
+User profile gets two optional fields: `email` (lower-case; links the account to the mailbox that
+replies / gets assignments) and `team` (one of the team names or `__all__`).
+
+## 4. Data layout (inside `data_dir`, i.e. the shared folder)
+
+```
+ops/settings.json                       all module settings (no secrets)
+ops/snapshots/<module>.json             LAST SUCCESSFUL scan of: email | sla | itsm
+ops/history/<module>/<YYYY-MM-DD>.json  small daily file: list of per-scan points + extras (section 5)
+ops/overrides/email/no_action.json      { message_id: {marked_by, marked_at, subject} }
+ops/overrides/email/team.json           { message_id: {team, marked_by, marked_at, subject} }
+ops/overrides/email/assignments.json    { message_id: {assigned_to_email, assigned_to_name, note, marked_by, marked_at, subject, notified} }
+ops/overrides/email/quality.json        { message_id: {rating, note, reasons, replied_by, replied_by_email, reviewed_by, reviewed_at, appeal, appeal_by, appeal_at, appeal_decision, decided_by, decided_at, rating_withdrawn, subject} }
+ops/state/<module>.json                 engine-private state (alert de-duplication, last sent, ...)
+ops/jobs/heartbeat/<job>.json           collector heartbeat (section 6)
+ops/jobs/requests/<job>-<stamp>-<rand>.json   "Run now" requests written by the web app
+ops/jobs/logs/<job>.log                 rolling text log (tail shown in System > Logs), rotated at ~1 MB
+ops/reports/email/<name>.xlsx           reports the collector produced
+ops/reports/sla/<name>.xlsx
+ops/reports/itsm/<name>.html
+ops/locks/                              lock files
+```
+
+Dates inside files are **naive local time of the collector PC**, ISO 8601 (`2026-10-11T09:15:03`);
+days are `YYYY-MM-DD`. The web app never converts time zones (everything is in Cairo local time).
+
+## 5. Snapshot contracts
+
+Every file in `ops/snapshots/` has this envelope. `data` differs per module.
+
+```jsonc
+{
+  "schema": 1,
+  "module": "sla",                  // email | sla | itsm
+  "generated_at": "2026-10-11T09:15:03",
+  "duration_seconds": 12.4,
+  "host": "PC-123",                 // collector PC
+  "date": "2026-10-11",
+  "data": { ... }
+}
+```
+
+A failed scan **never overwrites** the snapshot (the UI keeps showing the last good data with a banner,
+using the heartbeat's `last_error`).
+
+### 5.1 `sla`
+
+```jsonc
+"data": {
+  "thresholds": {"warning_minutes": 60, "breach_minutes": 120},
+  "totals": {"open": 31, "within": 20, "reminder": 7, "breached": 4, "no_date": 0, "oldest_minutes": 410},
+  "by_user": [   // sorted breached desc, reminder desc, total desc
+    {"user": "احمد ...", "total": 5, "within": 3, "reminder": 1, "breached": 1, "no_date": 0, "oldest_minutes": 150}
+  ],
+  "requests": [  // sorted by age desc
+    {"key": "stable-hash-of-the-request-columns", "security_user": "احمد ...",
+     "sent_at": "2026-10-11T08:12:00" | null, "age_minutes": 63 | null,
+     "status": "within" | "reminder" | "breached" | "no_date",
+     "fields": {"اسم الموظف": "...", "رقم المستخدم": "...", "الفرع / الادارة": "...",
+                "النظام": "...", "نوع الطلب": "...", "موظف الاسناد": "..."}}   // detail_headers present on the page
+  ]
+}
+```
+History point (`ops/history/sla/<day>.json` = `{"points": [{"ts","open","within","reminder","breached"}], "first_breach": {key: ts}}`).
+
+### 5.2 `itsm`
+
+```jsonc
+"data": {
+  "categories": ["Implementation Requests", "Rollback Requests"],     // settings order
+  "roles": [
+    {"role": "IMP User provisioning", "error": null,
+     "categories": {
+        "Implementation Requests": {"count": 3, "rows": [{"number": "123456", "summary": "..."}],
+                                    "warning": null, "note": null},
+        "Rollback Requests": {"count": null, "rows": [], "warning": null, "note": null}   // null = not on this role's scoreboard
+     }},
+    {"role": "IMP UAT I-Flex SMS", "error": "Set Role button not found", "categories": {}}
+  ],
+  "totals": {"Implementation Requests": 5, "Rollback Requests": 1},
+  "changes": {"new":   [{"role": "...", "category": "...", "number": "...", "summary": "..."}],
+              "closed": [{"role": "...", "category": "...", "number": "...", "summary": "..."}]}  // vs previous good scan of the same day or last known
+}
+```
+History point: `{"ts", "totals": {category: n}, "per_role": {role: {category: n}}}`.
+
+### 5.3 `email`
+
+`data` mirrors the old live-dashboard payload (`_json_safe_stats` / `_json_safe_row`) plus the extras the
+manager dashboard used. Row keys are stable; unknown extra keys are allowed (UI ignores them).
+
+```jsonc
+"data": {
+  "date": "2026-10-11",
+  "sla_target_minutes": 60,
+  "teams": ["MFA Team","Flex Cube","Card Management","Third Party","Open System","Unclassified"],
+  "stats": {
+    "business_emails": 0, "replied": 0, "pending": 0, "no_action_needed": 0, "needed_reply": 0,
+    "reply_rate": 0.0, "team_replies": 0, "total_team_replies": 0,
+    "average_response": 0, "fastest_response": 0, "slowest_response": 0,        // minutes
+    "conversation_matches": 0, "conversation_index_matches": 0, "subject_matches": 0, "no_matches": 0,
+    "sla_target_minutes": 60, "sla_breached": 0, "sla_compliance_rate": 0.0, "escalated_count": 0,
+    "carryover_count": 0, "carryover_oldest_days": 0, "assigned_count": 0,
+    "team_stats": {"Flex Cube": {"business_emails":0,"replied":0,"pending":0,"no_action_needed":0,"escalated_count":0,
+                                 "carryover_count":0,"carryover_oldest_days":0,"response_minutes_sum":0,"response_count":0,
+                                 "fastest_response_minutes":null,"sla_breached_count":0,"team_emails_sent":0}},
+    "system_volume": {"Flexcube": 12},                 // canonical application -> count
+    "business_address_volume": {"it.user_provisioning@nbe.com.eg": 20},
+    "reply_breakdown": [{"name":"...","team":"...","count":3}],
+    "top_slowest_replies": [{"subject","customer_name","team","first_reply_by","entry_id","response_minutes"}],
+    "escalated_items": [{"subject","customer_name","team","current_waiting_time"}],
+    "quality": {"reviewed":0,"excellent":0,"good":0,"needs_improvement":0,"appeals":0,"coverage_rate":0.0,
+                "repliable_count":0,"manager_reply_count":0},
+    "trend": {...}                                      // compute_trend() output, may be {}
+  },
+  "rows": [ {
+    "subject","entry_id","message_id","detected_systems","team","all_teams":[],"teams_pending":[],"teams_replied":[],
+    "customer_name","customer_email","received_time":"ISO","mailbox","folder",
+    "match_method","first_reply_by","first_reply_email","first_reply_time":"ISO|null",
+    "first_response_time":"1 H 5 Min","response_minutes": int|null,"duration_minutes": int|null,
+    "reply_count":0,"current_waiting_time":"","status":"Replied|Pending Reply|No Action Needed",
+    "sla_minutes":60,"sla_status":"Met|Breached|Within SLA|N/A","escalated":false,"reminder_count":0,
+    "is_carryover":false,"age_days":0,"no_action_reason":"","reply_by_manager":false,
+    "assigned_to_email":"","assigned_to_name":"",
+    "quality_rating":"Excellent|Good|Needs Improvement|","quality_note":"","quality_reasons":"",
+    "quality_appeal":"","appeal_decision":"","rating_withdrawn":false,
+    "body_preview":"<= 300 chars", "reply_body_preview":"<= 300 chars"
+  } ],
+  "quality": {"scorecard": [...], "team_index": {...}, "leaderboard_top": [...], "leaderboard_bottom": [...],
+              "speed_quality_matrix": [...], "person_trends": [...], "repeat_issue_alerts": [...]}
+}
+```
+History point (`ops/history/email/<day>.json`): `{"points":[{"ts","business_emails","replied","pending","no_action_needed","sla_breached","escalated"}], "final": {...stats subset...}}`.
+
+## 6. Collector and jobs
+
+`python collector.py` runs a loop (see `calllog/ops/runner.py`). Jobs:
+
+| job | what it does | schedule keys in `settings.json` |
+|---|---|---|
+| `email` | read-only Outlook scan of today (+ carry-over) -> `snapshots/email.json` | `email.interval_minutes` |
+| `email_report` | the old daily run: Excel, charts, pending `.msg` zips, report / team / assignment / quality / end-of-day e-mails, history | `email.report.send_times` (`["16:30"]`), or "Run now" |
+| `sla` | portal scan -> `snapshots/sla.json`, reminder / breach e-mails with the old escalation + repeat logic | `sla.interval_minutes` |
+| `itsm` | scoreboard scan -> `snapshots/itsm.json`, optional status e-mail | `itsm.interval_minutes`, `itsm.mail.send_times` |
+
+Rules every job follows:
+
+* Scheduled runs happen only on `general.work_days` between `general.active_hours`, never on
+  `general.holidays`. **Run now** ignores that.
+* An OS file lock `ops/locks/job-<job>.lock` guarantees one runner per job even with two collector PCs.
+  Outlook jobs (`email`, `email_report`, and every mail send) also share one in-process lock because Outlook
+  COM must not be used from two threads at once.
+* A job never raises into the runner: it returns a `JobResult`.
+* The runner owns writing snapshots, history points and heartbeats; the engine returns data.
+* Heartbeat `ops/jobs/heartbeat/<job>.json`:
+  `{"job","host","pid","running":false,"enabled":true,"started_at","last_run_at","last_ok_at","last_status":"ok|error|skipped",
+    "last_error":null,"last_summary":"31 open, 4 breached","last_duration_seconds":12.4,"next_run_at","runs_ok":0,"runs_failed":0,"version":"..."}`
+  The web app calls a collector **online** when `now - heartbeat updated_at < 3 x interval + 2 min`.
+* `JobContext` (engines/common.py): `settings` (the module's section), `general`, `store` (OpsStore), `now()`,
+  `log(msg)`, `credential(name)`, `send_mail(...)`, `debug`, `dry_run`, `no_email`, `data_dir`.
+  `JobResult`: `ok`, `snapshot_data` (dict or None), `summary`, `error`, `emails_sent`, `history_extra`.
+
+## 7. Web API (`/api/ops`, all JSON, CSRF header on writes, errors `{"error": "..."}`)
+
+| method + path | role | notes |
+|---|---|---|
+| `GET /overview` | admin, manager | Home data: per-module headline numbers, `attention` list, collector health, calls today |
+| `GET /<module>?since=<generated_at>` | admin, manager (+user for email "mine") | snapshot or `{"unchanged": true}`; adds `meta`: heartbeat + `stale`; email rows are team-scoped for managers and have overrides applied |
+| `GET /<module>/history?days=14` | admin, manager | list of history days |
+| `GET /email/mine` | any signed-in | rows assigned to `user.email` |
+| `POST /email/assign` `{message_id, assigned_to_email, assigned_to_name, note}` | admin, manager | |
+| `POST /email/no-action` `{message_id}` / `DELETE` to undo | admin, manager | |
+| `POST /email/team` `{message_id, team}` | admin, manager | |
+| `POST /email/quality` `{message_id, rating, note, reasons}`; `/email/quality/appeal`, `/email/quality/decision` | admin, manager (appeal: the replier) | |
+| `GET /jobs` | admin | heartbeats + pending requests + online flag |
+| `POST /jobs/<job>/run` | admin, manager (`email`,`sla`,`itsm`), admin (`email_report`) | writes a request file; returns `{queued: true}` |
+| `GET /jobs/<job>/log?lines=200` | admin | tail |
+| `GET /settings`, `PUT /settings` | admin | full settings, validated (section 9) |
+| `GET /reports`, download via `/export/ops/report/<module>/<name>` | admin, manager | no path traversal |
+| `GET /export/ops/<module>.xlsx` | admin, manager | built from the snapshot |
+
+Every write action calls `auth.audit(...)` with an `ops_*` action name.
+
+## 8. Pages
+
+`/hub` Home, `/calls` = existing admin dashboard (`/admin` stays), `/email`, `/sla`, `/itsm`, `/system`.
+After sign-in: `admin`/`manager` -> `/hub`; `user` -> `/dashboard` (unchanged). One shared top bar with module links
+(`templates/_topbar.html`). Strict CSP stays (`script-src 'self'; style-src 'self'`): **no inline scripts or
+style attributes**; everything from `static/*.js|css`. All scraped / e-mail text is inserted with
+`textContent`. Arabic text uses `dir="auto"`. Same visual language as the Call Log (`app.css` tokens).
+
+## 9. Settings (`ops/settings.json`)
+
+See `calllog/ops/settings.py` for the authoritative defaults and validation. Lists of e-mail addresses are stored lower-case,
+de-duplicated, sorted. Unknown keys are preserved, invalid values are rejected with a message naming the key.
+
+## 10. Credentials and `collector_config.json`
+
+The file `collector_config.json` (path: `--config`, env `CALLLOG_COLLECTOR_CONFIG`, else next to `collector.py`) is the **one
+place for users, passwords and machine-specific values**. Same shape as the settings, plus `username` / `password`:
+
+```json
+{
+  "sla":   {"username": "239582", "password": "...", "base_url": "https://nbesrv.nbe.ahly.bank"},
+  "itsm":  {"username": "239582", "password": "..."},
+  "email": {"target_archive_name": "2026_Part3"},
+  "data_dir": "data"
+}
+```
+
+* Any settings key written there **wins** over the value saved from the System page (`CollectorConfig.apply`); the System page
+  lists the pinned keys (`pinned_keys()`) as read-only. Keys starting with `_` are comments.
+* `password` is read by the collector only (`collector_config.get_password`): env `NBE_SSO_PASSWORD` / `ITSM_PASS` first, then the file,
+  then Windows Credential Manager (`python collector.py --set-password sla|itsm`). It is stripped from the overlay, so it can never reach
+  `settings.json`, a snapshot, a log line, an API answer or a debug dump.
+* A missing password is a clear error in the job log and on the System page - the collector never prompts in the background.
+* `collector_config.example.json` is committed (empty values). `collector_config.json` is git-ignored and excluded from the ZIP builder.
+* `python manage.py import-legacy` reads the old scripts (never runs them) and writes both `settings.json` and a ready
+  `collector_config.json` (the users / passwords / archive name found in the old scripts).
+* The web app shows only `has_password: true/false` for each account.
+
+## 11. What is intentionally NOT carried over from the old scripts
+
+* The old standalone HTML dashboards and the `--serve` HTTP server (`DASHBOARD_USERS` with default passwords): replaced by the
+  authenticated pages above.
+* Passwords and recipient lists written inside the code: passwords are now in `collector_config.json`, lists in settings
+  (import both with `python manage.py import-legacy ...`).
+* pandas (replaced by plain Python), `win32com` at import time.
+
+## 12. Engine entry points (what the runner calls)
+
+```python
+# calllog/ops/engines/email_engine.py
+def run_scan(ctx, namespace=None) -> JobResult            # job "email"; `namespace` lets tests inject a fake Outlook
+# calllog/ops/engines/email_report.py
+def run_report(ctx, namespace=None) -> JobResult          # job "email_report"
+# calllog/ops/engines/sla_engine.py
+def run(ctx, scraper=None) -> JobResult                   # `scraper(ctx) -> (headers, rows)` replaces the browser in tests
+# calllog/ops/engines/itsm_engine.py
+def run(ctx, browser_factory=None) -> JobResult           # `browser_factory(ctx) -> Browser-like` replaces Chrome in tests
+```
+
+`ctx` is `engines.common.JobContext`. Engines read `ctx.settings` (their own section) and `ctx.general`, log with `ctx.log`,
+send mail only through `ctx.mailer` and only when `ctx.can_email()`, read passwords only through `ctx.password(kind, username)`,
+keep private state in `ctx.store.read_state/write_state`, and never write snapshots or heartbeats themselves
+(the runner does). Overrides are read with `ctx.store.overrides(name)`.
+
+## 13. Demo data
+
+`calllog/ops/demo.py` writes contract-valid snapshots, history and heartbeats into an `OpsStore`
+(`python manage.py seed-demo`), used by tests, screenshots and for trying the pages before any collector runs.

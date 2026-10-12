@@ -1,0 +1,15 @@
+{
+  "_help": "Copy this file to collector_config.json (same folder as collector.py) and fill it in. Keys starting with _ are comments. Only the collector reads this file - never the web server. Do not e-mail it or put it in git.",
+
+  "sla": {
+    "username": "",
+    "password": ""
+  },
+  "itsm": {
+    "username": "",
+    "password": ""
+  },
+  "email": {
+    "target_archive_name": ""
+  }
+}

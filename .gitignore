@@ -12,3 +12,5 @@ venv/
 /server.log*
 /dist/
 /docs/out/
+/collector_config.json
+/ops-demo/
