@@ -233,14 +233,14 @@ Rules every job follows:
 | method + path | role | notes |
 |---|---|---|
 | `GET /overview` | admin, manager | Home data: per-module headline numbers, `attention` list, collector health, calls today |
-| `GET /<module>?since=<generated_at>` | admin, manager (+user for email "mine") | snapshot or `{"unchanged": true}`; adds `meta`: heartbeat + `stale`; email rows are team-scoped for managers and have overrides applied |
+| `GET /<module>?since=<generated_at>` | admin, manager | snapshot or `{"unchanged": true}`; adds `meta` (heartbeat, `online`, `stale`, `last_error`); email rows are team-scoped for managers and have overrides applied (`overlay.py`); the email answer also carries `options` = `{teams, quality_reasons, ratings, people: [{email, name, team}]}` |
 | `GET /<module>/history?days=14` | admin, manager | list of history days |
 | `GET /email/mine` | any signed-in | rows assigned to `user.email` |
 | `POST /email/assign` `{message_id, assigned_to_email, assigned_to_name, note}` | admin, manager | |
 | `POST /email/no-action` `{message_id}` / `DELETE` to undo | admin, manager | |
 | `POST /email/team` `{message_id, team}` | admin, manager | |
 | `POST /email/quality` `{message_id, rating, note, reasons}`; `/email/quality/appeal`, `/email/quality/decision` | admin, manager (appeal: the replier) | |
-| `GET /jobs` | admin | heartbeats + pending requests + online flag |
+| `GET /jobs` | admin | heartbeats + pending requests + online flag + `collector_info` (written by the collector into `ops/state/collector_info.json`: host, config path, pinned keys, per-account `username` + `has_password`; never a password) |
 | `POST /jobs/<job>/run` | admin, manager (`email`,`sla`,`itsm`), admin (`email_report`) | writes a request file; returns `{queued: true}` |
 | `GET /jobs/<job>/log?lines=200` | admin | tail |
 | `GET /settings`, `PUT /settings` | admin | full settings, validated (section 9) |
