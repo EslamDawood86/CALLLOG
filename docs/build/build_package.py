@@ -32,7 +32,7 @@ ZIP_PATH = DIST_DIR / "NBE-CallLog.zip"
 README_FIRST = BUILD_DIR / "READ-ME-FIRST.txt"
 
 # tracked files that are NOT part of the program
-EXCLUDE_PREFIXES = ("tests/", "docs/")
+EXCLUDE_PREFIXES = ("tests/", "docs/", "tools/")
 EXCLUDE_NAMES = (".gitignore", ".gitattributes", "pytest.ini")
 
 # the product must never contain these (user rule: no .bat/.cmd/.ps1/.vbs - run.py only)
