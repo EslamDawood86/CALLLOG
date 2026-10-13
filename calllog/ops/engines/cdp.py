@@ -321,7 +321,9 @@ class CdpBrowser:
                 return m.get("result", {})
 
     def eval(self, expression, timeout_ms=30000):
-        r = self.call("Runtime.evaluate", expression=f"(()=>{{{expression}}})()" if "return" in expression else expression,
+        """Run a JavaScript expression in the page and return its value (JSON-able). Pass a complete expression,
+        e.g. ``"location.href"`` or an IIFE ``"(() => {{ ...; return x; }})()"``."""
+        r = self.call("Runtime.evaluate", expression=expression,
                       returnByValue=True, awaitPromise=True, timeout=timeout_ms)
         if "exceptionDetails" in r:
             d = r["exceptionDetails"]
@@ -331,9 +333,20 @@ class CdpBrowser:
     def current_url(self):
         return self.eval("location.href")
 
+    def click_at(self, x, y):
+        """A real (trusted) mouse click at viewport pixel (x, y). Needed so a link that uses ``window.open`` is not
+        blocked as a pop-up (a synthetic ``el.click()`` has no user activation)."""
+        self.call("Input.dispatchMouseEvent", type="mouseMoved", x=float(x), y=float(y))
+        for kind in ("mousePressed", "mouseReleased"):
+            self.call("Input.dispatchMouseEvent", type=kind, x=float(x), y=float(y),
+                      button="left", clickCount=1, buttons=1)
+
     # ------------------------------------------------------------- navigation
     def navigate(self, url, timeout=30):
-        self.call("Page.navigate", url=url)
+        result = self.call("Page.navigate", url=url)
+        error = result.get("errorText")
+        if error and error not in ("net::ERR_ABORTED",):      # ERR_ABORTED = a redirect/anchor, not a real failure
+            raise CdpError(f"Could not open the page ({error}).")
         self.wait_ready(timeout)
 
     def wait_ready(self, timeout=30):

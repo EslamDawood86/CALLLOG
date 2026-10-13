@@ -866,6 +866,8 @@ def test_missing_packages_are_listed_not_crashed_on(monkeypatch, capsys):
 
 def test_requirements_file_lists_what_the_collector_needs():
     text = (REPO / "requirements-collector.txt").read_text(encoding="utf-8")
-    for name in ("pywin32", "playwright", "keyring", "openpyxl", "Flask"):
+    for name in ("pywin32", "keyring", "openpyxl", "Flask"):
         assert name in text
+    # SLA and ITSM drive the PC's Edge / Chrome over the DevTools protocol (stdlib), so Playwright is NOT needed
+    assert "playwright" not in text.lower()
     assert "matplotlib" in text and "pandas" not in text.lower().replace("no pandas", "")

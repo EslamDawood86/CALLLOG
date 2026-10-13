@@ -24,7 +24,8 @@ The account comes from ``ctx.settings["username"]`` and the password only from `
 password is never logged, put in an exception text, a file name or a saved page: every error text and debug HTML is
 scrubbed of it, and debug HTML is written without any input values.
 
-Only the standard library and openpyxl are needed to import this module; playwright is imported inside ``scrape``.
+Only the standard library and openpyxl are needed to import this module; the browser is driven over the DevTools
+protocol (``calllog.ops.engines.cdp``) - no Playwright, no Node.js and no browser download.
 """
 import hashlib
 import os
@@ -38,7 +39,10 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
+import json
+
 from .. import schemas
+from . import cdp
 from ..settings import DEFAULTS, deep_merge
 from .common import (
     FONT_STACK, NBE_GOLD, NBE_GREEN, NBE_GREEN_LIGHT, CredentialError, JobResult, OutlookMailer, esc, norm_arabic)
@@ -171,31 +175,6 @@ JS_NORM = r"""
   const textOf = el => norm(el.tagName === "INPUT" ? (el.value || "") : (el.innerText || el.textContent));
 """
 
-# Finds the best clickable element whose text contains `target`.
-JS_FIND_CLICKABLE = "(target) => {" + JS_NORM + r"""
-  const t = norm(target);
-  const sel = "a, button, input[type=submit], input[type=button], input[type=image], [onclick], [role=button], li, span";
-  const cands = [...document.querySelectorAll(sel)].filter(visible).filter(el => textOf(el).includes(t));
-  if (!cands.length) return null;
-  const score = el => (/^(A|BUTTON|INPUT)$/.test(el.tagName) ? 0 : 10)
-                    + (textOf(el) === t ? 0 : 5) + Math.min(textOf(el).length / 100, 4);
-  cands.sort((a, b) => score(a) - score(b));
-  return cands[0];
-}"""
-
-# Finds the table row of a package and returns its "open" control.
-JS_FIND_PACKAGE = "([target, linkText]) => {" + JS_NORM + r"""
-  const loose = s => s.replace(/[\s\-–_]/g, "");
-  const t = loose(norm(target)), lt = norm(linkText);
-  const rows = [...document.querySelectorAll("tr")].filter(visible).filter(r => loose(textOf(r)).includes(t));
-  if (!rows.length) return null;
-  rows.sort((a, b) => textOf(a).length - textOf(b).length);
-  const row = rows[0];
-  const ctls = [...row.querySelectorAll("a, button, input[type=submit], input[type=button], input[type=image], [onclick]")]
-      .filter(visible);
-  return ctls.find(c => lt && textOf(c).includes(lt)) || ctls[ctls.length - 1] || row;
-}"""
-
 # Reads every table on the page. DataTables are read through their API so all pages are included.
 JS_READ_TABLES = "() => {" + r"""
   const cellText = n => {
@@ -251,19 +230,72 @@ JS_REDACTED_HTML = "() => {" + r"""
 }"""
 
 
-def safe_click(element):
-    try:
-        element.scroll_into_view_if_needed(timeout=3000)
-        element.click(timeout=5000)
-    except Exception:
-        element.evaluate("e => e.click()")
+# The table-reading and page-dump scripts are arrow functions; CDP evaluates a complete expression, so they are called.
+READ_TABLES = "(" + JS_READ_TABLES + ")()"
+REDACTED_HTML = "(" + JS_REDACTED_HTML + ")()"
 
 
-def click_text(page, text):
-    el = page.evaluate_handle(JS_FIND_CLICKABLE, text).as_element()
-    if not el:
+
+def js_click_text(text):
+    """Find the best clickable element whose text contains ``text``; return its centre {x, y}, or null."""
+    return ("(() => {" + JS_NORM
+            + "const R = el => { try{el.scrollIntoView({block:'center'});}catch(e){} const r = el.getBoundingClientRect(); return {x: r.left + r.width/2, y: r.top + r.height/2}; };"
+            + "const t = norm(" + json.dumps(text) + ");"
+            + "const sel = \"a, button, input[type=submit], input[type=button], input[type=image], [onclick], [role=button], li, span\";"
+            + "const cands = [...document.querySelectorAll(sel)].filter(visible).filter(el => textOf(el).includes(t));"
+            + "if (!cands.length) return null;"
+            + "const score = el => (/^(A|BUTTON|INPUT)$/.test(el.tagName) ? 0 : 10) + (textOf(el) === t ? 0 : 5) + Math.min(textOf(el).length/100, 4);"
+            + "cands.sort((a,b) => score(a)-score(b));"
+            + "return R(cands[0]); })()")
+
+
+def js_click_selector(selector):
+    """Centre {x, y} of the first visible element matching ``selector``, or null."""
+    return ("(() => {" + JS_NORM
+            + "const R = el => { try{el.scrollIntoView({block:'center'});}catch(e){} const r = el.getBoundingClientRect(); return {x: r.left + r.width/2, y: r.top + r.height/2}; };"
+            + "const el = [...document.querySelectorAll(" + json.dumps(selector) + ")].filter(visible)[0];"
+            + "return el ? R(el) : null; })()")
+
+
+def js_open_package(target, link_text):
+    """Centre {x, y} of the package row's open control (prefer one whose text has ``link_text``). 'notfound' if no row."""
+    return ("(() => {" + JS_NORM
+            + "const R = el => { try{el.scrollIntoView({block:'center'});}catch(e){} const r = el.getBoundingClientRect(); return {x: r.left + r.width/2, y: r.top + r.height/2}; };"
+            + "const loose = s => s.replace(/[\\s\\-\u2013_]/g,'');"
+            + "const t = loose(norm(" + json.dumps(target) + ")), lt = norm(" + json.dumps(link_text or "") + ");"
+            + "const rows = [...document.querySelectorAll('tr')].filter(visible).filter(r => loose(textOf(r)).includes(t));"
+            + "if (!rows.length) return 'notfound';"
+            + "rows.sort((a,b) => textOf(a).length - textOf(b).length);"
+            + "const row = rows[0];"
+            + "const ctls = [...row.querySelectorAll(\"a, button, input[type=submit], input[type=button], input[type=image], [onclick]\")].filter(visible);"
+            + "const ctl = ctls.find(c => lt && textOf(c).includes(lt)) || ctls[ctls.length-1] || row;"
+            + "return R(ctl); })()")
+
+
+def js_next_page():
+    """Centre {x, y} of the DataTables 'next' button when it is enabled, else null."""
+    return ("(() => {" + 
+            "const el = el => el; const R = e => { try{e.scrollIntoView({block:'center'});}catch(x){} const r = e.getBoundingClientRect(); return {x: r.left + r.width/2, y: r.top + r.height/2}; };"
+            + "const n = document.querySelector('.dataTables_paginate .next:not(.disabled), .paginate_button.next:not(.disabled)');"
+            + "return n ? R(n) : null; })()")
+
+
+def js_fill_login(user_sel, pass_sel, username, password):
+    """Set the user and password inputs (by selector, or the first visible text / password input) and fire input/change."""
+    return ("(() => {" + JS_NORM
+            + "const uSel=" + json.dumps(user_sel or "") + ", pSel=" + json.dumps(pass_sel or "") + ";"
+            + "const u = uSel ? document.querySelector(uSel) : [...document.querySelectorAll(\"input[type=text], input:not([type])\")].filter(visible)[0];"
+            + "const p = pSel ? document.querySelector(pSel) : [...document.querySelectorAll(\"input[type=password]\")].filter(visible)[0];"
+            + "const set=(el,val)=>{if(!el)return false; try{el.focus();}catch(e){} el.value=val; el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); return true;};"
+            + "return {user:set(u," + json.dumps(str(username)) + "), pass:set(p," + json.dumps(password) + ")}; })()")
+
+
+def _click(browser, finder_expr):
+    """Run ``finder_expr`` (returns a point {x, y} or null); do a trusted mouse click there. Returns True if clicked."""
+    point = browser.eval(finder_expr)
+    if not isinstance(point, dict):
         return False
-    safe_click(el)
+    browser.click_at(point["x"], point["y"])
     return True
 
 
@@ -276,20 +308,22 @@ class Debug:
         self.secrets = list(secrets)
         self.n = 0
 
-    def snap(self, pages, name):
+    def snap(self, browser, name):
         if not self.enabled:
             return
         with suppress(OSError):
             self.folder.mkdir(parents=True, exist_ok=True)
         self.n += 1
-        for i, p in enumerate(pages):
-            base = self.folder / f"{self.n:02d}_{name}_{i}"
-            try:
-                p.screenshot(path=f"{base}.png", full_page=True)
-                page_html = scrub(p.evaluate(JS_REDACTED_HTML), self.secrets)
-                Path(f"{base}.html").write_text(page_html, encoding="utf-8")
-            except Exception:
-                pass
+        base = self.folder / f"{self.n:02d}_{name}_0"
+        try:
+            browser.screenshot(f"{base}.png")
+        except Exception:
+            pass
+        try:
+            page_html = scrub(browser.eval(REDACTED_HTML), self.secrets)
+            Path(f"{base}.html").write_text(page_html, encoding="utf-8")
+        except Exception:
+            pass
 
 
 def debug_folder(ctx):
@@ -297,94 +331,33 @@ def debug_folder(ctx):
     return root / "debug" / "sla"
 
 
-def install_chromium(log):
-    """One-time download of Playwright's own Chromium. Returns the exit code."""
-    cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
-    proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace", creationflags=NO_WINDOW, timeout=240)
-    tail = ((proc.stdout or "")[-500:] + (proc.stderr or "")[-500:]).strip()
-    if tail:
-        log(f"playwright install: {tail}")
-    return proc.returncode
+def open_browser(ctx, cfg, headless):
+    """The real browser for a scan: the PC's Edge / Chrome driven over the DevTools protocol (no Playwright). Tests
+    monkeypatch this to inject a scripted browser."""
+    bcfg = {"browser_executable": cfg.get("browser_executable") or "",
+            "cdp_port": cfg.get("cdp_port") or 0,
+            "profile_dir": cfg.get("profile_dir") or ""}
+    return cdp.CdpBrowser(bcfg, log=ctx.log, headless=headless, profile_leaf="sla_profile")
 
 
-# Where Edge / Chrome normally live on a Windows PC. Used directly (executable_path) so the collector works with the
-# browser the bank already has, WITHOUT Playwright having to download its own Chromium (no internet needed).
-WINDOWS_BROWSERS = (
-    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-    os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe"),
-)
-
-
-def installed_browsers():
-    """Full paths of a Chrome / Edge that is actually installed on this PC (Windows standard locations), newest-looking first."""
-    seen, out = set(), []
-    for path in WINDOWS_BROWSERS:
-        try:
-            if path and path.lower() not in seen and os.path.isfile(path):
-                seen.add(path.lower())
-                out.append(path)
-        except OSError:
-            pass
-    return out
-
-
-def launch_browser(pw, cfg, headed=False, log=print, install=None):
-    """Start the configured browser, else Chrome/Edge installed on the PC (by path, no download), else the ``chrome``/``msedge``
-    channels, and only if nothing is found Playwright's own Chromium (downloaded once, needs internet). Returns (browser, name)."""
-    opts = {"headless": not headed}
-    attempts = []
-    if cfg.get("browser_executable"):
-        attempts.append((cfg["browser_executable"], {"executable_path": cfg["browser_executable"]}))
-    for path in installed_browsers():                       # the Edge/Chrome the bank already has - works offline
-        attempts.append((os.path.basename(path), {"executable_path": path}))
-    for channel in dict.fromkeys([cfg.get("browser_channel"), "chrome", "msedge"]):
-        if channel:
-            attempts.append((channel, {"channel": channel}))
-    attempts.append(("playwright chromium", {}))
-    errors = []
-
-    def first_line(e):
-        text = str(e).strip()
-        return text.splitlines()[0] if text else repr(e)
-
-    for name, extra in attempts:
-        try:
-            return pw.chromium.launch(**opts, **extra), name
-        except Exception as e:
-            errors.append(f"{name}: {first_line(e)}")
-
-    log("Chrome / Edge not found - downloading Playwright's Chromium (one time)")
+def _press_enter(browser):
+    """Press Enter in the focused password field (a real, trusted key event), to submit a login form that has no button
+    whose text we recognise."""
     try:
-        code = (install or install_chromium)(log)
-    except Exception as e:
-        code = None
-        errors.append(f"download: {first_line(e)}")
-    if code == 0:
+        browser.eval("(() => { const p=[...document.querySelectorAll('input[type=password]')]"
+                     ".filter(e => e.offsetParent !== null)[0]; if (p) p.focus(); return !!p; })()")
+    except Exception:
+        pass
+    for kind in ("rawKeyDown", "char", "keyUp"):
         try:
-            return pw.chromium.launch(**opts), "playwright chromium"
-        except Exception as e:
-            errors.append(f"playwright chromium (after download): {first_line(e)}")
-    hint = ("Could not start a browser. If this PC has Microsoft Edge or Google Chrome, set sla.browser_executable in "
-            "collector_config.json to its full path, e.g. "
-            r'"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"'
-            " - then no internet is needed. ")
-    raise PortalError(hint + "Tried: " + " | ".join(errors))
+            browser.call("Input.dispatchKeyEvent", type=kind, key="Enter", code="Enter", text="\r",
+                         windowsVirtualKeyCode=13, nativeVirtualKeyCode=13)
+        except Exception:
+            pass
 
 
-def wait_for_app_page(context, fragment, timeout_s):
-    """The page (new window or the same tab) whose URL contains ``fragment``."""
-    end = time.time() + timeout_s
-    while time.time() < end:
-        for p in reversed(context.pages):
-            if fragment in (p.url or "").lower():
-                p.wait_for_load_state("load")
-                return p
-        context.pages[0].wait_for_timeout(500)
-    raise PortalError(f"The application page did not open (no page with '{fragment}' in its URL)")
+def _sleep_ms(ms):
+    time.sleep(max(0, int(ms)) / 1000.0)
 
 
 def pick_table(tables, cfg):
@@ -398,34 +371,31 @@ def pick_table(tables, cfg):
     return best[1] if best else None
 
 
-def read_requests(page, cfg, debug):
+def read_requests(browser, cfg, debug):
     """(headers, rows) of the requests table on the Re-Assign page."""
-    page.wait_for_timeout(SETTLE_MS)
-    table = pick_table(page.evaluate(JS_READ_TABLES), cfg)
+    _sleep_ms(SETTLE_MS)
+    table = pick_table(browser.eval(READ_TABLES), cfg)
     if table is None or not table["rows"]:
         # results not loaded yet -> press the search button
-        if click_text(page, cfg["search_button_text"]):
-            page.wait_for_timeout(SETTLE_MS)
-            page.wait_for_load_state("load")
-            page.wait_for_timeout(SETTLE_MS)
-            table = pick_table(page.evaluate(JS_READ_TABLES), cfg)
-    debug.snap([page], "results")
+        if _click(browser, js_click_text(cfg["search_button_text"])):
+            _sleep_ms(SETTLE_MS)
+            browser.wait_ready(int(cfg["timeout_seconds"]))
+            _sleep_ms(SETTLE_MS)
+            table = pick_table(browser.eval(READ_TABLES), cfg)
+    debug.snap(browser, "results")
     if table is None:
-        seen = [t["headers"] for t in page.evaluate(JS_READ_TABLES) if t["headers"]]
+        seen = [t["headers"] for t in browser.eval(READ_TABLES) if t["headers"]]
         raise PortalError("Requests table not found. Headers seen on the page: "
                           + " | ".join(", ".join(h) for h in seen))
 
     rows = list(table["rows"])
     if table["source"] == "dom":
-        # plain paging: click "next" until it is disabled
+        # plain paging: click "next" until it is disabled or nothing new arrives
         for _ in range(MAX_PAGES):
-            nxt = page.locator(".dataTables_paginate .next:not(.disabled), "
-                               ".paginate_button.next:not(.disabled)").first
-            if nxt.count() == 0:
+            if not _click(browser, js_next_page()):
                 break
-            nxt.click()
-            page.wait_for_timeout(PAGE_MS)
-            t = pick_table(page.evaluate(JS_READ_TABLES), cfg)
+            _sleep_ms(PAGE_MS)
+            t = pick_table(browser.eval(READ_TABLES), cfg)
             new = [r for r in (t["rows"] if t else []) if r not in rows]
             if not new:
                 break
@@ -440,72 +410,55 @@ def url_marker(path, default, keep_extension=False):
 
 
 def scrape(ctx, username, password):
-    """Log in, open the package, open the Re-Assign page, read the table. Returns (headers, rows)."""
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        raise PortalError("Playwright is not installed on the collector PC (pip install -r requirements-collector.txt)") from None
+    """Log in, open the package, open the Re-Assign page, read the table. Returns (headers, rows).
 
+    Driven over the DevTools protocol (no Playwright): the PC's Edge / Chrome is launched with a debugging port and
+    walked through the pages with small JavaScript snippets. The debug dumps hold no input value and no password."""
     cfg = _config(ctx)
     timeout_s = int(cfg["timeout_seconds"])
-    timeout_ms = timeout_s * 1000
     base = cfg["base_url"].rstrip("/")
     sel = cfg.get("selectors") or {}
     login_marker = url_marker(cfg["login_path"], "login.aspx", keep_extension=True)
     reassign_marker = url_marker(cfg["reassign_path"], "request_reassign")
     debug = Debug(ctx.debug, debug_folder(ctx), [password])
 
-    with sync_playwright() as pw:
-        browser, name = launch_browser(pw, cfg, ctx.headed, ctx.log)
-        ctx.log(f"Browser: {name}")
+    browser = open_browser(ctx, cfg, headless=not ctx.headed)
+    try:
+        # 1) Login. The page is dumped BEFORE the password is typed.
+        browser.navigate(base + cfg["login_path"], timeout=timeout_s)
+        debug.snap(browser, "login")
+        browser.eval(js_fill_login(sel.get("username"), sel.get("password"), username, password))
+        if sel.get("login_button"):
+            _click(browser, js_click_selector(sel["login_button"]))
+        elif not _click(browser, js_click_text(cfg["login_button_text"])):
+            _press_enter(browser)
+        if browser.wait_url(lambda u: login_marker not in u.lower(), timeout=timeout_s) is None:
+            raise LoginError("Login failed - still on the login page. Check the SLA user and password "
+                             "in collector_config.json (sla.username / sla.password).")
+        browser.wait_ready(timeout_s)
+        debug.snap(browser, "groups")
+
+        # 2) Open the package (may open in a new window, or load in the same tab)
+        pkg = browser.eval(js_open_package(cfg["package_text"], cfg["package_link_text"]))
+        if pkg == "notfound" or not isinstance(pkg, dict):
+            raise PortalError(f"Package not found on the groups page: {cfg['package_text']}")
+        browser.click_at(pkg["x"], pkg["y"])
+        browser.attach(cfg["app_url_fragment"].lower(), timeout=timeout_s)
+        debug.snap(browser, "app_home")
+
+        # 3) Re-Assign page
+        browser.navigate(base + cfg["reassign_path"], timeout=timeout_s)
+        if reassign_marker not in (browser.current_url() or "").lower():
+            raise PortalError(f"Could not open the Re-Assign page (ended on {scrub(browser.current_url(), [password])})")
+        return read_requests(browser, cfg, debug)
+    except Exception:
         try:
-            context = browser.new_context(
-                ignore_https_errors=bool(cfg.get("ignore_https_errors")),
-                viewport={"width": 1600, "height": 1000},
-                locale="ar-EG",
-            )
-            context.set_default_timeout(timeout_ms)
-            page = context.new_page()
-            try:
-                # 1) Login. The page is dumped BEFORE the password is typed.
-                page.goto(base + cfg["login_path"], wait_until="load")
-                debug.snap([page], "login")
-                user_box = page.locator(sel.get("username")
-                                        or "input[type='text']:visible, input:not([type]):visible").first
-                pass_box = page.locator(sel.get("password") or "input[type='password']:visible").first
-                user_box.fill(str(username))
-                pass_box.fill(password)
-                if sel.get("login_button"):
-                    page.locator(sel["login_button"]).first.click()
-                elif not click_text(page, cfg["login_button_text"]):
-                    pass_box.press("Enter")
-                try:
-                    page.wait_for_url(lambda u: login_marker not in u.lower(), timeout=timeout_ms)
-                except Exception:
-                    raise LoginError("Login failed - still on the login page. Check the SLA user and password "
-                                     "in collector_config.json (sla.username / sla.password).") from None
-                page.wait_for_load_state("load")
-                debug.snap([page], "groups")
-
-                # 2) Open the package (may open in a new window)
-                ctl = page.evaluate_handle(JS_FIND_PACKAGE,
-                                           [cfg["package_text"], cfg["package_link_text"]]).as_element()
-                if not ctl:
-                    raise PortalError(f"Package not found on the groups page: {cfg['package_text']}")
-                safe_click(ctl)
-                app = wait_for_app_page(context, cfg["app_url_fragment"].lower(), timeout_s)
-                debug.snap([app], "app_home")
-
-                # 3) Re-Assign page
-                app.goto(base + cfg["reassign_path"], wait_until="load")
-                if reassign_marker not in app.url.lower():
-                    raise PortalError(f"Could not open the Re-Assign page (ended on {scrub(app.url, [password])})")
-                return read_requests(app, cfg, debug)
-            except Exception:
-                debug.snap(context.pages, "error")
-                raise
-        finally:
-            browser.close()
+            debug.snap(browser, "error")
+        except Exception:
+            pass
+        raise
+    finally:
+        browser.close()
 
 
 # --------------------------------------------------------------------------- analysis

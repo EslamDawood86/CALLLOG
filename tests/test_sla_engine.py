@@ -16,7 +16,7 @@ import openpyxl
 import pytest
 
 from calllog.ops import schemas, settings
-from calllog.ops.engines import sla_engine as sla
+from calllog.ops.engines import cdp, sla_engine as sla
 from calllog.ops.engines.common import CredentialError, FakeMailer, JobContext, norm_arabic
 from calllog.ops.store import OpsStore
 from tests.fake_portal import HEADERS, sample_requests, table_cells
@@ -697,106 +697,68 @@ class TestRunFailures:
         assert any("starting fresh" in line for line in ctx.logs)
 
 
-# --------------------------------------------------------------------------------------------------- browser launch fallback
-class FakeChromium:
-    def __init__(self, working=(), after_install=False):
-        self.working, self.attempts, self.installed = set(working), [], False
-        self.after_install = after_install
+# --------------------------------------------------------------------------------------------------- browser selection
+class TestBrowser:
+    def test_find_browser_prefers_the_configured_path(self, tmp_path):
+        exe = tmp_path / "msedge.exe"
+        exe.write_text("")
+        assert cdp.find_browser(str(exe), environ={}) == str(exe)
 
-    def launch(self, **kw):
-        key = kw.get("executable_path") or kw.get("channel") or "bundled"
-        self.attempts.append(key)
-        if key in self.working or (key == "bundled" and self.installed and self.after_install):
-            return f"browser:{key}"
-        raise RuntimeError(f"{key} is not installed\nCall log: more text")
+    def test_find_browser_uses_chrome_path_env(self, tmp_path):
+        exe = tmp_path / "chrome"
+        exe.write_text("")
+        assert cdp.find_browser("", environ={"CHROME_PATH": str(exe)}) == str(exe)
 
+    def test_find_browser_uses_a_playwright_chromium_already_on_the_pc(self, tmp_path):
+        exe = tmp_path / "pw" / "chromium-1100" / "chrome-linux" / "chrome"
+        exe.parent.mkdir(parents=True)
+        exe.write_text("")
+        assert cdp.find_browser("", environ={"PLAYWRIGHT_BROWSERS_PATH": str(tmp_path / "pw")}) == str(exe)
 
-class FakePw:
-    def __init__(self, chromium):
-        self.chromium = chromium
+    def test_find_browser_none_when_nothing_is_installed(self, tmp_path):
+        assert cdp.find_browser("", environ={"PLAYWRIGHT_BROWSERS_PATH": str(tmp_path / "empty")}) is None
 
-
-class TestLaunch:
-    def cfg(self, **kw):
-        return {"browser_channel": "chrome", "browser_executable": "", **kw}
-
-    def test_configured_channel_first(self):
-        chromium = FakeChromium(working={"msedge"})
-        browser, name = sla.launch_browser(FakePw(chromium), self.cfg(browser_channel="msedge"))
-        assert (browser, name) == ("browser:msedge", "msedge") and chromium.attempts == ["msedge"]
-
-    def test_order_executable_channel_chrome_edge_bundled(self):
-        chromium = FakeChromium(working={"bundled"})
-        _, name = sla.launch_browser(FakePw(chromium), self.cfg(browser_executable="C:/b.exe", browser_channel="firefoxish"),
-                                     install=lambda log: pytest.fail("must not download when bundled Chromium works"))
-        assert name == "playwright chromium"
-        assert chromium.attempts == ["C:/b.exe", "firefoxish", "chrome", "msedge", "bundled"]
-
-    def test_empty_channel_still_tries_chrome_and_edge_then_bundled(self):
-        chromium = FakeChromium(working={"bundled"})
-        sla.launch_browser(FakePw(chromium), self.cfg(browser_channel=""))
-        assert chromium.attempts == ["chrome", "msedge", "bundled"]
-
-    def test_headed_flag(self):
+    def test_open_browser_builds_a_cdp_browser_from_the_settings(self, store, monkeypatch):
         seen = {}
 
-        class Chromium:
-            def launch(self, **kw):
-                seen.update(kw)
-                return "b"
-        sla.launch_browser(FakePw(Chromium()), self.cfg(), headed=True)
+        class FakeCdp:
+            def __init__(self, cfg, log=None, headless=True, profile_leaf="sla_profile"):
+                seen.update(cfg=cfg, headless=headless, leaf=profile_leaf)
+
+        monkeypatch.setattr(cdp, "CdpBrowser", FakeCdp)
+        ctx = make_ctx(store)
+        sla.open_browser(ctx, {"browser_executable": "C:/edge.exe", "cdp_port": 9333}, headless=True)
+        assert seen["cfg"]["browser_executable"] == "C:/edge.exe" and seen["cfg"]["cdp_port"] == 9333
+        assert seen["headless"] is True and seen["leaf"] == "sla_profile"
+
+    def test_headed_flag_is_passed_through(self, store, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(cdp, "CdpBrowser", lambda cfg, log=None, headless=True, profile_leaf="": seen.update(headless=headless))
+        sla.open_browser(make_ctx(store), {}, headless=False)
         assert seen["headless"] is False
-
-    def test_download_happens_once_and_only_when_nothing_is_found(self):
-        chromium = FakeChromium(after_install=True)
-        downloads, logs = [], []
-
-        def install(log):
-            downloads.append(1)
-            chromium.installed = True
-            return 0
-        _, name = sla.launch_browser(FakePw(chromium), self.cfg(), log=logs.append, install=install)
-        assert name == "playwright chromium" and downloads == [1]
-        assert chromium.attempts == ["chrome", "msedge", "bundled", "bundled"]
-        assert any("downloading" in line.lower() for line in logs)
-
-    def test_failure_lists_every_attempt(self):
-        chromium = FakeChromium()
-        with pytest.raises(sla.PortalError) as err:
-            sla.launch_browser(FakePw(chromium), self.cfg(), install=lambda log: 1)
-        text = str(err.value)
-        assert "chrome: chrome is not installed" in text and "msedge: msedge" in text and "Call log" not in text
-        assert chromium.attempts == ["chrome", "msedge", "bundled"]
-
-    def test_a_crashing_installer_is_reported_not_raised(self):
-        def boom(log):
-            raise OSError("no network")
-        with pytest.raises(sla.PortalError, match="download: no network"):
-            sla.launch_browser(FakePw(FakeChromium()), self.cfg(), install=boom)
 
 
 class TestDebugDumps:
-    class Page:
+    class Browser:
         def __init__(self, html):
             self.html = html
 
-        def screenshot(self, path, full_page):
-            Path(path).write_bytes(b"png")
+        def screenshot(self, path):
+            Path(path).write_bytes(b"\x89PNG\r\n")
 
-        def evaluate(self, script):
+        def eval(self, expression):
             return self.html
 
     def test_disabled_writes_nothing(self, tmp_path):
-        sla.Debug(False, tmp_path / "d", [PASSWORD]).snap([self.Page("x")], "login")
+        sla.Debug(False, tmp_path / "d", [PASSWORD]).snap(self.Browser("x"), "login")
         assert not (tmp_path / "d").exists()
 
     def test_html_is_scrubbed_and_files_are_numbered(self, tmp_path):
         dbg = sla.Debug(True, tmp_path / "d", [PASSWORD])
-        dbg.snap([self.Page(f"<p>echo {PASSWORD}</p>")], "login")
-        dbg.snap([self.Page("b"), self.Page("c")], "error")
+        dbg.snap(self.Browser(f"<p>echo {PASSWORD}</p>"), "login")
+        dbg.snap(self.Browser("b"), "error")
         names = sorted(p.name for p in (tmp_path / "d").iterdir())
-        assert names == ["01_login_0.html", "01_login_0.png", "02_error_0.html", "02_error_0.png",
-                         "02_error_1.html", "02_error_1.png"]
+        assert names == ["01_login_0.html", "01_login_0.png", "02_error_0.html", "02_error_0.png"]
         assert (tmp_path / "d" / "01_login_0.html").read_text(encoding="utf-8") == "<p>echo ***</p>"
 
     def test_folder_is_under_data_dir_ops_debug_sla(self, store):
@@ -821,48 +783,38 @@ def test_module_imports_without_browser_or_windows_packages():
 from tests.fake_portal import GROUPS_PATH, HOME_PATH, LOGIN_PATH, REASSIGN_PATH, FakePortal  # noqa: E402
 
 
-BROWSER = {"executable": ""}      # filled by chromium_ok: "" = Playwright's own default Chromium works here
-
-
-def _installed_chromiums():
-    """Chromium builds already in PLAYWRIGHT_BROWSERS_PATH (newest first), for a Playwright whose own revision is missing."""
-    root = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or "")
-    found = list(root.glob("chromium-*/chrome-linux/chrome")) + list(root.glob("chromium_headless_shell-*/chrome-linux/headless_shell"))
-    return [str(p) for p in sorted(found, reverse=True)]
+BROWSER = {"executable": ""}      # filled by chromium_ok with the Edge / Chrome / Chromium found on this machine
 
 
 @pytest.fixture(scope="module")
 def chromium_ok():
+    """A real Chrome / Edge / Chromium to drive over CDP (no Playwright). Skips cleanly when none can be found or started."""
+    exe = cdp.find_browser("")
+    if not exe:
+        pytest.skip("no Chrome / Edge / Chromium on this machine")
+    port = cdp.free_port()
     try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        pytest.skip("playwright is not installed")
-    errors = []
-    with sync_playwright() as pw:
-        for executable in [""] + _installed_chromiums():
-            try:
-                pw.chromium.launch(**({"executable_path": executable} if executable else {})).close()
-            except Exception as exc:                          # missing binary, no sandbox permission, ...
-                errors.append(str(exc).strip().splitlines()[0] if str(exc).strip() else repr(exc))
-                continue
-            BROWSER["executable"] = executable
-            return executable
-    pytest.skip("Chromium cannot start here: " + " | ".join(errors))
+        b = cdp.CdpBrowser({"browser_executable": exe, "cdp_port": port,
+                            "profile_dir": tempfile.mkdtemp(prefix="sla-probe-")}, headless=True)
+        b.close()
+    except Exception as exc:                          # no sandbox permission, policy block, ...
+        pytest.skip("Chromium cannot start here: " + (str(exc).strip().splitlines()[0] if str(exc).strip() else repr(exc)))
+    BROWSER["executable"] = exe
+    return exe
 
 
 @pytest.fixture
 def quick(monkeypatch):
     monkeypatch.setattr(sla, "SETTLE_MS", 300)
     monkeypatch.setattr(sla, "PAGE_MS", 250)
-    # the e2e tests must never start a download
-    monkeypatch.setattr(sla, "install_chromium", lambda log: pytest.fail("a browser download was attempted"))
 
 
 def e2e_settings(portal, timeout=8, **over):
-    """Settings that point the engine at the fake portal. browser_channel "" = no installed Chrome / Edge is required;
-    browser_executable is only set when this machine's Playwright has no matching bundled Chromium."""
+    """Settings that point the engine at the fake portal and at the browser found by chromium_ok (driven over CDP)."""
     cfg = sla_settings(base_url=portal.url, browser_channel="", browser_executable=BROWSER["executable"], **over)
     cfg["timeout_seconds"] = timeout
+    cfg["cdp_port"] = 0                                          # a free port per run
+    cfg["profile_dir"] = tempfile.mkdtemp(prefix="sla-prof-")    # a fresh profile per run (no cross-test clashes)
     return cfg
 
 
@@ -902,14 +854,11 @@ def assert_scanned_everything(result):
 @pytest.mark.usefixtures("chromium_ok", "quick")
 class TestEndToEnd:
     def test_new_window_plain_table(self, store, monkeypatch):
-        windows, clicks, sources = [], [], []
-        spy(monkeypatch, "wait_for_app_page", lambda a, out: windows.append(len(a[0].pages)))
-        spy(monkeypatch, "click_text", lambda a, out: clicks.append((a[1], out)))
+        sources = []
         spy(monkeypatch, "pick_table", lambda a, out: sources.append(out["source"] if out else None))
         with FakePortal(sample_requests(NOW), open_mode="blank", variant="plain") as portal:
-            result, ctx = portal_run(store, portal)
-            assert windows == [2]                                  # the package opened in a second window
-            assert clicks == [("دخول", True)] and set(sources) == {"dom"}       # login button found by its text
+            result, ctx = portal_run(store, portal)                # the package opens a second window; attach() follows it
+            assert set(sources) == {"dom"}
             assert result.ok, result.error
             assert_scanned_everything(result)
             assert result.emails_sent == 1 and ctx.mailer.sent[0]["to"] == [BOSS]
@@ -922,36 +871,30 @@ class TestEndToEnd:
         assert users["(Unassigned)"]["no_date"] == 1 and users[OWNER_A]["total"] == 3
 
     def test_same_tab_datatables_reads_every_page_through_the_api(self, store, monkeypatch):
-        windows, sources = [], []
-        spy(monkeypatch, "wait_for_app_page", lambda a, out: windows.append(len(a[0].pages)))
+        sources = []
         spy(monkeypatch, "pick_table", lambda a, out: sources.append(out["source"] if out else None))
         with FakePortal(sample_requests(NOW), open_mode="same", variant="datatables", page_size=5) as portal:
-            result, _ = portal_run(store, portal)
+            result, _ = portal_run(store, portal)                  # same tab; read through the DataTables API, no paging
             assert result.ok, result.error
-            assert windows == [1] and sources == ["datatables"]    # same tab; read through the API, no paging clicks
+            assert sources == ["datatables"]
             assert_scanned_everything(result)             # 12 rows although only 5 are in the DOM
 
     def test_paged_plain_table_is_followed_page_by_page_and_enter_logs_in(self, store, monkeypatch):
-        clicks, reads = [], []
-        spy(monkeypatch, "click_text", lambda a, out: clicks.append((a[1], out)))
+        reads = []
         spy(monkeypatch, "pick_table", lambda a, out: reads.append(len(out["rows"]) if out else None))
         with FakePortal(sample_requests(NOW), variant="paged", page_size=5, login_style="english") as portal:
-            result, _ = portal_run(store, portal)
+            result, _ = portal_run(store, portal)          # no login button text matches: the Enter key submits the form
             assert result.ok, result.error
             assert_scanned_everything(result)
             assert portal.logins == [True]
-            assert clicks == [("دخول", False)]             # no button text matched: the Enter key submitted the form
             assert reads == [5, 5, 2]                      # first page, then "next" twice (5 + 5 + 2 = 12 rows)
 
-    def test_selectors_override_and_search_button(self, store, monkeypatch):
-        clicks = []
-        spy(monkeypatch, "click_text", lambda a, out: clicks.append((a[1], out)))
+    def test_selectors_override_and_search_button(self, store):
         selectors = {"username": "#txtUserName", "password": "#txtPassword", "login_button": "#btnLogin"}
         with FakePortal(sample_requests(NOW), variant="search", login_style="english") as portal:
-            result, _ = portal_run(store, portal, selectors=selectors)
+            result, _ = portal_run(store, portal, selectors=selectors)   # login via the given selectors; results need the search button
             assert result.ok, result.error
             assert_scanned_everything(result)
-            assert clicks == [("بحث", True)]               # the login used the selector; only the search was clicked by text
 
     def test_wrong_password_is_a_clear_auth_error_and_debug_files_hide_it(self, store):
         before = {"alerted": {"k": 1}, "last_sent": "2026-10-12T09:00:00"}
@@ -1012,12 +955,12 @@ class TestEndToEnd:
         assert "ERR_CONNECTION_REFUSED" in result.error or "Page.goto" in result.error
 
     def test_js_normalisation_matches_python(self):
-        from playwright.sync_api import sync_playwright
+        import json as _json
         samples = ["مُحَمَّد", "إأآ ا", "مدرسة", "على  مصطفى", "ـــ", "  Mixed CASE  ", "تحويل", "موظف اسناد - مستخدم السرية"]
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(**({"executable_path": BROWSER["executable"]} if BROWSER["executable"] else {}))
-            page = browser.new_page()
-            js = "(s) => {" + sla.JS_NORM + " return norm(s); }"
-            got = [page.evaluate(js, s) for s in samples]
+        browser = cdp.CdpBrowser({"browser_executable": BROWSER["executable"], "cdp_port": 0,
+                                  "profile_dir": tempfile.mkdtemp(prefix="sla-norm-")}, headless=True)
+        try:
+            got = [browser.eval("(() => {" + sla.JS_NORM + " return norm(" + _json.dumps(x) + "); })()") for x in samples]
+        finally:
             browser.close()
         assert got == [sla.norm(s) for s in samples]

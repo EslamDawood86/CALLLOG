@@ -13,7 +13,7 @@ disagree, fix the code or change this file in the same commit.
  │ collector.py                  │ ────────▶ │ data\ops\snapshots\*.json       │ ────────▶ │ Flask app (calllog\)  │──▶ browsers
  │  jobs: email, email_report,   │           │ data\ops\history, overrides,    │ ◀──────── │  Home / Calls / Email │
  │        sla, itsm              │ ◀──────── │ jobs\requests (run-now), logs   │   write   │  SLA / ITSM / System  │
- │  (Outlook COM, Playwright,    │   read    └─────────────────────────────────┘ overrides └───────────────────────┘
+ │  (Outlook COM, DevTools/CDP,  │   read    └─────────────────────────────────┘ overrides └───────────────────────┘
  │   Chrome DevTools)            │
  └───────────────────────────────┘
 ```
@@ -56,7 +56,7 @@ collector.py      launcher (top level, next to run.py)
 requirements-collector.txt
 ```
 
-Engines and `store.py` must **import on Linux/macOS without Outlook, Chrome, pywin32, Playwright or
+Engines and `store.py` must **import on Linux/macOS without Outlook, Chrome, pywin32 or
 pandas installed** (import those lazily inside the functions that need them). This is what makes them
 testable here. Do not add pandas to the project.
 
@@ -506,7 +506,7 @@ Rules for 24/7 safety:
 
 * **Jobs run in child processes** (`collector.py --run-job <job>` started by the runner, result handed back as a JSON file) with a hard
   timeout per job (email 20 min, email_report 30 min, sla 5 min, itsm 10 min, settings can lower them) and a kill of the whole process tree
-  (Outlook scan, Chrome, Playwright) on timeout. A hung COM call or a leaking browser can therefore never freeze the collector or grow
+  (Outlook scan, Chrome / Edge and their helpers) on timeout. A hung COM call or a leaking browser can therefore never freeze the collector or grow
   memory for days.
 * **Never hammer a login.** A wrong or expired password (`JobResult.error_kind == "auth"`) stops the scheduled runs of that job until
   the credential changes (collector_config.json mtime / password source changed) or an admin presses *Run now*; the System page and Home show

@@ -40,6 +40,8 @@ Admin and employee pages share one **Team status** strip (counts only: calls tod
    ```
 
    Anything written here wins over the same setting saved from the web page. Only the collector reads this file (never the web server); it is not part of the ZIP and not in git.
+
+   The SLA and ITSM jobs drive the browser the PC already has (Microsoft **Edge** or Google **Chrome**) over the DevTools protocol — **no Playwright, no Node.js and no browser download, so no internet is needed for them**. The collector finds Edge/Chrome in the usual place automatically; if it is installed somewhere else, add its full path: `"sla": {"browser_executable": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"}` (and the same under `"itsm"`).
    Prefer not to keep a password in a file? Leave it out and run `python collector.py --set-password sla` (and `itsm`): it goes to Windows Credential Manager.
 3. `python collector.py --check` tells you what is configured and what is missing (it never prints a password).
 4. Bring your old settings over once: `python manage.py import-legacy --email <old e-mail script> --sla <old SLA script> --itsm <old ITSM script>`

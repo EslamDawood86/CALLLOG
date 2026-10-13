@@ -272,7 +272,7 @@ def result_from_json(doc):
 
 
 def kill_process_tree(pid):
-    """End a child process and everything it started (Outlook scan helpers, Chrome, Playwright)."""
+    """End a child process and everything it started (Outlook scan helpers, Chrome / Edge and their helpers)."""
     if os.name == "nt":
         subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, creationflags=NO_WINDOW, timeout=30)
         return

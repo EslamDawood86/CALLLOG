@@ -41,7 +41,7 @@ REQUIREMENTS = HERE / "requirements-collector.txt"
 OPTIONAL_PACKAGES = (("matplotlib", "matplotlib>=3.7"),)      # charts in the e-mail report; the report works without them
 JOB_NAMES = ("email", "email_report", "sla", "itsm")             # same as calllog.ops.schemas.JOBS (a test keeps them equal)
 ACCOUNTS = {"sla": "SLA portal", "itsm": "ITSM"}
-PACKAGES = [("flask", "Flask"), ("openpyxl", "openpyxl"), ("playwright", "playwright"), ("keyring", "keyring")] + (
+PACKAGES = [("flask", "Flask"), ("openpyxl", "openpyxl"), ("keyring", "keyring")] + (
     [("win32com", "pywin32")] if os.name == "nt" else [])
 
 RESTART_FLAG = "NBE_COLLECTOR_RESTARTED"       # set after the one-time install, so a failed install cannot loop
@@ -272,7 +272,7 @@ def cmd_check(args):
     archive = str(settings["email"].get("target_archive_name") or "")
     line("Outlook archive", archive if archive else "not set - the default mailbox is scanned (set email.target_archive_name)")
     browser = find_browser(settings)
-    line("Chrome / Edge", browser if browser else "not found - Playwright's own Chromium is downloaded the first time (internet needed)")
+    line("Chrome / Edge", browser if browser else "NOT FOUND - install Microsoft Edge or Google Chrome, or set sla.browser_executable / itsm.browser_executable", not browser)
 
     for kind, label in ACCOUNTS.items():
         username = str(settings[kind].get("username") or "")
@@ -527,7 +527,7 @@ def cmd_stop(args):
     if not name or not name.startswith("python"):
         say("The collector is running but its process id is unknown. End the python / pythonw process in Task Manager.")
         return 1
-    if os.name == "nt":                                   # /T also ends the job processes (Chrome, Playwright ...)
+    if os.name == "nt":                                   # /T also ends the job processes (Chrome / Edge and their helpers)
         subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, creationflags=NO_WINDOW)
     else:
         os.kill(pid, signal.SIGTERM)
