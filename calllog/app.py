@@ -3,7 +3,7 @@ import importlib.util
 import secrets
 from datetime import datetime, timedelta
 
-from flask import Flask, g, jsonify, render_template, request, session
+from flask import Flask, Request, g, jsonify, render_template, request, session
 
 from . import auth
 from .config import APP_DIR, load_config
@@ -14,6 +14,22 @@ from .storage import StorageError, Store, iso_now
 
 # Pages the user may still reach while a password change is being forced.
 _ALLOWED_WHEN_PASSWORD_DUE = {"pages.password", "pages.logout", "static"}
+
+DEFAULT_UPLOAD_LIMIT = 2 * 1024 * 1024
+# The IP phone directory export (~42,000 rows) is bigger than the 2 MB every other request may carry: this route only.
+LARGE_UPLOADS = {("POST", "/api/admin/ip-phones/import"): 20 * 1024 * 1024}
+
+
+class AppRequest(Request):
+    """The normal request, except that the routes in ``LARGE_UPLOADS`` may carry a bigger body (works with Flask 3.0 and 3.1)."""
+
+    @property
+    def max_content_length(self):
+        return LARGE_UPLOADS.get((self.method, self.path)) or super().max_content_length
+
+    @max_content_length.setter
+    def max_content_length(self, value):
+        self._max_content_length = value
 
 
 def _secret_key():
@@ -77,6 +93,7 @@ def create_app(overrides=None):
     cfg.update(overrides or {})
 
     app = Flask(__name__)
+    app.request_class = AppRequest
     app.json.ensure_ascii = False
     app.config.update(
         SECRET_KEY=cfg.get("secret_key") or _secret_key(),
@@ -84,7 +101,7 @@ def create_app(overrides=None):
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
         PERMANENT_SESSION_LIFETIME=timedelta(hours=cfg["session_hours"]),
-        MAX_CONTENT_LENGTH=2 * 1024 * 1024,
+        MAX_CONTENT_LENGTH=DEFAULT_UPLOAD_LIMIT,
         CLOCK=cfg.get("clock") or datetime.now,
         USER_EDIT_DAYS=cfg["user_edit_days"],
         IP_PHONE_REGEX=cfg["ip_phone_regex"],
@@ -183,6 +200,7 @@ def create_app(overrides=None):
 
     @app.errorhandler(413)
     def too_large(exc):
-        return jsonify(error="That file is too large (limit 2 MB)."), 413
+        limit = request.max_content_length or DEFAULT_UPLOAD_LIMIT
+        return jsonify(error=f"That file is too large (limit {limit // (1024 * 1024)} MB)."), 413
 
     return app

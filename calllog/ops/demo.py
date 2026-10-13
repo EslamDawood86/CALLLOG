@@ -12,13 +12,15 @@ Used by ``python manage.py seed-demo``, the tests and the documentation screensh
 import hashlib
 import os
 import random
+import tempfile
 from collections import Counter
 from itertools import zip_longest
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from .. import security
 from ..storage import StorageError, iso_now
-from . import overlay, schemas
+from . import mailbox, notifications, overlay, schemas
 from . import settings as hub_settings
 
 DEMO_PASSWORD = "demo-pass-2026"
@@ -196,6 +198,7 @@ def _mail_row(n, subject, system, team, received, now, hint=None, classified_by=
         "received_time_display": f"{received:%H:%M}", "mailbox": "IT Support shared mailbox", "folder": "Inbox",
         "business_addresses_in_to": _address(BUSINESS_ADDRESSES.get(team, GENERAL_ADDRESS)),
         "match_method": "No Match", "first_reply_by": "", "first_reply_email": "", "first_reply_time": None,
+        "last_reply_by": "", "last_reply_email": "", "last_reply_time": None, "mail_copy": "",
         "first_response_time": "", "response_minutes": None, "duration_minutes": None, "reply_count": 0,
         "multiple_team_reply": False, "multiple_team_reply_team": "", "current_waiting_time": "",
         "status": schemas.EMAIL_PENDING, "sla_minutes": SLA_TARGET, "sla_status": "Within SLA", "escalated": False,
@@ -217,6 +220,7 @@ def _make_replied(row, person, minutes, now, by_manager=False):
     row.update(
         status=schemas.EMAIL_REPLIED, first_reply_by=name, first_reply_email=_address(mailbox),
         first_reply_time=_iso(received + timedelta(minutes=minutes)), response_minutes=minutes,
+        last_reply_by=name, last_reply_email=_address(mailbox), last_reply_time=_iso(received + timedelta(minutes=minutes)),
         first_response_time=_fmt_minutes(minutes), duration_minutes=minutes, reply_count=1 + minutes % 2,
         sla_status="Met" if minutes <= SLA_TARGET else "Breached", teams_replied=list(row["all_teams"]),
         teams_pending=[], match_method=("ConversationID", "ConversationIndex", "Subject")[minutes % 3],
@@ -323,10 +327,30 @@ def _build_overrides(rows, now):
         overrides["team"][by_id(unclassified[0])] = {"team": "Third Party", "marked_by": MANAGER[1], "marked_at": stamp(25),
                                                       "subject": unclassified[0]["subject"]}
     flex = [r for r in pending if r["team"] == "Flex Cube" and by_id(r) not in overrides["no_action"]]
-    for r, (mailbox, name), note in zip(flex[:3], (TEAM_PEOPLE["Flex Cube"][0], TEAM_PEOPLE["Flex Cube"][1], TEAM_PEOPLE["Flex Cube"][0]),
-                                        ("Please call the branch first", "", "Customer is waiting")):
-        overrides["assignments"][by_id(r)] = {"assigned_to_email": _address(mailbox), "assigned_to_name": name, "note": note,
-                                              "marked_by": MANAGER[1], "marked_at": stamp(55), "subject": r["subject"], "notified": True}
+    alice, omar = TEAM_PEOPLE["Flex Cube"][0], TEAM_PEOPLE["Flex Cube"][1]
+
+    def assign(row, person, note, minutes, **extra):
+        mailbox_, name = person
+        overrides["assignments"][by_id(row)] = {
+            "assigned_to_email": _address(mailbox_), "assigned_to_name": name, "note": note, "marked_by": MANAGER[1],
+            "marked_by_id": MANAGER_ID, "marked_at": stamp(minutes), "subject": row["subject"], "team": row["team"],
+            "notified": True, **extra}
+    # two open mails for the first employee, one open mail for the second (it has no saved copy yet: "preparing")
+    for r, person, note, minutes in zip(flex[:3], (alice, omar, alice), ("Please call the branch first", "", "Customer is waiting"),
+                                        (55, 52, 50)):
+        assign(r, person, note, minutes)
+    # one the employee already marked done (still waiting for a reply in Outlook: Done is not a reply), an older mail
+    carry = [r for r in rows if r["team"] == "Flex Cube" and r["is_carryover"] and not r["is_split_child"]]
+    if carry:
+        assign(carry[-1], alice, "Branch confirmed by phone - waiting for their e-mail", 180,
+               done_at=stamp(20), done_by=alice[1], done_by_id="1001", done_note="Called the branch, they will confirm today")
+    # one the employee answered in Outlook (shows as done by itself)
+    answered = [r for r in rows if r["team"] == "Flex Cube" and r["status"] == schemas.EMAIL_REPLIED
+                and r["first_reply_email"] == _address(alice[0]) and not r["is_split_child"]]
+    if answered:
+        assign(answered[-1], alice, "Please answer today", 0, replied_notified=_iso(now - timedelta(minutes=10)))
+        overrides["assignments"][by_id(answered[-1])]["marked_at"] = _iso(
+            datetime.fromisoformat(answered[-1]["received_time"]) + timedelta(minutes=2))
     return overrides
 
 
@@ -456,6 +480,7 @@ def email_snapshot_data(now):
     rows = overlay.apply_overrides(rows, overrides, now)
     _tag_classification(rows, overrides)
     rows.sort(key=lambda r: (r["received_time"], r["row_id"]))
+    _plan_mail_copies(rows, overrides)
     stats = _email_stats(rows, now)
     counts = Counter(r["classified_by"] for r in rows)
     data = {"date": now.date().isoformat(), "sla_target_minutes": SLA_TARGET, "teams": list(TEAMS), "stats": stats, "rows": rows,
@@ -463,6 +488,127 @@ def email_snapshot_data(now):
             "classification": {"counts": {k: counts.get(k, 0) for k in CLASSIFIED_BY},
                                "unclassified": sum(1 for r in rows if r["team"] == "Unclassified"), "unclassified_team": ""}}
     return data, overrides
+
+
+# ================================================================================ saved copies and notifications
+MSG_DEMO_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1DEMO-MSG (not a real Outlook message)\n"
+OMAR_OPEN_NOTE = "the second employee's open mail has no saved copy yet, so the viewer shows 'preparing'"
+BODY_EN = ["Hello team,", "", "{subject}.", "",
+           "We tried again this morning and the problem is still there. Could you please check and tell us what we should do?",
+           "", "Steps we followed:", "  1. Signed out and signed in again", "  2. Cleared the cache and restarted the application",
+           "  3. Tried from another PC in the same branch", "", "This is blocking the branch's customers, so any help today is appreciated.",
+           "", "Best regards,", "{customer}", "Branch operations", "", "-----Original Message-----", "From: {customer}",
+           "Sent: yesterday 16:42", "Subject: {subject}", "", "Please see the screenshot attached."]
+BODY_AR = ["السلام عليكم،", "", "{subject}", "", "حاولنا مرة أخرى هذا الصباح والمشكلة ما زالت قائمة، برجاء الفحص والإفادة.", "",
+           "الخطوات التي اتبعناها:", "  ١. تسجيل الخروج ثم الدخول مرة أخرى", "  ٢. إعادة تشغيل البرنامج",
+           "  ٣. التجربة من جهاز آخر في نفس الفرع", "", "نرجو سرعة الرد لأن العملاء في انتظار الخدمة.", "", "مع خالص التحية،", "{customer}"]
+
+
+def _plan_mail_copies(rows, overrides):
+    """Which mails have a saved copy in the demo (the collector's rule: assigned and pending), written as ``mail_copy`` on the
+    row the way the engine does. One assigned mail is left without a copy on purpose (state 'preparing'), one pending mail has
+    a preview only ('too large')."""
+    assigned = overrides["assignments"]
+    left_out = next((m for m, e in assigned.items() if e["assigned_to_email"] == _address(TEAM_PEOPLE["Flex Cube"][1][0])), None)
+    plan = {m: "ready" for m in assigned if m != left_out}
+    pending = [r for r in rows if r["status"] == schemas.EMAIL_PENDING and r["message_id"] not in assigned
+               and not r.get("is_split_child") and r["team"] != "Unclassified"]
+    for i, row in enumerate(pending[:6]):
+        plan[row["message_id"]] = "too_large" if i == 2 else "ready"
+    for row in rows:
+        row["mail_copy"] = plan.get(row["message_id"], "")
+
+
+def _demo_preview(row, now, index):
+    arabic = any("؀" <= c <= "ۿ" for c in row["subject"])
+    text = "\n".join((BODY_AR if arabic else BODY_EN)).format(subject=row["subject"], customer=row["customer_name"])
+    attachments = [("screenshot.png", 184_320), ("error-log.txt", 5_120)][: index % 3]
+    if row.get("mail_copy") == "too_large":
+        attachments = [("scanned-documents.zip", 31_457_280)]              # the reason this mail is preview-only
+    return mailbox.make_preview(
+        row["message_id"], subject=row["subject"], from_name=row["customer_name"], from_email=row["customer_email"],
+        to=[row["business_addresses_in_to"]], cc=[_address("branch.operations")] if index % 2 else [],
+        received=row["received_time"], body=text, attachments=[{"name": n, "size": z} for n, z in attachments],
+        saved_at=now - timedelta(minutes=5))
+
+
+def _write_mail_copies(ops, rows, now):
+    """Fake .msg bytes + preview for every row the plan marked; the previous demo copies are cleared first, so seeding twice
+    gives the same files. The .msg is NOT a real Outlook message - it only proves the download works."""
+    ops.mail_dir.mkdir(parents=True, exist_ok=True)
+    for old in ops.mail_dir.glob("*"):
+        if old.is_file():
+            old.unlink()
+    written = 0
+    for index, row in enumerate(r for r in rows if r.get("mail_copy")):
+        key = mailbox.mail_key(row["message_id"])
+        preview = _demo_preview(row, now, index)
+        if row["mail_copy"] == "too_large":
+            mailbox.write_copy(ops.mail_dir, key, dict(preview, too_large=True))
+        else:
+            with tempfile.TemporaryDirectory() as tmp:
+                source = Path(tmp) / f"{key}.msg"
+                source.write_bytes(MSG_DEMO_MAGIC + f"subject={row['subject']}\n".encode("utf-8") + preview["body_text"].encode("utf-8")
+                                   + b"\0" * (2048 + 512 * index))
+                mailbox.write_copy(ops.mail_dir, key, preview, msg_file=source)
+        written += 1
+    return written
+
+
+def _demo_notifications(ops, rows, overrides, now):
+    """Three to six notifications for the first employee and for the Flex Cube manager, telling the story of the demo
+    assignments (assigned, taken away, done, answered in Outlook, reopened). Fixed ids, so seeding twice is the same."""
+    by_assignee = {}
+    for message_id, entry in overrides["assignments"].items():
+        by_assignee.setdefault(entry["assigned_to_email"], []).append((message_id, entry))
+    alice = _address(TEAM_PEOPLE["Flex Cube"][0][0])
+    mine = sorted(by_assignee.get(alice, []), key=lambda t: t[1]["marked_at"])
+    omar_mail = next((m for m, e in overrides["assignments"].items()
+                      if e["assigned_to_email"] == _address(TEAM_PEOPLE["Flex Cube"][1][0])), None)
+    done = next(((m, e) for m, e in mine if e.get("done_at")), None)
+    answered = next(((m, e) for m, e in mine if not e.get("done_at") and any(
+        r["message_id"] == m and r["status"] == schemas.EMAIL_REPLIED for r in rows)), None)
+    open_mails = [(m, e) for m, e in mine if not e.get("done_at") and (answered is None or m != answered[0])]
+    subject = {m: e["subject"] for m, e in overrides["assignments"].items()}
+    user_role, boss_role = {"role": "user"}, {"role": "manager"}
+
+    def at(stamp, minutes=0):
+        return datetime.fromisoformat(stamp) + timedelta(minutes=minutes)
+
+    def item(n, moment, kind, title, text, message_id, role, actor, read=False):
+        return {"id": f"demo-{n:02d}", "ts": _iso(moment), "type": kind, "title": title,
+                "text": text[:200], "link": notifications.link_for(role, message_id), "actor": actor,
+                "ref": {"message_id": message_id}, "read": read}
+
+    employee_items, manager_items = [], []
+    for k, (message_id, entry) in enumerate(open_mails[:2]):
+        employee_items.append(item(10 + k, at(entry["marked_at"]), schemas.NOTIFY_ASSIGNED, "New e-mail assigned to you",
+                                   f"{subject[message_id]} - by {MANAGER[1]}", message_id, user_role, MANAGER[1]))
+    if omar_mail:       # the mail was Alice's first and went to the second employee: she is told it was taken away
+        employee_items.append(item(12, at(overrides["assignments"][omar_mail]["marked_at"]), schemas.NOTIFY_UNASSIGNED,
+                                   "Assignment removed", f"{subject[omar_mail]} - by {MANAGER[1]}", omar_mail, user_role,
+                                   MANAGER[1], read=True))
+    if done:
+        employee_items.append(item(13, at(done[1]["marked_at"]), schemas.NOTIFY_ASSIGNED, "New e-mail assigned to you",
+                                   f"{subject[done[0]]} - by {MANAGER[1]}", done[0], user_role, MANAGER[1], read=True))
+        manager_items.append(item(20, at(done[1]["done_at"]), schemas.NOTIFY_DONE, f"{EMPLOYEES[0][1]} marked an e-mail as done",
+                                  f"{subject[done[0]]} - {done[1].get('done_note', '')}", done[0], boss_role, EMPLOYEES[0][1]))
+    if answered:
+        reply_at = next(r["first_reply_time"] for r in rows if r["message_id"] == answered[0])
+        manager_items.append(item(21, at(reply_at, 1), schemas.NOTIFY_REPLIED, f"{EMPLOYEES[0][1]} replied to an assigned e-mail",
+                                  subject[answered[0]], answered[0], boss_role, EMPLOYEES[0][1]))
+    if open_mails:      # she marked the first open mail done and then took it back
+        first_id, first = open_mails[0]
+        manager_items.append(item(22, at(first["marked_at"], 12), schemas.NOTIFY_REOPENED, "E-mail reopened",
+                                  f"{subject[first_id]} - by {EMPLOYEES[0][1]}", first_id, boss_role, EMPLOYEES[0][1], read=True))
+        manager_items.append(item(23, at(first["marked_at"], 6), schemas.NOTIFY_DONE, f"{EMPLOYEES[0][1]} marked an e-mail as done",
+                                  f"{subject[first_id]} - Waiting for the branch", first_id, boss_role, EMPLOYEES[0][1], read=True))
+    ops.notifications_dir.mkdir(parents=True, exist_ok=True)
+    for uid, items in ((EMPLOYEES[0][0], employee_items), (MANAGER_ID, manager_items)):
+        items.sort(key=lambda i: i["ts"], reverse=True)
+        doc = {"items": items, "ts": _iso(now) + ".000000", "seen_ts": ""}
+        ops.write_json(notifications.path_for(ops, uid), doc)
+    return len(employee_items) + len(manager_items)
 
 
 # ================================================================================================== SLA
@@ -769,6 +915,8 @@ def seed(ops, now=None, with_history=True, itsm_error=False, failed_job=None, st
     ops.write_snapshot("itsm", itsm, generated_at=_iso(itsm_at), duration_seconds=35.9, host=HOST, date=day)
     for name, entries in overrides.items():
         ops.write_json(ops.overrides_dir / f"{name}.json", entries)
+    copies = _write_mail_copies(ops, email["rows"], now)
+    notified = _demo_notifications(ops, email["rows"], overrides, now)
 
     if with_history:
         _replace_history(ops, "email", _email_points(email_at, email["stats"]))
@@ -783,4 +931,5 @@ def seed(ops, now=None, with_history=True, itsm_error=False, failed_job=None, st
     _reports(ops, now)
     configured = _demo_settings(ops) if with_settings else False
     return {"email_rows": len(email["rows"]), "sla_requests": len(sla["requests"]), "itsm_roles": len(itsm["roles"]),
-            "history": with_history, "settings_written": configured, "day": day}
+            "history": with_history, "settings_written": configured, "day": day, "mail_copies": copies,
+            "notifications": notified}

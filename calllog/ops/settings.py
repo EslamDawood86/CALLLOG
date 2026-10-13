@@ -7,6 +7,8 @@ import copy
 import json
 import re
 
+from . import schemas
+
 DEFAULT_TEAMS = ["MFA Team", "Flex Cube", "Card Management", "Third Party", "Open System", "Unclassified"]
 WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
@@ -40,6 +42,12 @@ DEFAULTS = {
         },
         "outlook_connect_retries": 5,
         "outlook_connect_retry_seconds": 15,
+        "mail_copies": {                        # saved copies of the mails people open on the web pages (collector, FEATURES-V2 B1)
+            "scope": "assigned_and_pending",    # assigned_and_pending | assigned | off
+            "max_per_scan": 40,                 # at most this many new copies per scan (the rest next scan)
+            "max_msg_mb": 25,                   # a bigger mail gets a preview only (still downloadable from Outlook)
+            "keep_days": 21,                    # a copy stays this long after its mail left the pending / assigned set
+        },
         "report": {                             # the old daily run
             "send": True,
             "send_times": ["16:30"],
@@ -347,6 +355,8 @@ FIELDS = {
         "ignored_sender_emails": _emails, "manager_emails": _emails, "teams": _strs(80),
         "sla_target_minutes": _int(1, 10080), "backlog_lookback_days": _int(0, 30), "history_keep_days": _int(1, 365),
         "outlook_connect_retries": _int(1, 20), "outlook_connect_retry_seconds": _int(1, 300),
+        "mail_copies": {"scope": _choice(*schemas.MAIL_COPY_SCOPES), "max_per_scan": _int(1, 500),
+                        "max_msg_mb": _int(1, 200), "keep_days": _int(1, 365)},
         "classification": {"system_team_map": _map(_str(80, allow_empty=False)), "address_team_map": _addr_map,
                            "unclassified_team": _str(80), "extra_no_action_keywords": _strs(120)},
         "report": {"send": _bool, "send_times": _times, "to": _emails, "cc": _emails, "subject_prefix": _str(120),

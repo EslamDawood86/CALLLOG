@@ -33,11 +33,14 @@ cannot give it, the entry id is used instead so every row has a stable key for t
 several teams becomes one row per team (same message_id, different ``team``; ``row_id`` tells them apart).
 """
 import os
+import shutil
+import tempfile
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
+from .. import mailbox
 from ..settings import DEFAULT_TEAMS
 from .common import OUTLOOK_LOCK, JobResult, fmt_minutes
 from .email_rules import (
@@ -48,6 +51,8 @@ from .email_rules import (
 PR_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x39FE001E"
 PR_INTERNET_MESSAGE_ID = "http://schemas.microsoft.com/mapi/proptag/0x1035001E"
 OL_MAIL_ITEM = 43
+OL_MSG = 3                                   # olMSG: the format of Outlook's own SaveAs (what people download)
+COPY_FAILURES_LOGGED = 5                     # failed copies described one by one in the log (the summary line counts all)
 OL_FOLDER_INBOX = 6
 CONVERSATION_INDEX_ROOT_LENGTH = 44          # 22 bytes, hex encoded: the part every message of a thread shares
 BODY_KEEP_CHARS = 2500                       # the new text of a mail, kept for keyword scans and the body popup
@@ -101,6 +106,11 @@ class EmailConfig:
         self.repeat_lookback_days = max(1, to_int(adv.get("repeat_issue_lookback_days"), 7))
         self.outlook_retries = max(1, to_int(s.get("outlook_connect_retries"), 5))
         self.outlook_retry_seconds = max(0, to_int(s.get("outlook_connect_retry_seconds"), 15))
+        copies = s.get("mail_copies") if isinstance(s.get("mail_copies"), dict) else {}
+        scope = str(copies.get("scope") or "assigned_and_pending")
+        self.copies_scope = scope if scope in ("assigned_and_pending", "assigned", "off") else "assigned_and_pending"
+        self.copies_per_scan = max(1, to_int(copies.get("max_per_scan"), 40))
+        self.copies_max_bytes = max(1, to_int(copies.get("max_msg_mb"), 25)) * 1024 * 1024
 
 
 def team_member_people(email_settings):
@@ -396,6 +406,7 @@ def scan_current_day(ctx, namespace, cfg, now=None, keep_mail_items=False, lookb
             if folder_is_ignored(folder, cfg.ignored_folder_terms):
                 continue
             items, ordered = _recent_first_items(folder, start_dt, cfg.use_restrict)
+            store_id = _folder_store_id(folder) if cfg.copies_scope != "off" else ""
             for item in items:
                 try:
                     if item.Class != OL_MAIL_ITEM:
@@ -410,7 +421,7 @@ def scan_current_day(ctx, namespace, cfg, now=None, keep_mail_items=False, lookb
                     if received >= end_dt:
                         continue
                     info["items_seen"] += 1
-                    email = _read_item(item, cfg, root, folder, received, seen_ids, keep_mail_items)
+                    email = _read_item(item, cfg, root, folder, received, seen_ids, keep_mail_items, store_id)
                     if email is None:
                         continue
                     all_emails.append(email)
@@ -428,7 +439,16 @@ def scan_current_day(ctx, namespace, cfg, now=None, keep_mail_items=False, lookb
     return all_emails, included, today
 
 
-def _read_item(item, cfg, root, folder, received, seen_ids, keep_mail_items):
+def _folder_store_id(folder):
+    """The id of the Outlook store a folder lives in (needed to fetch one of its mails again by EntryID later, in an
+    archive). One COM read per folder, never per mail."""
+    try:
+        return str(folder.StoreID or "")
+    except Exception:
+        return ""
+
+
+def _read_item(item, cfg, root, folder, received, seen_ids, keep_mail_items, store_id=""):
     """The analysis dict of one Outlook mail, or None when it is irrelevant (duplicate copy, ignored sender, neither a
     team reply nor a business mail, nothing but a signature). Cheap checks come first: ``item.Body`` is the single most
     expensive COM read."""
@@ -465,6 +485,7 @@ def _read_item(item, cfg, root, folder, received, seen_ids, keep_mail_items):
         "conversation_id": get_conversation_id(item),
         "conversation_index_root": conversation_index_root(get_conversation_index(item)),
         "entry_id": entry_id,
+        "store_id": store_id,
         "message_id": internet_id or entry_id,
         "mailbox": str(root.Name),
         "folder": str(folder.FolderPath),
@@ -713,6 +734,7 @@ def _new_row(cfg, customer, cls, ovr, status_info):
         "folder": customer["folder"],
         "conversation_id": customer["conversation_id"],
         "entry_id": customer.get("entry_id", ""),
+        "store_id": customer.get("store_id", ""),
         "message_id": key,
         "row_id": key,
         "mail_item": customer.get("mail_item"),
@@ -894,6 +916,145 @@ def build_report(ctx, cfg, included_emails, all_emails, now=None):
         rows.extend(_rows_for_customer(cfg, customer, (by_conversation, by_root, by_subject), team_replies, ovr, now))
     rows.sort(key=lambda r: (r["received_time"], r["message_id"]))        # stable: a split mail keeps its team order
     return rows, team_replies
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Saved copies of the mails people open on the web pages (docs/FEATURES-V2.md B1; files and rules: calllog/ops/mailbox.py)
+# ---------------------------------------------------------------------------------------------------------------------
+def _fetch_item(namespace, row):
+    """The Outlook item of one row, fetched again by EntryID (with the store it lives in when we know it). The caller
+    must drop it as soon as it has saved it: a live COM object per mail makes Outlook unresponsive."""
+    entry_id, store_id = row.get("entry_id"), row.get("store_id")
+    if not entry_id:
+        raise LookupError("the mail has no EntryID")
+    if store_id:
+        try:
+            return namespace.GetItemFromID(entry_id, store_id)
+        except Exception:
+            pass                                     # a store id that does not fit: try the default lookup
+    return namespace.GetItemFromID(entry_id)
+
+
+def _recipient_names(item, attribute):
+    try:
+        return [p.strip() for p in str(getattr(item, attribute) or "").split(";") if p.strip()]
+    except Exception:
+        return []
+
+
+def _attachment_list(item):
+    out = []
+    try:
+        for att in item.Attachments:
+            try:
+                out.append({"name": str(att.FileName or "attachment"), "size": int(att.Size or 0)})
+            except Exception:
+                continue
+            if len(out) >= mailbox.MAX_ATTACHMENTS:
+                break
+    except Exception:
+        pass
+    return out
+
+
+def _item_size(item):
+    try:
+        return int(item.Size or 0)
+    except Exception:
+        return 0
+
+
+def _preview_of(item, row, message_id):
+    """The preview document of a mail (plain text only; attachments are names and sizes, the files stay inside the .msg)."""
+    try:
+        body = str(item.Body or "")
+    except Exception:
+        body = row.get("body_preview", "")
+    received = to_python_datetime(getattr(item, "ReceivedTime", None)) or row.get("received_time")
+    return mailbox.make_preview(
+        message_id, subject=_text_property(item, "Subject") or row.get("subject", ""),
+        from_name=_text_property(item, "SenderName") or row.get("customer_name", ""),
+        from_email=get_sender_smtp_address(item) or row.get("customer_email", ""), to=_recipient_names(item, "To"),
+        cc=_recipient_names(item, "CC"), received=received, body=body, attachments=_attachment_list(item))
+
+
+def _save_one(namespace, cfg, directory, tmp_dir, row, message_id, key):
+    """Save one mail. Returns "ready" or "too_large". Raises on any COM / file problem (the caller logs and moves on).
+    Every COM object lives only inside this function."""
+    item = _fetch_item(namespace, row)
+    try:
+        preview = _preview_of(item, row, message_id)
+        if _item_size(item) > cfg.copies_max_bytes:
+            mailbox.write_copy(directory, key, dict(preview, too_large=True))
+            return "too_large"
+        tmp = os.path.join(tmp_dir, f"{key}.msg")
+        item.SaveAs(tmp, OL_MSG)
+        try:
+            size = os.path.getsize(tmp)
+            if size > cfg.copies_max_bytes:              # Size said less than the file turned out to be
+                mailbox.write_copy(directory, key, dict(preview, too_large=True))
+                return "too_large"
+            mailbox.write_copy(directory, key, preview, msg_file=tmp)
+            return "ready"
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    finally:
+        item = None                                      # release the COM object before the next mail
+
+
+def save_mail_copies(ctx, namespace, cfg, rows):
+    """Save a copy (.msg + preview) of the assigned mails and of the mails still waiting for a reply.
+
+    Incremental: a mail whose files exist is skipped, so after the first scan only new mails cost time (a SaveAs is
+    ~50-300 ms). At most ``mail_copies.max_per_scan`` new copies per scan, assigned mails first, then the oldest pending
+    ones; the rest follow on the next scan. A mail bigger than ``max_msg_mb`` gets a preview only. A failure on one mail is
+    logged (without its subject) and skipped. Items are fetched one at a time by EntryID and released at once - nothing
+    COM-related survives this function.
+
+    Returns ``{"saved", "existing", "too_large", "failed", "waiting", "states": {message_id: "ready" | "too_large"}}`` where
+    ``states`` covers every wanted mail that now has a copy."""
+    result = {"saved": 0, "existing": 0, "too_large": 0, "failed": 0, "waiting": 0, "states": {}}
+    store = getattr(ctx, "store", None)
+    if cfg.copies_scope == "off" or store is None or ctx.dry_run:
+        return result
+    directory = store.mail_dir
+    try:
+        wanted = mailbox.wanted_mails(rows, store.overrides("assignments"), cfg.copies_scope)
+        files = mailbox.list_files(directory)
+    except Exception as exc:                             # a damaged override file must not fail the scan
+        ctx.log(f"Mail copies skipped: {type(exc).__name__}: {exc}")
+        return result
+    todo = []
+    for message_id, reason, row in wanted:
+        key = mailbox.mail_key(message_id)
+        if mailbox.copy_complete(files, key, directory):
+            result["existing"] += 1
+            result["states"][message_id] = "ready" if f"{key}.msg" in files else "too_large"
+        else:
+            todo.append((message_id, key, row))
+    result["waiting"] = max(0, len(todo) - cfg.copies_per_scan)
+    if not todo:
+        return result
+    tmp_dir = tempfile.mkdtemp(prefix="nbe-mail-")
+    try:
+        for message_id, key, row in todo[:cfg.copies_per_scan]:
+            try:
+                state = _save_one(namespace, cfg, directory, tmp_dir, row, message_id, key)
+            except Exception as exc:
+                result["failed"] += 1
+                if result["failed"] <= COPY_FAILURES_LOGGED:     # a problem that hits every mail must not flood the log
+                    ctx.log(f"Could not save a copy of one mail ({key[:8]}): {type(exc).__name__}: {exc}")
+                continue
+            result["states"][message_id] = state
+            result["saved" if state == "ready" else "too_large"] += 1
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    ctx.log(f"Mail copies: {result['saved']} saved, {result['too_large']} too large (preview only), "
+            f"{result['existing']} already there, {result['failed']} failed, {result['waiting']} waiting for the next scan")
+    return result
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1178,10 +1339,14 @@ class ScanOutcome:
     now: datetime = None
     config: EmailConfig = None
     scan_info: dict = field(default_factory=dict)
+    copies: dict = field(default_factory=dict)             # what save_mail_copies did (empty when it did not run)
 
 
-def scan_and_analyze(ctx, namespace=None, keep_mail_items=False):
-    """Scan Outlook and analyse it. ``namespace`` None = connect to Outlook (retrying while it starts)."""
+def scan_and_analyze(ctx, namespace=None, keep_mail_items=False, save_copies=False):
+    """Scan Outlook and analyse it. ``namespace`` None = connect to Outlook (retrying while it starts).
+
+    ``save_copies`` (the live "email" job only): after the analysis, save the .msg + preview of the mails people open on the
+    web pages (``save_mail_copies``) and mark each row with ``mail_copy`` ("ready" | "too_large" | "")."""
     cfg = EmailConfig(ctx.settings)
     if not cfg.business:
         raise ConfigProblem("No business e-mail address is set (Settings > E-mail > business_emails).")
@@ -1200,9 +1365,19 @@ def scan_and_analyze(ctx, namespace=None, keep_mail_items=False):
     ctx.log(f"Scanned {info['items_seen']} mail(s) in {info['folders']} folder(s): {len(all_emails)} relevant, "
             f"{len(included)} business")
     rows, team_replies = build_report(ctx, cfg, included, all_emails, now)
+    copies = {}
+    if save_copies:
+        try:
+            with OUTLOOK_LOCK:
+                copies = save_mail_copies(ctx, namespace, cfg, rows)
+        except Exception as exc:                        # a problem with the copies must never cost the scan
+            ctx.log(f"Mail copies failed: {type(exc).__name__}: {exc}")
+        states = copies.get("states") or {}
+        for row in rows:
+            row["mail_copy"] = states.get(row.get("message_id"), "")
     stats = calculate_statistics(cfg, rows, team_replies, included)
     _attach_history(ctx, cfg, stats, today)
-    return ScanOutcome(rows, team_replies, stats, today, included, all_emails, now, cfg, info)
+    return ScanOutcome(rows, team_replies, stats, today, included, all_emails, now, cfg, info, copies)
 
 
 def _preview(text):
@@ -1247,6 +1422,10 @@ def snapshot_row(row, now):
         "first_reply_by": row.get("first_reply_by", ""),
         "first_reply_email": row.get("first_reply_email", ""),
         "first_reply_time": _iso(replied_at),
+        "last_reply_by": row.get("last_reply_by", ""),
+        "last_reply_email": row.get("last_reply_email", ""),
+        "last_reply_time": _iso(row.get("last_reply_time")),
+        "mail_copy": row.get("mail_copy", ""),
         "first_response_time": first_response,
         "response_minutes": row.get("response_minutes"),
         "duration_minutes": duration,
@@ -1353,7 +1532,7 @@ def history_point(outcome, ctx):
 def run_scan(ctx, namespace=None):
     """Job "email". Never raises: a failure becomes ``JobResult(ok=False, error=...)`` and the last good snapshot stays."""
     try:
-        outcome = scan_and_analyze(ctx, namespace)
+        outcome = scan_and_analyze(ctx, namespace, save_copies=True)
         data = to_snapshot_data(outcome, ctx)
     except (ConfigProblem, OutlookUnavailable) as exc:
         ctx.log(f"E-mail scan cannot run: {exc}")
@@ -1364,6 +1543,7 @@ def run_scan(ctx, namespace=None):
     s = outcome.stats
     summary = (f"{s['business_emails']} business e-mails, {s['replied']} replied, {s['pending']} pending"
                + (f", {s['escalated_count']} escalated" if s["escalated_count"] else "")
-               + (f", {s['carryover_count']} carried over" if s["carryover_count"] else ""))
+               + (f", {s['carryover_count']} carried over" if s["carryover_count"] else "")
+               + (f", {outcome.copies['saved']} mail copies saved" if outcome.copies.get("saved") else ""))
     return JobResult(ok=True, snapshot_data=data, snapshot_date=outcome.today.isoformat(), summary=summary,
                      history_point=history_point(outcome, ctx))

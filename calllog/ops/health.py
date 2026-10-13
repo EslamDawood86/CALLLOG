@@ -14,7 +14,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from . import schemas
+from . import mailbox, schemas
 from .settings import is_active
 
 APP_VERSION = "NBE Operations Hub 1.0"
@@ -23,6 +23,7 @@ _START_MONOTONIC = time.monotonic()
 
 LOW_DISK_BYTES = 1_000_000_000
 LOW_DISK_PERCENT = 10.0
+MAIL_COPIES_WARN_BYTES = 2_000_000_000
 _ROLES = ("admin", "manager", "user")
 
 
@@ -202,6 +203,10 @@ def _problems(report, settings, now):
             add("danger", f"The {job} collector is offline (last seen {hb.get('age_minutes')} minutes ago).")
         if hb.get("last_status") == "error":
             add("danger", f"The last {job} run failed: {hb.get('last_error') or 'unknown error'}")
+    copies = report.get("mail_copies") or {}
+    if copies.get("bytes", 0) > MAIL_COPIES_WARN_BYTES:
+        add("warn", f"The saved copies of mails take {copies['bytes'] // 1_000_000} MB - lower email.mail_copies.keep_days or "
+                    "max_per_scan in the settings.")
     if report["pending_requests"]["count"] > 5:
         add("warn", f"{report['pending_requests']['count']} 'Run now' requests are waiting - is a collector running?")
     if report["audit_today"]["failed_sign_ins"] >= 10:
@@ -220,6 +225,9 @@ def collect(data_dir, ops, store, settings, now, extra=None):
         "data_folder": folder,
         "ops_folder": {"path": str(ops.root), **ops_folder},
         "records_days": _count_dirs(Path(data_dir) / "records"),
+        "mail_copies": {**mailbox.folder_summary(ops.mail_dir),
+                        "scope": ((settings.get("email") or {}).get("mail_copies") or {}).get("scope", "")},
+        "notifications": {"people": _count_files(ops.notifications_dir, ".json")},
         "snapshots": _snapshot_ages(ops, now),
         "heartbeats": job_states(ops, settings, now),
         "pending_requests": {"count": len(requests),
@@ -237,6 +245,14 @@ def collect(data_dir, ops, store, settings, now, extra=None):
     levels = {p["level"] for p in report["problems"]}
     report["status"] = "error" if "danger" in levels else "warn" if "warn" in levels else "ok"
     return report
+
+
+def _count_files(folder, suffix):
+    try:
+        with os.scandir(folder) as it:
+            return sum(1 for e in it if e.name.endswith(suffix) and e.is_file(follow_symlinks=False))
+    except OSError:
+        return 0
 
 
 def _count_dirs(folder):

@@ -281,3 +281,110 @@ def test_two_employees_match_rows_of_the_snapshots(tmp_path, call_store):
     assert {u["team"] for u in with_mail} == {"Flex Cube"}
     assert sorted(len(u["teams"]) for u in creds["users"].values() if u["role"] == "user") == [0, 0, 1, 2]      # one employee has two teams
     assert creds["users"][demo.MANAGER_ID]["teams"] == ["Flex Cube"]
+
+
+# ------------------------------------------------------------------- assigned mails, saved copies, notifications (feature B)
+@pytest.fixture
+def seeded(app, clock):
+    """The app with the demo accounts, mails, copies and notifications, at the demo's own 'now'."""
+    from calllog.ops import mailbox
+    clock.value = NOW
+    ops = app.extensions["ops"]
+    demo.seed(ops, NOW)
+    creds = demo.seed_users_and_calls(app.extensions["store"], NOW)
+
+    def login(uid):
+        from conftest import Browser
+        b = Browser(app)
+        assert b.login(uid, creds["password"]).status_code == 302
+        return b
+    return type("Seeded", (), {"ops": ops, "creds": creds, "login": staticmethod(login), "mailbox": mailbox})
+
+
+def test_the_demo_has_assigned_mails_in_every_state_for_the_first_employee(seeded):
+    me = seeded.login("1001")
+    mine = me.get("/api/ops/my").get_json()["email"]["assigned"]
+    assert (mine["pending"], mine["done"], mine["other"]) == (2, 2, 0)
+    by_state = {(i["assignment_done"], i["done_auto"]): i for i in mine["items"]}
+    assert set(by_state) == {(False, False), (True, False), (True, True)}
+    marked = by_state[(True, False)]
+    assert marked["status"] == "Pending Reply" and marked["done_by"] == "Alice Hassan" and marked["done_note"]
+    answered = by_state[(True, True)]
+    assert answered["status"] == "Replied" and answered["done_by"] == "" and answered["done_at"]
+    assert [i["assignment_done"] for i in mine["items"]] == [False, False, True, True]          # open first, then done
+    other = seeded.login("1002").get("/api/ops/my").get_json()["email"]["assigned"]
+    assert (other["pending"], other["done"]) == (1, 0)
+
+
+def test_the_manager_sees_the_done_mail_and_the_numbers(seeded):
+    boss = seeded.login(demo.MANAGER_ID)
+    data = boss.get("/api/ops/email").get_json()["data"]
+    done = [r for r in data["rows"] if r["assignment_done"]]
+    assert {(r["done_auto"], r["status"]) for r in done} == {(False, "Pending Reply"), (True, "Replied")}
+    assert data["stats"]["assigned_count"] == 5 and data["stats"]["assigned_done_count"] == 2
+    assert any(r["done_by"] == "Alice Hassan" and r["done_note"] for r in done)
+
+
+def test_the_demo_copies_open_and_download_for_the_people_who_may(seeded):
+    from urllib.parse import quote
+    me, other = seeded.login("1001"), seeded.login("1002")
+    items = me.get("/api/ops/my").get_json()["email"]["assigned"]["items"]
+    assert len(items) == 4 and all(i["mail_copy"] == "ready" for i in items)
+    for item in items:
+        mid = quote(item["message_id"], safe="")
+        preview = me.get(f"/api/ops/email/message?message_id={mid}").get_json()
+        assert preview["state"] == "ready" and preview["subject"] == item["subject"] and len(preview["body_text"]) > 200
+        assert preview["can"]["download"] is True and preview["assignment"]["assigned_to_name"] == "Alice Hassan"
+        file = me.get(f"/api/ops/email/message/download?message_id={mid}")
+        assert file.status_code == 200 and file.data.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1DEMO-MSG")
+        assert other.get(f"/api/ops/email/message?message_id={mid}").status_code == 404
+    seconds = other.get("/api/ops/my").get_json()["email"]["assigned"]["items"]
+    assert len(seconds) == 1 and seconds[0]["mail_copy"] == ""
+    preview = other.get("/api/ops/email/message?message_id=" + quote(seconds[0]["message_id"], safe="")).get_json()
+    assert preview["state"] == "preparing" and preview["can"]["prepare"] is True and preview["source"] == "snapshot"
+
+
+def test_the_demo_has_a_too_large_mail_and_pending_mails_with_copies(seeded):
+    ops = seeded.ops
+    rows = ops.read_snapshot("email")["data"]["rows"]
+    states = Counter(r["mail_copy"] for r in rows)
+    assert states["ready"] >= 8 and states["too_large"] == 1 and states[""] > 20
+    files = sorted(p.name for p in ops.mail_dir.iterdir())
+    assert len(files) == states["ready"] * 2 + states["too_large"] and sum(f.endswith(".msg") for f in files) == states["ready"]
+    big = next(r for r in rows if r["mail_copy"] == "too_large")
+    preview = seeded.mailbox.read_preview(ops.mail_dir, seeded.mailbox.mail_key(big["message_id"]))
+    assert preview["msg_bytes"] == 0 and preview["too_large"] is True and preview["attachments"]
+    arabic = [r for r in rows if r["mail_copy"] == "ready" and any("؀" <= c <= "ۿ" for c in r["subject"])]
+    assert arabic and "السلام عليكم" in seeded.mailbox.read_preview(ops.mail_dir, seeded.mailbox.mail_key(arabic[0]["message_id"]))["body_text"]
+    for row in rows:                                         # a copy is promised exactly where its files are
+        key = seeded.mailbox.mail_key(row["message_id"])
+        assert (ops.mail_dir / f"{key}.json").exists() == bool(row["mail_copy"])
+
+
+def test_the_demo_notifications_tell_the_story_to_the_employee_and_the_manager(seeded):
+    from urllib.parse import unquote
+    me, boss = seeded.login("1001"), seeded.login(demo.MANAGER_ID)
+    mine, theirs = me.get("/api/ops/notifications").get_json(), boss.get("/api/ops/notifications").get_json()
+    assert 3 <= len(mine["items"]) <= 6 and 3 <= len(theirs["items"]) <= 6
+    assert (mine["unread"], theirs["unread"]) == (2, 2)
+    assert {i["type"] for i in mine["items"]} == {"assigned", "unassigned"}
+    assert {i["type"] for i in theirs["items"]} == {"done", "replied", "reopened"}
+    for who, got in ((me, mine), (boss, theirs)):
+        assert [i["ts"] for i in got["items"]] == sorted((i["ts"] for i in got["items"]), reverse=True)
+        assert len({i["id"] for i in got["items"]}) == len(got["items"])
+        for i in got["items"]:
+            assert len(i["title"]) <= 200 and len(i["text"]) <= 200 and i["ref"]["message_id"].startswith("<demo-")
+            assert unquote(i["link"].split("=", 1)[-1] if "mail=" in i["link"] else i["link"].split("open=")[-1]) == i["ref"]["message_id"]
+    assert all(i["link"].startswith("/my?mail=") for i in mine["items"])
+    assert all(i["link"].startswith("/email?tab=pending&open=") for i in theirs["items"])
+    assert me.get("/api/ops/notifications?since=" + mine["ts"]).get_json()["unchanged"] is True
+    assert boss.post("/api/ops/notifications/read", {"ids": "all"}).get_json()["unread"] == 0
+    # the replied mail is already announced in the demo: opening the bell does not add another
+    assert len(boss.get("/api/ops/notifications").get_json()["items"]) == len(theirs["items"])
+
+
+def test_the_demo_people_in_the_new_files_are_made_up(seeded):
+    text = "\n".join(p.read_text(encoding="utf-8", errors="ignore") for folder in (seeded.ops.mail_dir, seeded.ops.notifications_dir)
+                     for p in folder.iterdir() if p.suffix == ".json")
+    addresses = set(re.findall(r"[\w.+-]+@[\w.-]+", text))
+    assert addresses and all(a.endswith((".example", ".test")) for a in addresses), sorted(addresses)[:5]

@@ -452,3 +452,50 @@ dialog.dlg::backdrop { background: rgba(0, 0, 0, 0.45); }
 .top-list li:last-child { border-bottom: 0; }
 .top-list .hint { font-size: 0.8rem; }
 .top-list strong { align-self: center; font-variant-numeric: tabular-nums; grid-row: 1 / span 2; grid-column: 2; }
+
+/* IP phone lookup */
+/* The line under the IP phone box (and in the edit dialog): branch / department of the number. Its height is reserved for the
+   longest case (a name on two rows + the hint row) in every state, so it appearing never moves the fields below it.
+   Colours come from the theme variables, so it works in light and dark. */
+.ip-unit {
+  display: flex; align-items: flex-start; gap: 9px; margin-top: 8px; padding: 5px 11px;
+  border: 1px dashed var(--hair); border-radius: 10px; font-size: 0.88rem; line-height: 1.25; color: var(--ink-2);
+}
+.ip-unit > svg { width: 17px; height: 17px; flex: none; margin-top: 2px; color: var(--muted); }
+.ip-unit-body { display: grid; align-content: center; justify-items: start; min-width: 0; flex: 1 1 auto; min-height: 3.2rem; }
+.ip-unit[data-state="found"] {
+  border: 1px solid var(--hair); border-inline-start: 3px solid var(--brand); background: var(--wash); color: var(--ink);
+}
+.ip-unit[data-state="found"] > svg { color: var(--brand); }
+.ip-unit[data-state="none"] { border-style: solid; }
+.ip-unit-hint, .ip-unit-none { font-size: 0.85rem; }
+.ip-unit-name {
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden;
+  overflow-wrap: anywhere; max-width: 100%; font-weight: 600;
+}
+.ip-unit-meta {
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.78rem; color: var(--ink-2); font-weight: 400;
+}
+/* "Filled from the IP phone" under the branch picker; hidden with visibility so its line stays reserved */
+.bp-wrap { display: grid; }
+.bp-auto {
+  display: flex; align-items: center; gap: 5px; min-height: 1.25rem; margin: 5px 2px 0; font-size: 0.8rem; color: var(--accent-text);
+  visibility: hidden;
+}
+.bp-auto.on { visibility: visible; }
+.bp-auto svg { width: 13px; height: 13px; flex: none; }
+/* the location under the number in the calls tables */
+table.data td.ip .ip-where {
+  width: fit-content; max-width: 24ch; margin-top: 2px; font-size: 0.8rem; font-weight: 400; letter-spacing: 0; color: var(--ink-2);
+  overflow-wrap: anywhere; text-align: start;
+}
+/* admin: the IP phones card and its import dialog */
+.ip-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 12px 0 8px; }
+.dropzone {
+  display: grid; gap: 8px; justify-items: start; padding: 14px; border: 2px dashed var(--axis); border-radius: 10px;
+  background: var(--wash); color: var(--ink-2);
+}
+.dropzone.over { border-color: var(--btn); background: color-mix(in srgb, var(--btn) 12%, transparent); color: var(--ink); }
+.dropzone input[type="file"] { max-width: 100%; border: 0; background: none; padding: 0; }
+.import-result { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.import-result strong { font-variant-numeric: tabular-nums; }

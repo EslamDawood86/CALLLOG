@@ -4,6 +4,9 @@
     python manage.py reset-password 230966          (prints a new temporary password)
     python manage.py add-admin boss "Full Name"     (prints a temporary password)
 
+IP phone directory (phone number -> branch / department; the best way to load a 40,000-row export):
+    python manage.py import-ip-phones PATH.xlsx     replaces the directory; names of people in the file are never read into it
+
 Operations Hub:
     python manage.py import-legacy --email OLD_EMAIL.py --sla SLA.PY --itsm itsm_status.py [--out-config PATH] [--no-passwords] [--force]
                                                     read the three old scripts (never run them): settings into the data
@@ -16,6 +19,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import bootstrap  # noqa: F401  (adds the 'libs' folder)
@@ -108,6 +112,31 @@ def cmd_import_legacy(args):
     print("Next: check the result with  python collector.py --check")
 
 
+def cmd_import_ip_phones(args):
+    from calllog import ip_phones
+    path = Path(args.path)
+    if not path.is_file():
+        sys.exit(f"File not found: {path}")
+    store = open_store()
+    started = time.perf_counter()
+    try:
+        data = ip_phones.build_from_bytes(path.read_bytes(), path.name, imported_by="manage.py", now=iso_now(datetime.now()))
+    except ip_phones.IpPhoneError as exc:
+        sys.exit(f"ERROR: {exc}")
+    previous = store.ip_directory().status()["numbers"]
+    store.replace_ip_phones(data)
+    report = data["report"]
+    store.audit({"ts": iso_now(datetime.now()), "actor": None, "actor_name": "manage.py", "action": "ip_phones_imported",
+                 "target": data["source_name"], "ip": None, "details": {**report, "previous": previous}})
+    print(f"IP phone directory imported in {time.perf_counter() - started:.1f} s: {store.ip_phones_path}")
+    print(f"  rows read:           {report['rows']:,}")
+    print(f"  numbers kept:        {report['numbers']:,}   (units: {report['units']:,}, numbers under more than one unit: {report['ambiguous']:,})")
+    print(f"  rows skipped:        {report['no_number'] + report['bad_number'] + report['no_unit']:,}   "
+          f"(no number {report['no_number']:,}, bad number {report['bad_number']:,}, no unit {report['no_unit']:,})")
+    print(f"  units that are Call Log branches: {store.ip_directory().status()['branch_units']:,}")
+    print("  The names of people in the file were not stored. The file itself was not copied.")
+
+
 def cmd_seed_demo(args):
     try:
         from calllog.ops import demo
@@ -138,6 +167,9 @@ def main(argv=None):
     p.add_argument("--no-passwords", action="store_true", help="do not copy passwords into collector_config.json")
     p.add_argument("--force", action="store_true", help="overwrite an existing collector_config.json")
     p.set_defaults(func=cmd_import_legacy)
+    p = sub.add_parser("import-ip-phones", help="load the IP phone directory (Excel / CSV: phone, name, branch / department)")
+    p.add_argument("path", metavar="PATH", help="the .xlsx or .csv export (columns telephoneNumber, displayName, msExchExtensionAttribute27)")
+    p.set_defaults(func=cmd_import_ip_phones)
     p = sub.add_parser("seed-demo", help="write demo data (needs calllog/ops/demo.py)")
     p.add_argument("--data-dir", metavar="PATH", help="data folder to fill (default: the configured one)")
     p.set_defaults(func=cmd_seed_demo)

@@ -40,7 +40,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
-from . import collector_config, events, schemas
+from . import collector_config, events, mailbox, notifications, schemas
 from . import settings as hub_settings
 from .engines import common
 from .store import HISTORY_KEEP_DAYS, LOG_ROTATE_BYTES, OpsStore, now_iso
@@ -72,6 +72,7 @@ REPORT_KEEP_COPIES = 30
 DEBUG_KEEP_DAYS = 7
 REQUEST_KEEP_DAYS = 1
 EVENT_KEEP_DAYS = 30
+NOTIFICATION_KEEP_DAYS = 30
 
 
 def app_version():
@@ -992,7 +993,8 @@ class Runner:
                 return None
             removed = {}
             steps = (("history", self._prune_history), ("events", self._prune_events), ("reports", self._prune_reports),
-                     ("debug files", self._prune_debug), ("run requests", self._prune_requests))
+                     ("debug files", self._prune_debug), ("run requests", self._prune_requests),
+                     ("mail copies", self._prune_mail_copies), ("notifications", self._prune_notifications))
             for name, function in steps:
                 try:
                     removed[name] = function(now)
@@ -1055,6 +1057,17 @@ class Runner:
                         os.remove(path)
                         removed += 1
         return removed
+
+    def _prune_mail_copies(self, now):
+        """Saved copies of mails (ops/mail): files of mails that left the pending / assigned set ``keep_days`` ago, orphans
+        and left-over temp files. Returns how many files were removed."""
+        keep = int((((self._settings or {}).get("email") or {}).get("mail_copies") or {}).get("keep_days") or 21)
+        done = mailbox.housekeeping(self.store, mailbox.wanted_keys_from(self.store), keep, today=now.date(), now=now)
+        return done["removed"] + done["orphans"] + done["temp"]
+
+    def _prune_notifications(self, now):
+        """In-app notifications older than 30 days (each person's file is also cut to 100 items when it is written)."""
+        return notifications.prune(self.store, NOTIFICATION_KEEP_DAYS, now)
 
     def _prune_requests(self, now):
         removed = 0

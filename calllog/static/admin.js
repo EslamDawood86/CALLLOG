@@ -14,7 +14,8 @@
     login: "Signed in", logout: "Signed out", login_failed: "Failed sign-in", login_blocked: "Sign-in blocked (too many attempts)",
     password_changed: "Changed own password", record_created: "Logged a call", record_updated: "Edited a call",
     record_deleted: "Deleted a call", user_created: "Created user", user_updated: "Updated user",
-    password_reset: "Reset a password", users_imported: "Imported users", branches_imported: "Imported the branch list", export: "Exported data",
+    password_reset: "Reset a password", users_imported: "Imported users", branches_imported: "Imported the branch list",
+    ip_phones_imported: "Imported the IP phone directory", export: "Exported data",
     ops_assign: "Assigned an e-mail", ops_unassign: "Removed an e-mail assignment", ops_no_action: "Marked an e-mail: no action needed",
     ops_no_action_undo: "Undid a no-action mark", ops_team: "Changed the team of an e-mail", ops_quality: "Rated a reply",
     ops_quality_appeal: "Appealed a rating", ops_quality_decision: "Decided a rating appeal",
@@ -240,7 +241,7 @@
         h("td", { class: "nowrap" }, single ? hhmm(r.time) : `${r.date} ${hhmm(r.time)}`, h("span", { class: "hint" }, r.time.slice(5))),
         h("td", {}, bidi(r.name), h("span", { class: "hint" }, `  ${r.user_id}`)),
         h("td", {}, bidi(r.department)),
-        h("td", { class: "ip" }, r.ip_phone),
+        h("td", { class: "ip" }, r.ip_phone, r.ip_unit ? h("div", { class: "ip-where", dir: "auto", title: r.ip_unit }, r.ip_unit) : null),
         h("td", { class: "branch-cell" }, r.branch ? [h("strong", {}, r.branch), bidi(r.branch_name), h("div", { class: "hint" }, r.region)] : h("span", { class: "branch-none" }, "—")),
         h("td", {}, statusChip(r.status, r.reason_ar)),
         h("td", { class: "note" }, bidi(r.note || ""), r.edited ? h("span", { class: "edited-mark", title: `Edited ${r.updated_at} by ${r.updated_by}` }, "edited") : null),
@@ -484,7 +485,13 @@
     const d = await api("GET", "/api/branches");
     state.branches = d.branches;
     fillRegions();
-    if (force || changed("branches", { n: d.branches.length, first: d.branches[0], last: d.branches[d.branches.length - 1] })) renderBranches();
+    try {
+      state.ipStatus = await api("GET", "/api/admin/ip-phones");
+    } catch (e) {
+      if (e.network) throw e;
+      state.ipStatus = { error: e.message };
+    }
+    if (force || changed("branches", { n: d.branches.length, first: d.branches[0], last: d.branches[d.branches.length - 1], ip: state.ipStatus })) renderBranches();
     return new Date().toTimeString().slice(0, 8).padStart(19, " ");
   }
 
@@ -501,13 +508,82 @@
       note.textContent = hits.length > 200 ? `Showing the first 200 of ${hits.length} — type to narrow the list.` : `${hits.length} shown`;
     };
     search.addEventListener("input", debounce(draw, 150));
-    panel("branches").replaceChildren(h("div", { class: "card" },
+    panel("branches").replaceChildren(ipPhonesCard(), h("div", { class: "card" },
       h("div", { class: "card-head" }, h("h2", {}, `${state.branches.length} branches in ${regions} regions`), search, h("span", { class: "grow" }),
         h("button", { class: "btn btn-primary", type: "button", onclick: importBranches }, icon("upload"), "Import from Excel")),
       h("p", { class: "hint" }, "Employees choose from this list when the caller is a branch. Importing replaces the whole list; calls already logged keep the branch they were logged with."),
       h("div", { class: "table-wrap" }, h("table", { class: "data" },
         h("thead", {}, h("tr", {}, ["Number", "Branch", "Region", "Type"].map((c) => h("th", {}, c)))), body)), note));
     draw();
+  }
+
+  // ------------------------------------------------------ IP phone directory
+  /** The "IP phones" card of the Branches tab: what the directory holds and the import button. */
+  function ipPhonesCard() {
+    const s = state.ipStatus || {};
+    const stat = (value, label) => h("div", { class: "tile" }, h("strong", {}, fmtNum(value)), h("span", { class: "tile-sub" }, label));
+    let status;
+    if (s.error) status = h("p", { class: "form-error", role: "alert" }, `The IP phone directory could not be read: ${s.error}`);
+    else if (!s.imported) status = h("p", { class: "muted" }, "No IP phone directory has been imported yet. Until then the call form simply shows no location for a phone number.");
+    else {
+      status = h("div", { class: "ip-stats" }, stat(s.numbers, "IP phone numbers"), stat(s.units, "branches / departments"),
+        stat(s.branch_units, "of them are in the branch list"), stat(s.ambiguous, "numbers used by more than one unit"));
+    }
+    const when = s.imported ? h("p", { class: "hint" },
+      `Imported ${s.imported_at ? s.imported_at.slice(0, 16) : ""}${s.imported_by ? ` by ${s.imported_by}` : ""}${s.source_name ? ` from ${s.source_name}` : ""}.`,
+      s.has_previous ? " The directory before it is kept as ip_phones.previous.json until the next import." : "") : null;
+    return h("div", { class: "card", id: "ipPhonesCard" },
+      h("div", { class: "card-head" }, h("h2", {}, "IP phones"), h("span", { class: "grow" }),
+        h("button", { class: "btn btn-primary", type: "button", id: "importIpPhones", onclick: importIpPhones }, icon("upload"), "Import IP phones")),
+      h("p", { class: "hint" }, "While an employee types the IP phone of a call, the form shows the branch or department of that phone and selects the branch when the name is in the branch list. Only the number and the branch / department are kept - the people's names in the file are ignored."),
+      status, when);
+  }
+
+  async function importIpPhones() {
+    const file = h("input", { type: "file", accept: ".xlsx,.csv", "aria-label": "IP phone directory file" });
+    const drop = h("div", { class: "dropzone" }, h("span", {}, "Drop the file here, or choose it:"), file);
+    drop.addEventListener("dragover", (ev) => { ev.preventDefault(); drop.classList.add("over"); });
+    drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+    drop.addEventListener("drop", (ev) => {
+      ev.preventDefault();
+      drop.classList.remove("over");
+      if (ev.dataTransfer && ev.dataTransfer.files.length) file.files = ev.dataTransfer.files;
+    });
+    const busy = h("p", { class: "hint", role: "status", hidden: true }, "Reading the file - a 40,000-row export takes a few seconds.");
+    let report = null;
+    await modal({
+      title: "Import the IP phone directory", submitLabel: "Replace the directory",
+      body: h("div", { class: "dlg-body" },
+        h("p", { class: "muted" }, "Choose the Excel (.xlsx) or CSV export of the IP phones. The first row must have the column titles:"),
+        h("p", {}, h("code", {}, "telephoneNumber"), " (the IP phone), ", h("code", {}, "msExchExtensionAttribute27"), " (branch / department) and ", h("code", {}, "displayName"),
+          " - the last one is ignored and never stored. Phone, branch, department or unit work as titles too."),
+        h("p", { class: "hint" }, `The current directory (${fmtNum((state.ipStatus || {}).numbers || 0)} numbers) will be replaced. For a very large file you can run  python manage.py import-ip-phones PATH  on the server instead.`),
+        drop, busy),
+      onSubmit: async () => {
+        if (!file.files[0]) throw new Error("Choose a file first.");
+        const fd = new FormData();
+        fd.append("file", file.files[0]);
+        busy.hidden = false;
+        try {
+          report = await api("POST", "/api/admin/ip-phones/import", fd);
+        } finally {
+          busy.hidden = true;
+        }
+      },
+    });
+    if (!report) return;
+    const r = report.report, skipped = r.no_number + r.bad_number + r.no_unit;
+    const line = (label, value, hint) => h("li", {}, h("strong", {}, fmtNum(value)), " ", label, hint ? h("span", { class: "hint" }, `  ${hint}`) : null);
+    await modal({
+      title: "IP phone directory imported",
+      body: h("div", { class: "dlg-body", id: "ipImportResult" }, h("ul", { class: "import-result" },
+        line("rows read", r.rows),
+        line("IP phone numbers kept", r.numbers, `${fmtNum(r.units)} branches / departments, ${fmtNum(report.branch_units)} of them in the branch list`),
+        line("numbers used by more than one unit", r.ambiguous, "the most frequent unit is shown first"),
+        line("rows skipped", skipped, `no number ${fmtNum(r.no_number)} · no branch / department ${fmtNum(r.no_unit)} · not a phone number ${fmtNum(r.bad_number)}`))),
+    });
+    toast(`IP phone directory updated: ${fmtNum(r.numbers)} numbers`);
+    refresh(true);
   }
 
   async function importBranches() {
@@ -537,9 +613,9 @@
     const d = e.details || {}, who = (o) => (o && o !== e.actor ? ` (employee ${o})` : "");
     const reason = (k) => reasonLabel(k);
     switch (e.action) {
-      case "record_created": return `IP ${d.ip_phone} · ${reason(d.reason)}` + (d.branch ? ` · ${d.branch}` : "") + (d.note ? ` · “${d.note}”` : "");
+      case "record_created": return `IP ${d.ip_phone}` + (d.ip_unit ? ` (${d.ip_unit})` : "") + ` · ${reason(d.reason)}` + (d.branch ? ` · ${d.branch}${d.branch_auto ? " (from the IP phone)" : ""}` : "") + (d.note ? ` · “${d.note}”` : "");
       case "record_updated": return Object.keys(d.after || {}).map((k) => `${k.replace("_", " ")}: ${k === "reason" ? reason(d.before[k]) : d.before[k] || "—"} → ${k === "reason" ? reason(d.after[k]) : d.after[k] || "—"}`).join(" · ") + who(d.owner);
-      case "record_deleted": return `${d.date} ${hhmm(d.time || "")} · IP ${d.ip_phone} · ${reason(d.reason)}` + (d.branch ? ` · ${d.branch}` : "") + who(d.owner);
+      case "record_deleted": return `${d.date} ${hhmm(d.time || "")} · IP ${d.ip_phone}` + (d.ip_unit ? ` (${d.ip_unit})` : "") + ` · ${reason(d.reason)}` + (d.branch ? ` · ${d.branch}` : "") + who(d.owner);
       case "user_created": {
         const teams = Array.isArray(d.teams) ? d.teams : d.team ? [d.team] : [];          // older entries have one `team`
         return `${d.name} (${d.role})` + (teams.length ? ` · ${teams.length > 1 ? "teams" : "team"} ${teamsText(teams)}` : "") + (d.email ? ` · ${d.email}` : "");
@@ -558,6 +634,7 @@
       case "export": return `${e.target} · ${d.from} → ${d.to} · ${fmtNum(d.rows)} rows`;
       case "users_imported": return `${d.created} created, ${d.skipped} skipped`;
       case "branches_imported": return `${d.count} branches (was ${d.previous}), ${d.duplicates_merged} duplicates merged`;
+      case "ip_phones_imported": return `${fmtNum(d.numbers)} numbers, ${fmtNum(d.units)} units (was ${fmtNum(d.previous)} numbers), ${fmtNum(d.no_number + d.bad_number + d.no_unit)} rows skipped` + (e.target ? ` · ${e.target}` : "");
       case "login_failed": return d.reason === "disabled" ? "account is disabled" : "";
       default: return "";
     }

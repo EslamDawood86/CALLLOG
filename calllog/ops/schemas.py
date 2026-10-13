@@ -19,6 +19,21 @@ EMAIL_STATUSES = (EMAIL_REPLIED, EMAIL_PENDING, EMAIL_NO_ACTION)
 
 ALL_TEAMS_MARK = "__all__"      # user.team value meaning "every team"
 
+# Saved copies of mails (ops/mail/<key>.msg + <key>.json, docs/FEATURES-V2.md B1)
+MAIL_COPY_SCOPES = ("assigned_and_pending", "assigned", "off")
+MAIL_STATE_READY, MAIL_STATE_PREPARING, MAIL_STATE_TOO_LARGE, MAIL_STATE_UNAVAILABLE = (
+    "ready", "preparing", "too_large", "unavailable")
+MAIL_STATES = (MAIL_STATE_READY, MAIL_STATE_PREPARING, MAIL_STATE_TOO_LARGE, MAIL_STATE_UNAVAILABLE)
+MAIL_BODY_CHARS = 30000         # longest plain-text body kept in a preview
+DONE_NOTE_CHARS = 300
+
+# In-app notifications (ops/notifications/<user id>.json, docs/FEATURES-V2.md B4)
+NOTIFY_ASSIGNED, NOTIFY_UNASSIGNED, NOTIFY_DONE, NOTIFY_REOPENED, NOTIFY_REPLIED = (
+    "assigned", "unassigned", "done", "reopened", "replied")
+NOTIFICATION_TYPES = (NOTIFY_ASSIGNED, NOTIFY_UNASSIGNED, NOTIFY_DONE, NOTIFY_REOPENED, NOTIFY_REPLIED)
+NOTIFICATION_KEEP = 100         # items kept per person
+NOTIFICATION_PAGE = 30          # items one poll returns
+
 _ISO_DT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?")
 _ISO_DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 

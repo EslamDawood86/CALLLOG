@@ -16,7 +16,7 @@ bp = Blueprint("exports", __name__)
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 RECORD_HEAD = ["Date", "Time", "User ID", "Employee", "Department", "IP Phone", "Branch No.", "Branch",
-               "Region", "Action Taken", "Action (English)", "Status", "Note", "Edited at"]
+               "Region", "Action Taken", "Action (English)", "Status", "Note", "Edited at", "IP phone location"]
 BRANCH_HEAD = ["Branch No.", "Branch", "Region", "Total calls", "Resolved", "Transferred", "Ticket Inquiry"]
 SUMMARY_HEAD = ["User ID", "Employee", "Department", "Total calls", "Resolved", "Transferred",
                 "Ticket Inquiry", "First call", "Last call"]
@@ -27,7 +27,7 @@ _FORMULA_STARTS = ("=", "+", "-", "@", "\t", "\r")
 def _record_row(r):
     return [r["date"], r["time"], r["user_id"], r["name"], r["department"], r["ip_phone"],
             r["branch"], r["branch_name"], r["region"], r["reason_ar"], r["reason_en"],
-            r["status_label"], r.get("note") or "", r.get("updated_at") or ""]
+            r["status_label"], r.get("note") or "", r.get("updated_at") or "", r.get("ip_unit") or ""]
 
 
 def _summary_rows(d_from, d_to):
@@ -125,7 +125,7 @@ def _fmt(value):
 
 
 SHEET_TITLES = {"records": "Calls", "report": "Calls", "my-calls": "My calls", "audit": "Audit log"}
-RECORD_WIDTHS = [12, 10, 12, 26, 24, 12, 11, 26, 30, 28, 30, 16, 36, 20]
+RECORD_WIDTHS = [12, 10, 12, 26, 24, 12, 11, 26, 30, 28, 30, 16, 36, 20, 30]
 BRANCH_WIDTHS = [11, 30, 34, 12, 11, 13, 14]
 SUMMARY_WIDTHS = [12, 26, 24, 12, 11, 13, 14, 20, 20]
 

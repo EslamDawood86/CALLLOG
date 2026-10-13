@@ -15,14 +15,15 @@ Rules this file keeps:
 import hashlib
 import json
 from datetime import date, datetime, timedelta
+from urllib.parse import quote
 
-from flask import Blueprint, current_app, g, jsonify, request
+from flask import Blueprint, current_app, g, jsonify, request, send_file
 
 from .. import auth, overview as calls_overview, stats as call_stats
 from ..api import public_user
 from ..queries import ApiError, json_body, parse_day, reasons_by_key
 from ..storage import STATUSES, StorageError, norm_uid
-from . import health, overlay, schemas
+from . import health, mailbox, notifications, overlay, schemas
 from . import settings as hub_settings
 from .engines.common import norm_arabic
 from .store import now_iso
@@ -39,6 +40,7 @@ MODULE_LABELS = {"email": "E-mail", "sla": "Security requests", "itsm": "ITSM"}
 MODULE_LINKS = {"email": "/email", "sla": "/sla", "itsm": "/itsm"}
 _SECRET_KEYS = {"password", "passwd", "pwd", "secret", "token", "api_key", "apikey"}
 _MAX_LIST = 100
+_MAX_ASSIGNED = 300          # assigned mails listed on My work (the page shows them 10 per page)
 
 
 # ----------------------------------------------------------------------------- shared helpers
@@ -141,16 +143,26 @@ def read_overrides():
 
 
 def overrides_rev(ovr):
-    """Short fingerprint of the override lists (pages send it back as ``rev`` to learn that someone acted)."""
+    """Short fingerprint of the override lists (pages send it back as ``rev`` to learn that someone acted).
+
+    Almost every request needs it and the lists only grow (assignments, ratings, Done marks), so it is computed once per
+    version of the files: the store hands out the same parsed objects until a file changes, and that identity is the key."""
+    parts = tuple(ovr.get(name) for name in schemas.OVERRIDES)
+    memo = current_app.extensions.setdefault("ops_rev_memo", {})
+    held = memo.get("held")                                   # (the parsed lists, their fingerprint): one tuple, set at once
+    if held is not None and all(a is b or (not a and not b) for a, b in zip(held[0], parts)):
+        return held[1]
     blob = json.dumps(ovr, sort_keys=True, ensure_ascii=False, default=str)
-    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12]
+    rev = hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12]
+    memo["held"] = (parts, rev)
+    return rev
 
 
 def _latest_override_stamp(ovr):
     latest = ""
     for entries in ovr.values():
         for entry in entries.values():
-            for field in ("marked_at", "reviewed_at", "appeal_at", "decided_at"):
+            for field in ("marked_at", "reviewed_at", "appeal_at", "decided_at", "done_at"):
                 stamp = str(entry.get(field) or "").replace(" ", "T")
                 latest = max(latest, stamp)
     return latest
@@ -247,7 +259,7 @@ def team_mail(snap, scope, ovr=None, rev=None):
 # ----------------------------------------------------------------------------- headline numbers
 EMAIL_HEADLINE = ("business_emails", "replied", "pending", "no_action_needed", "needed_reply", "reply_rate",
                   "sla_breached", "sla_compliance_rate", "escalated_count", "carryover_count", "carryover_oldest_days",
-                  "assigned_count", "average_response")
+                  "assigned_count", "assigned_done_count", "average_response")
 
 
 def email_headline(stats):
@@ -366,12 +378,28 @@ def _my_email_row(row):
             "first_reply_time": row.get("first_reply_time"), "response_minutes": row.get("response_minutes"),
             "assigned_by": row.get("assigned_by", ""), "assigned_at": row.get("assigned_at", ""),
             "note": row.get("assigned_note", ""), "quality_rating": row.get("quality_rating", ""),
-            "is_carryover": bool(row.get("is_carryover"))}
+            "is_carryover": bool(row.get("is_carryover")),
+            "assignment_done": bool(row.get("assignment_done")), "done_at": row.get("done_at", ""),
+            "done_by": row.get("done_by", ""), "done_note": row.get("done_note", ""),
+            "done_auto": bool(row.get("done_auto")), "mail_copy": row.get("mail_copy", "")}
 
 
 def _team_summary(teams, all_teams=False):
     return {"teams": list(teams), "all_teams": all_teams, "pending": 0, "replied": 0, "no_action": 0, "sla_breached": 0,
             "escalated": 0, "reply_rate": 0.0, "listed": 0, "more": 0}
+
+
+def _one_row_per_mail(rows):
+    """A mail the collector split into one row per team is still ONE assignment: keep a single row (a pending one wins)."""
+    kept, at = [], {}
+    for row in rows:
+        key = row.get("message_id") or id(row)
+        if key not in at:
+            at[key] = len(kept)
+            kept.append(row)
+        elif row.get("status") == schemas.EMAIL_PENDING and kept[at[key]].get("status") != schemas.EMAIL_PENDING:
+            kept[at[key]] = row
+    return kept
 
 
 def my_email(user, viewer=None):
@@ -387,7 +415,7 @@ def my_email(user, viewer=None):
     if scope is not None and not scope:
         hint = "no_team" if not own_scope else "out_of_scope"
     empty = {"configured": bool(email), "available": False, "email": email,
-             "assigned": {"pending": 0, "done": 0, "items": []},
+             "assigned": {"pending": 0, "done": 0, "other": 0, "items": []},
              "replied": {"count": 0, "average_first_reply_minutes": None, "sla_met": 0, "sla_breached": 0, "items": []},
              "team_emails": [], "team_summary": _team_summary(scope or (), scope is None), "team_emails_hint": hint}
     snap, _ = read_snapshot("email")
@@ -403,15 +431,17 @@ def my_email(user, viewer=None):
     rows = overlaid_rows(snap, ovr, rev)
     if viewer is not None:                        # a manager looking at someone else sees only rows of their own teams
         rows = overlay.scope_rows(rows, viewer)
-    mine_assigned, mine_replied = overlay.assigned_rows(rows, email), overlay.replied_rows(rows, email)
-    pending = [r for r in mine_assigned if r.get("status") == schemas.EMAIL_PENDING]
-    pending.sort(key=lambda r: str(r.get("received_time") or ""))
-    done = [r for r in mine_assigned if r.get("status") != schemas.EMAIL_PENDING]
-    done.sort(key=lambda r: str(r.get("received_time") or ""), reverse=True)
+    mine_assigned, mine_replied = _one_row_per_mail(overlay.assigned_rows(rows, email)), overlay.replied_rows(rows, email)
+    open_rows = [r for r in mine_assigned if not r.get("assignment_done") and r.get("status") == schemas.EMAIL_PENDING]
+    done_rows = [r for r in mine_assigned if r.get("assignment_done")]
+    listed = {id(r) for r in open_rows} | {id(r) for r in done_rows}
+    other_rows = [r for r in mine_assigned if id(r) not in listed]        # closed by somebody else / no action needed
+    newest = lambda r: (str(r.get("assigned_at") or ""), str(r.get("received_time") or ""))    # noqa: E731
+    ordered = [r for group in (open_rows, done_rows, other_rows) for r in sorted(group, key=newest, reverse=True)]
     times = [m for m in (overlay.response_minutes(r) for r in mine_replied) if m is not None]
     mine_replied.sort(key=lambda r: str(r.get("first_reply_time") or ""), reverse=True)
-    out["assigned"] = {"pending": len(pending), "done": len(done),
-                       "items": [_my_email_row(r) for r in (pending + done)[:_MAX_LIST]]}
+    out["assigned"] = {"pending": len(open_rows), "done": len(done_rows), "other": len(other_rows),
+                       "items": [_my_email_row(r) for r in ordered[:_MAX_ASSIGNED]]}
     out["replied"] = {"count": len(mine_replied),
                       "average_first_reply_minutes": round(sum(times) / len(times), 1) if times else None,
                       "sla_met": sum(1 for r in mine_replied if r.get("sla_status") == "Met"),
@@ -727,12 +757,16 @@ def raw_rows(message_id):
     return [r for r in ((snap or {}).get("data") or {}).get("rows") or [] if r.get("message_id") == message_id]
 
 
+def mail_rows(message_id, ovr=None):
+    """The rows of one e-mail as people see them (overrides applied); [] when it is not in the latest scan."""
+    raw = raw_rows(message_id)
+    return overlay.apply_overrides(raw, ovr if ovr is not None else read_overrides(), auth.now()) if raw else []
+
+
 def current_rows(message_id):
     """The e-mail's rows as people see them now (overrides applied). 404 when it is not in the latest scan; 403 when
     it belongs to another team than the manager's."""
-    rows = raw_rows(message_id)
-    if rows:
-        rows = overlay.apply_overrides(rows, read_overrides(), auth.now())
+    rows = mail_rows(message_id)
     if not rows:
         raise ApiError("That e-mail is not in the latest scan. Reload the page.", 404)
     scope = auth.team_scope()
@@ -760,6 +794,29 @@ def _clean_team(value):
     return team
 
 
+# fields of an assignment the assignee's own actions set; a new note for the SAME person must not undo them
+_KEPT_WHEN_SAME_PERSON = ("done_at", "done_by", "done_by_id", "done_note", "replied_notified")
+
+
+def _row_team(rows, entry=None):
+    """The team the assignment is filed under: the mail's team (for a mail sent to several teams, the first one the signed-in
+    manager looks after, so they can still handle it when it has left the scan)."""
+    scope = auth.team_scope()
+    row = next((r for r in rows if overlay.row_in_scope(r, scope)), rows[0] if rows else {})
+    return str(row.get("team") or (entry or {}).get("team") or "")[:80]
+
+
+def _notify(kind, entry, rows, message_id, old_entry=None):
+    """In-app notifications of one event (docs/FEATURES-V2.md B4). A failure here is logged and never undoes the action."""
+    try:
+        subject = _subject(rows) or str((entry or {}).get("subject") or "")[:200]
+        return notifications.notify(ops(), auth.store().users(), kind, g.user, entry, rows, subject, message_id,
+                                    auth.now(), old_entry)
+    except Exception as exc:                                    # noqa: BLE001
+        current_app.logger.warning("notification %s failed: %s: %s", kind, type(exc).__name__, exc)
+        return []
+
+
 @bp.post("/email/assign")
 @auth.ops_act_required
 def email_assign():
@@ -771,16 +828,43 @@ def email_assign():
     name = clean_text(body.get("assigned_to_name"), "Name", 80) or overlay.display_name_from_email(address)
     note = clean_text(body.get("note"), "Note", 300, multiline=True)
     rows = current_rows(message_id)
+    team = _row_team(rows)
+    seen = {}
 
     def change(old):
-        same = old and old.get("assigned_to_email") == address
-        return {"assigned_to_email": address, "assigned_to_name": name, "note": note, "marked_by": _who(),
-                "marked_by_id": g.user["user_id"], "marked_at": _stamp(), "subject": _subject(rows),
-                "notified": bool(same and old.get("notified") and old.get("note") == note)}
+        seen["old"] = old
+        same = bool(old and old.get("assigned_to_email") == address)
+        new = {"assigned_to_email": address, "assigned_to_name": name, "note": note, "marked_by": _who(),
+               "marked_by_id": g.user["user_id"], "marked_at": _stamp(), "subject": _subject(rows), "team": team,
+               "notified": bool(same and old.get("notified") and old.get("note") == note)}
+        if same:
+            new.update({k: old[k] for k in _KEPT_WHEN_SAME_PERSON if old.get(k)})
+        return new
     entry = ops().update_override("assignments", message_id, change)
+    old = seen.get("old")
     auth.audit("ops_assign", target=message_id, details={"to": address, "name": name, "note": note,
                                                           "subject": _subject(rows)[:80]})
+    if not old or old.get("assigned_to_email") != address:       # another person than before: tell them (and the one it was taken from)
+        if old:
+            _notify(schemas.NOTIFY_UNASSIGNED, old, rows, message_id, old)
+        _notify(schemas.NOTIFY_ASSIGNED, entry, rows, message_id)
     return jsonify(ok=True, assignment=entry, rev=overrides_rev(read_overrides()))
+
+
+def manager_rows(message_id, entry):
+    """The rows of a mail for a manager / administrator action: 404 when nothing is known about it, 403 when it belongs to
+    another team. A mail that has left the latest scan can still be handled while its assignment remembers its team."""
+    rows = mail_rows(message_id)
+    scope = auth.team_scope()
+    if rows:
+        if scope is not None and not any(overlay.row_in_scope(r, scope) for r in rows):
+            raise ApiError("That e-mail belongs to another team.", 403)
+    elif entry:
+        if scope is not None and not overlay.team_in(scope, entry.get("team")):
+            raise ApiError("That e-mail belongs to another team.", 403)
+    else:
+        raise ApiError("That e-mail is not in the latest scan. Reload the page.", 404)
+    return rows
 
 
 @bp.delete("/email/assign")
@@ -788,11 +872,19 @@ def email_assign():
 def email_unassign():
     body = optional_body()
     message_id = clean_message_id(body.get("message_id") or request.args.get("message_id"))
-    rows = current_rows(message_id)
-    if not ops().overrides("assignments").get(message_id):
+    entry = ops().overrides("assignments").get(message_id)
+    rows = manager_rows(message_id, entry)
+    if not entry:
         raise ApiError("That e-mail is not assigned.", 404)
-    ops().delete_override("assignments", message_id)
-    auth.audit("ops_unassign", target=message_id, details={"subject": _subject(rows)[:80]})
+    taken = {}
+
+    def remove(old):
+        taken["old"] = old
+        return None
+    ops().update_override("assignments", message_id, remove)
+    old = taken.get("old") or entry
+    auth.audit("ops_unassign", target=message_id, details={"subject": (_subject(rows) or str(old.get("subject") or ""))[:80]})
+    _notify(schemas.NOTIFY_UNASSIGNED, old, rows, message_id, old)
     return jsonify(ok=True, rev=overrides_rev(read_overrides()))
 
 
@@ -939,6 +1031,303 @@ def email_quality_decision():
     auth.audit("ops_quality_decision", target=message_id, details={"decision": decision,
                                                                     "subject": str(review.get("subject") or "")[:80]})
     return jsonify(ok=True, review=entry, rev=overrides_rev(read_overrides()))
+
+
+# ----------------------------------------------------------------------------- assigned mail: open, download, Done
+# docs/FEATURES-V2.md B2 / B3. THE rule of this section: a person gets a mail only when the assignment names them (any role),
+# or when they are a manager of its team, or an administrator. Everything else - a mail that does not exist, a mail that
+# is somebody else's, an "Unclassified" mail of no one - gets the SAME answer, so ids cannot be probed.
+def not_available():
+    return ApiError("That e-mail is not available.", 404)
+
+
+def is_assignee(user, entry):
+    mine = overlay.normalize_email((user or {}).get("email"))
+    return bool(entry) and bool(mine) and overlay.normalize_email(entry.get("assigned_to_email")) == mine
+
+
+def may_open_mail(user, message_id, entry, rows):
+    """The access rule for opening, downloading, marking done and reopening one e-mail (see above)."""
+    if is_assignee(user, entry):
+        return True
+    if (user or {}).get("role") not in auth.OPS_ROLES:
+        return False                                            # an employee: only what is assigned to them
+    scope = overlay.scope_for_user(user)
+    if rows:
+        return scope is None or any(overlay.row_in_scope(r, scope) for r in rows)
+    if entry:                                                   # the mail left the scan: the assignment remembers its team
+        return scope is None or overlay.team_in(scope, entry.get("team"))
+    # nothing in the scan and no assignment: only someone who sees every team, and only if a saved copy exists
+    return scope is None and mailbox.preview_path(ops().mail_dir, mailbox.mail_key(message_id)).is_file()
+
+
+def mail_access(message_id, route):
+    """(assignment entry or None, overlaid rows) when the signed-in person may handle ``message_id``; otherwise the one
+    404 for 'not found' and 'not yours' alike (and an audit line, so probing leaves a trace)."""
+    ovr = read_overrides()
+    entry = ovr["assignments"].get(message_id)
+    rows = mail_rows(message_id, ovr)
+    if not may_open_mail(g.user, message_id, entry, rows):
+        auth.audit("ops_mail_denied", target=message_id[:200], details={"route": route})
+        raise not_available()
+    return entry, rows
+
+
+def read_only_view():
+    """True when the page is somebody else's (``?as=<user>``): looking is allowed, acting is not."""
+    wanted = norm_uid(str(request.args.get("as") or optional_body().get("as") or ""))
+    return bool(wanted) and wanted != g.user["user_id"]
+
+
+def mail_state(message_id, entry, rows):
+    """(key, preview or None, has_msg, state) of the saved copy of one mail."""
+    key = mailbox.mail_key(message_id)
+    preview, has_msg = mailbox.load_copy(ops().mail_dir, key)
+    scope = hub_cfg()["email"]["mail_copies"]["scope"]
+    wanted = scope != "off" and (bool(entry) or (scope == "assigned_and_pending" and any(
+        r.get("status") == schemas.EMAIL_PENDING for r in rows)))
+    if preview and has_msg:
+        state = schemas.MAIL_STATE_READY
+    elif preview and not int(preview.get("msg_bytes") or 0):
+        state = schemas.MAIL_STATE_TOO_LARGE
+    else:
+        state = schemas.MAIL_STATE_PREPARING if wanted else schemas.MAIL_STATE_UNAVAILABLE
+    return key, preview, has_msg, state
+
+
+def assignment_view(entry, row=None):
+    """What a person sees of an assignment (no internal ids)."""
+    if not entry:
+        return None
+    manual = bool(entry.get("done_at"))
+    auto = bool(row and row.get("done_auto")) and not manual
+    return {"assigned_to_email": overlay.normalize_email(entry.get("assigned_to_email")),
+            "assigned_to_name": entry.get("assigned_to_name", ""), "assigned_by": entry.get("marked_by", ""),
+            "assigned_at": entry.get("marked_at", ""), "note": entry.get("note", ""),
+            "done": manual or auto, "done_auto": auto,
+            "done_at": entry.get("done_at", "") if manual else (row.get("done_at", "") if auto else ""),
+            "done_by": entry.get("done_by", "") if manual else "", "done_note": entry.get("done_note", "") if manual else ""}
+
+
+def _mail_block(rows):
+    if not rows:
+        return None
+    row = next((r for r in rows if r.get("status") == schemas.EMAIL_PENDING), rows[0])
+    block = {k: row.get(k, "") for k in ("status", "sla_status", "sla_minutes", "team", "received_time",
+                                          "current_waiting_time", "first_response_time", "first_reply_by",
+                                          "first_reply_time", "detected_systems", "customer_name")}
+    block.update(escalated=bool(row.get("escalated")), is_carryover=bool(row.get("is_carryover")))
+    return block
+
+
+@bp.get("/email/message")
+@auth.login_required
+def email_message():
+    message_id = clean_message_id(request.args.get("message_id"))
+    entry, rows = mail_access(message_id, "message")
+    key, preview, has_msg, state = mail_state(message_id, entry, rows)
+    row = rows[0] if rows else {}
+    view = assignment_view(entry, next((r for r in rows if r.get("assigned_to_email")), row))
+    out = {"message_id": message_id, "state": state, "has_msg": has_msg, "source": "copy" if preview else "snapshot"}
+    if preview:
+        out.update({k: preview.get(k) for k in ("subject", "from_name", "from_email", "to", "cc", "received", "body_text",
+                                                 "truncated", "attachments", "saved_at", "msg_bytes")})
+    else:                                  # no saved copy yet: what the scan knows (the first 300 characters of the text)
+        out.update(subject=row.get("subject") or (entry or {}).get("subject", ""), from_name=row.get("customer_name", ""),
+                   from_email=row.get("customer_email", ""), to=[], cc=[], received=row.get("received_time"),
+                   body_text=row.get("body_preview", ""), truncated=bool(row.get("body_preview")), attachments=[],
+                   saved_at=None, msg_bytes=0)
+    acting = not read_only_view()
+    handler = is_assignee(g.user, entry) or g.user["role"] in auth.OPS_ROLES
+    out.update(mail=_mail_block(rows), assignment=view, can={
+        "download": state == schemas.MAIL_STATE_READY, "prepare": state == schemas.MAIL_STATE_PREPARING,
+        "done": bool(entry) and acting and handler and not (view or {}).get("done"),
+        "reopen": bool(entry) and acting and handler and bool(entry.get("done_at"))})
+    auth.audit("ops_mail_open", target=message_id, details={"state": state, "subject": str(out.get("subject") or "")[:80]})
+    return jsonify(out)
+
+
+@bp.get("/email/message/download")
+@auth.login_required
+def email_message_download():
+    message_id = clean_message_id(request.args.get("message_id"))
+    entry, rows = mail_access(message_id, "download")
+    key, preview, has_msg, state = mail_state(message_id, entry, rows)
+    if state != schemas.MAIL_STATE_READY:
+        raise ApiError("The copy of this e-mail is " + ("too large to keep - open it in Outlook."
+                       if state == schemas.MAIL_STATE_TOO_LARGE else "not ready yet."), 404)
+    name, ascii_name = mailbox.download_name(preview.get("subject"))
+    try:
+        resp = send_file(mailbox.msg_path(ops().mail_dir, key), mimetype=mailbox.MSG_MIME, as_attachment=True,
+                         download_name=ascii_name, conditional=False, etag=False, max_age=0)
+    except OSError:                                               # housekeeping removed it a moment ago
+        raise ApiError("The copy of this e-mail is not ready yet.", 404)
+    resp.headers["Content-Disposition"] = f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(name, safe='')}"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Cache-Control"] = "no-store"
+    auth.audit("ops_mail_download", target=message_id, details={"subject": str(preview.get("subject") or "")[:80],
+                                                                  "bytes": preview.get("msg_bytes")})
+    return resp
+
+
+@bp.post("/email/message/prepare")
+@auth.login_required
+def email_message_prepare():
+    """'Prepare now': ask the collector for an e-mail scan so the copy of a mail that has none yet is saved."""
+    message_id = clean_message_id(json_body().get("message_id"))
+    entry, rows = mail_access(message_id, "prepare")
+    key, preview, has_msg, state = mail_state(message_id, entry, rows)
+    if state != schemas.MAIL_STATE_PREPARING:
+        return jsonify(ok=True, queued=False, state=state)
+    if ops().pending_run_requests("email"):
+        return jsonify(ok=True, queued=True, already_pending=True, state=state)
+    name = ops().add_run_request("email", g.user["user_id"])
+    auth.audit("ops_mail_prepare", target=message_id, details={"request": name})
+    return jsonify(ok=True, queued=True, already_pending=False, state=state)
+
+
+def assignment_target(message_id):
+    """(entry, rows, via) for Done / Reopen: the person must be the assignee or a manager / administrator of the mail's team.
+    Anybody else gets the one 'not available' answer; an in-scope manager on a mail nobody holds gets 409."""
+    if read_only_view():
+        raise ApiError("This is somebody else's page - it is read-only.", 403)
+    entry, rows = mail_access(message_id, "done")
+    if not entry:
+        raise ApiError("That e-mail is not assigned.", 409)
+    return entry, rows, ("assignee" if is_assignee(g.user, entry) else "manager")
+
+
+@bp.post("/email/done")
+@auth.login_required
+def email_done():
+    """The assignee (or a manager / administrator of the mail's team) says the assigned e-mail is handled."""
+    body = json_body()
+    message_id = clean_message_id(body.get("message_id"))
+    note = clean_text(body.get("note"), "Note", schemas.DONE_NOTE_CHARS, multiline=True)
+    entry, rows, via = assignment_target(message_id)
+    state = {}
+
+    def change(old):
+        if not old or (via == "assignee" and not is_assignee(g.user, old)):
+            state["gone"] = True                                  # unassigned / given to somebody else a moment ago
+            return old
+        if old.get("done_at"):
+            state["already"] = True
+            return old
+        state["changed"] = True
+        return {**old, "done_at": _stamp(), "done_by": _who(), "done_by_id": g.user["user_id"], "done_note": note}
+    updated = ops().update_override("assignments", message_id, change)
+    if state.get("gone"):
+        raise not_available()
+    if state.get("changed"):
+        auth.audit("ops_done", target=message_id, details={"by": via, "note": note[:80],
+                                                           "subject": (_subject(rows) or str(updated.get("subject") or ""))[:80]})
+        _notify(schemas.NOTIFY_DONE, updated, rows, message_id)
+    return jsonify(ok=True, already=bool(state.get("already")), assignment=assignment_view(updated),
+                   rev=overrides_rev(read_overrides()))
+
+
+@bp.delete("/email/done")
+@auth.login_required
+def email_reopen():
+    """Take the Done mark back (the assignee, or a manager / administrator of the mail's team)."""
+    body = optional_body()
+    message_id = clean_message_id(body.get("message_id") or request.args.get("message_id"))
+    entry, rows, via = assignment_target(message_id)
+    if not entry.get("done_at"):
+        if any(r.get("done_auto") for r in rows):
+            raise ApiError("The assignee answered that e-mail in Outlook, so it stays done.", 409)
+        return jsonify(ok=True, already=True, assignment=assignment_view(entry), rev=overrides_rev(read_overrides()))
+    state = {}
+
+    def change(old):
+        if not old or (via == "assignee" and not is_assignee(g.user, old)):
+            state["gone"] = True
+            return old
+        if not old.get("done_at"):
+            state["already"] = True
+            return old
+        state["changed"] = True
+        return {k: v for k, v in old.items() if k not in ("done_at", "done_by", "done_by_id", "done_note")}
+    updated = ops().update_override("assignments", message_id, change)
+    if state.get("gone"):
+        raise not_available()
+    if state.get("changed"):
+        auth.audit("ops_reopen", target=message_id, details={"by": via,
+                                                             "subject": (_subject(rows) or str(updated.get("subject") or ""))[:80]})
+        _notify(schemas.NOTIFY_REOPENED, updated, rows, message_id)
+    return jsonify(ok=True, already=bool(state.get("already")), assignment=assignment_view(updated),
+                   rev=overrides_rev(read_overrides()))
+
+
+# ----------------------------------------------------------------------------- notifications (the bell)
+def sweep_replied():
+    """Tell the assigner and the team's managers - once - when an assignee answered an assigned e-mail in Outlook.
+
+    The collector only writes snapshots, so the web app notices: when the snapshot or the assignments changed it looks for
+    rows that are Replied by their assignee and whose assignment has not been announced yet (``replied_notified``). The
+    flag is set under the assignments lock, so two requests at once (or two servers) announce a reply only once."""
+    snap, _ = read_snapshot("email")
+    if not snap:
+        return
+    assignments = ops().overrides("assignments")
+    memo = current_app.extensions.setdefault("ops_replied_sweep", {})
+    if memo.get("stamp") == snap.get("generated_at") and memo.get("assignments") is assignments:
+        return
+    memo["stamp"], memo["assignments"] = snap.get("generated_at"), assignments
+    found = {}
+    for row in (snap.get("data") or {}).get("rows") or []:
+        entry = assignments.get(row.get("message_id")) if isinstance(row, dict) else None
+        if entry and not entry.get("replied_notified") and row.get("status") == schemas.EMAIL_REPLIED \
+                and overlay.replied_by_address(row, overlay.normalize_email(entry.get("assigned_to_email"))):
+            found.setdefault(row["message_id"], row)
+    for message_id, row in found.items():
+        flipped = {}
+
+        def flip(old, flipped=flipped):
+            if old and not old.get("replied_notified"):
+                flipped["entry"] = {**old, "replied_notified": _stamp()}
+                return flipped["entry"]
+            return old
+        ops().update_override("assignments", message_id, flip)
+        if flipped:
+            entry = flipped["entry"]
+            assignee = next((u for u in auth.store().users().values()
+                             if overlay.normalize_email(u.get("email")) == overlay.normalize_email(entry.get("assigned_to_email"))
+                             and u.get("active", True)), None)
+            rows = overlay.apply_overrides([row], read_overrides(), auth.now())
+            try:
+                notifications.notify(ops(), auth.store().users(), schemas.NOTIFY_REPLIED, None, entry, rows,
+                                     row.get("subject", ""), message_id, auth.now(),
+                                     actor_name=(assignee or {}).get("name") or entry.get("assigned_to_name", ""))
+            except Exception as exc:                          # noqa: BLE001
+                current_app.logger.warning("notification replied failed: %s: %s", type(exc).__name__, exc)
+
+
+@bp.get("/notifications")
+@auth.login_required
+def notifications_get():
+    """The signed-in person's bell: ``{unread, items, ts}`` or, when ``since`` is still current, ``{unchanged, unread}``.
+    The person comes from the session only - there is no way to ask for somebody else's."""
+    try:
+        sweep_replied()
+    except Exception as exc:                                  # noqa: BLE001 - the bell must keep answering
+        current_app.logger.warning("replied sweep failed: %s: %s", type(exc).__name__, exc)
+    return jsonify(notifications.poll(ops(), g.user["user_id"], request.args.get("since")))
+
+
+@bp.post("/notifications/read")
+@auth.login_required
+def notifications_read():
+    body = json_body()
+    ids = body.get("ids")
+    if ids != "all":
+        if not isinstance(ids, list) or len(ids) > 200 or not all(isinstance(i, str) and 0 < len(i) <= 64 for i in ids):
+            raise ApiError('ids must be a list of notification ids or "all".')
+    result = notifications.mark_read(ops(), g.user["user_id"], ids, auth.now())
+    if result["changed"]:
+        auth.audit("ops_notifications_read", details={"count": result["changed"], "all": ids == "all"})
+    return jsonify(ok=True, unread=result["unread"], ts=result["ts"])
 
 
 # ----------------------------------------------------------------------------- classification rules

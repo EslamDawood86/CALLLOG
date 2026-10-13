@@ -39,6 +39,8 @@ calllog/ops/
   collector_config.py  reads collector_config.json (accounts + pinned settings)      [foundation, done]
   schemas.py      constants (module names, status codes) + light snapshot validators
   overlay.py      applies e-mail overrides on top of an e-mail snapshot (pure functions)
+  mailbox.py      saved copies of mails: file names, preview documents, which mails to copy, housekeeping (section 4); no Flask, no Outlook
+  notifications.py  the in-app notifications (the bell): per-person files, poll, mark read, who is told about what (section 7.2)
   api.py          Flask blueprint  /api/ops/...   (section 7)
   views.py        HTML pages /hub /email /sla /itsm /system                       (section 8)
   exports.py      /export/ops/... (xlsx/csv built from snapshots, report download)
@@ -92,9 +94,13 @@ see different e-mail numbers, but every dashboard shows the *same* viewer the *s
 `GET /api/ops/my[?as=uid]` returns the signed-in user's own data:
 * **calls**: today / yesterday / last 7 days totals, split by status, calls per hour today (from the existing call storage);
 * **e-mails** (`email`):
-  * `assigned` / `replied` - the mails that are mine *by name*: assigned to my `email` (pending / done, waiting time) and
-    the ones I replied to today (count, average first-reply minutes, SLA met / breached). A mail that is mine stays visible
-    even if it later becomes "Unclassified" (it was explicitly handed to me).
+  * `assigned` / `replied` - the mails that are mine *by name*: assigned to my `email` and the ones I replied to today (count,
+    average first-reply minutes, SLA met / breached). A mail that is mine stays visible even if it later becomes "Unclassified"
+    (it was explicitly handed to me), and I may open it (section 7.1). `assigned` = `{pending, done, other, items}`: **pending**
+    (= open) is a mail still waiting for a reply that I have not marked done; **done** is a mail I marked Done *or* answered in
+    Outlook myself (`done_auto`); **other** is a mail somebody else answered or that needs no action. `items` (at most 300, one per
+    mail even when the collector split it between teams) are ordered open first, then done, then other, newest assignment first; each
+    carries `assignment_done, done_at, done_by, done_note, done_auto, mail_copy` next to the usual fields.
   * `team_emails` - the e-mails of **my own team(s)**: overlaid rows whose `team` or any of `all_teams` is one of my teams,
     status Pending or Replied, **never the "Unclassified" bucket**, pending-first then oldest-first, at most 300. Only a
     whitelist of fields is returned (`row_id, message_id, subject, customer_name, team, status, received_time,
@@ -118,18 +124,28 @@ ops/snapshots/<module>.json             LAST SUCCESSFUL scan of: email | sla | i
 ops/history/<module>/<YYYY-MM-DD>.json  small daily file: list of per-scan points + extras (section 5)
 ops/overrides/email/no_action.json      { message_id: {marked_by, marked_at, subject} }
 ops/overrides/email/team.json           { message_id: {team, marked_by, marked_at, subject} }
-ops/overrides/email/assignments.json    { message_id: {assigned_to_email, assigned_to_name, note, marked_by, marked_at, subject, notified} }
+ops/overrides/email/assignments.json    { message_id: {assigned_to_email, assigned_to_name, note, marked_by, marked_by_id, marked_at, subject, team, notified,
+                                          done_at, done_by, done_by_id, done_note,      <- set by Done (7.1); cleared when the mail goes to someone else
+                                          replied_notified} }                           <- set once the "replied" notification was sent
 ops/overrides/email/quality.json        { message_id: {rating, note, reasons, replied_by, replied_by_email, reviewed_by, reviewed_at, appeal, appeal_by, appeal_at, appeal_decision, decided_by, decided_at, rating_withdrawn, subject} }
 ops/state/<module>.json                 engine-private state (alert de-duplication, last sent, ...)
 ops/events/<YYYY-MM-DD>.jsonl           timeline events (section 5.4): one line per event, written by the runner
 ops/jobs/heartbeat/<job>.json           collector heartbeat (section 6)
 ops/jobs/requests/<job>-<stamp>-<rand>.json   "Run now" requests written by the web app
 ops/jobs/logs/<job>.log                 rolling text log (tail shown in System > Logs), rotated at ~1 MB
+ops/mail/<key>.msg                      saved copy of a mail (Outlook SaveAs, olMSG); key = sha1(message_id).hexdigest()[:32]
+ops/mail/<key>.json                     its preview: {message_id, subject, from_name, from_email, to[], cc[], received, body_text (<= 30,000 chars),
+                                          truncated, attachments[{name,size}], saved_at, msg_bytes, too_large}  (msg_bytes 0 = preview only)
+ops/notifications/<user id>.json        {items[{id,ts,type,title,text,link,actor,ref{message_id},read}], ts, seen_ts}, newest first, <= 100 items
 ops/reports/email/<name>.xlsx           reports the collector produced
 ops/reports/sla/<name>.xlsx
 ops/reports/itsm/<name>.html
 ops/locks/                              lock files
 ```
+
+The two files of a saved mail are written atomically, the `.msg` first and the `.json` last (a preview that exists is complete); the
+web app builds both paths from the hash only, never from text a person typed. `mail/` and `notifications/` are the only folders that
+grow with use: housekeeping (section 15) prunes them, `GET /api/ops/health` reports their size.
 
 Dates inside files are **naive local time of the collector PC**, ISO 8601 (`2026-10-11T09:15:03`);
 days are `YYYY-MM-DD`. The web app never converts time zones (everything is in Cairo local time).
@@ -232,6 +248,8 @@ manager dashboard used. Row keys are stable; unknown extra keys are allowed (UI 
     "sla_minutes":60,"sla_status":"Met|Breached|Within SLA|N/A","escalated":false,"reminder_count":0,
     "is_carryover":false,"age_days":0,"no_action_reason":"","reply_by_manager":false,
     "assigned_to_email":"","assigned_to_name":"",
+    "last_reply_by":"","last_reply_email":"","last_reply_time":"ISO|null",   // the newest team reply (the first one is first_reply_*)
+    "mail_copy":"ready|too_large|",                                          // a saved copy exists (scan time); "" = none yet
     "quality_rating":"Excellent|Good|Needs Improvement|","quality_note":"","quality_reasons":"",
     "quality_appeal":"","appeal_decision":"","rating_withdrawn":false,
     "body_preview":"<= 300 chars", "reply_body_preview":"<= 300 chars"
@@ -240,6 +258,12 @@ manager dashboard used. Row keys are stable; unknown extra keys are allowed (UI 
               "speed_quality_matrix": [...], "person_trends": [...], "repeat_issue_alerts": [...]}
 }
 ```
+The web overlay (`overlay.py`) adds to every row, from the assignments override: `assigned_*` (to, name, note, by, at) and the Done
+fields `assignment_done` (bool), `done_at`, `done_by`, `done_note`, `done_auto`. A row is **done** when the assignee marked it Done, or -
+with no mark - when the assignee wrote the first or the last reply in Outlook (`done_auto: true`, `done_by` empty). Done never changes
+`status`, `sla_status` or any reply number: a Done mail nobody replied to is still Pending Reply. `stats` gets `assigned_done_count`
+next to `assigned_count`.
+
 History point (`ops/history/email/<day>.json`): `{"points":[{"ts","business_emails","replied","pending","no_action_needed","sla_breached","escalated"}], "final": {...stats subset...}}`.
 
 ### 5.4 Timeline events (`calllog/ops/events.py`, already written)
@@ -295,7 +319,12 @@ Rules every job follows:
 | `GET /my[?as=uid]` | any signed-in (`as`: admin, manager) | section 3.2; the e-mail block has `assigned`/`replied` (mine by name) plus `team_emails`/`team_summary`/`team_emails_hint` (my team(s), never Unclassified) |
 | `GET /events?day=` | admin, manager | timeline events, newest first |
 | `POST /email/classification/rule` `{keyword, team}` / `DELETE` | admin, manager (own teams) | adds / removes a `system_team_map` entry; 403 if `team` is outside the manager's team set |
-| `POST /email/assign` `{message_id, assigned_to_email, assigned_to_name, note}` | admin, manager | 403 if the mail is outside the manager's team set |
+| `POST /email/assign` `{message_id, assigned_to_email, assigned_to_name, note}` / `DELETE` to take it back | admin, manager | 403 if the mail is outside the manager's team set; stores the mail's `team` in the entry so the manager can still handle it after it left the scan; tells the new assignee (and the previous one, "Assignment removed") |
+| `GET /email/message?message_id=` | any signed-in, see 7.1 | preview JSON + `{state, has_msg, source, mail, assignment, can}`; one audit line per open |
+| `GET /email/message/download?message_id=` | any signed-in, see 7.1 | the `.msg` as an attachment; one audit line per download |
+| `POST /email/message/prepare` `{message_id}` | any signed-in, see 7.1 | "Prepare now": queues one `email` run request when the copy is not saved yet |
+| `POST /email/done` `{message_id, note?}` / `DELETE /email/done` (reopen) | the assignee, or a manager / admin of the mail's team | 7.1; idempotent; audited; notifies the other side |
+| `GET /notifications?since=<ts>` / `POST /notifications/read` `{ids:[..]\|"all"}` | any signed-in | 7.2; always the caller's own file |
 | `POST /email/no-action` `{message_id}` / `DELETE` to undo | admin, manager | 403 if the mail is outside the manager's team set |
 | `POST /email/team` `{message_id, team}` | admin, manager | 403 if the mail is outside the manager's team set |
 | `POST /email/quality` `{message_id, rating, note, reasons}`; `/email/quality/appeal`, `/email/quality/decision` | admin, manager (appeal: the replier) | |
@@ -306,7 +335,53 @@ Rules every job follows:
 | `GET /reports`, download via `/export/ops/report/<module>/<name>` | admin, manager | no path traversal |
 | `GET /export/ops/<module>.xlsx` | admin, manager | built from the snapshot |
 
-Every write action calls `auth.audit(...)` with an `ops_*` action name.
+Every write action calls `auth.audit(...)` with an `ops_*` action name (`ops_done`, `ops_reopen`, `ops_mail_open`, `ops_mail_download`,
+`ops_mail_prepare`, `ops_mail_denied`, `ops_notifications_read`, ...).
+
+### 7.1 Opening, downloading and finishing an assigned e-mail (docs/FEATURES-V2.md, feature B)
+
+**Who may open / download / mark done / reopen one e-mail** (`api.may_open_mail`, the one rule behind all five routes):
+
+| person | may handle |
+|---|---|
+| the person the mail is assigned to (`assignments[message_id].assigned_to_email` equals their account `email`, any role) | that mail, even if it later became "Unclassified" or left the scan |
+| a manager | any mail of their teams (the same scope rule as the E-mail page; a manager with no team or `__all__` sees every team); a mail that left the scan is judged by the `team` stored in its assignment |
+| an administrator | everything that exists (in the scan, assigned, or with a saved copy) |
+| any other employee, anonymous | nothing (401 for anonymous) |
+
+A mail that does not exist and a mail the person may not handle get the **same answer** (`404 {"error": "That e-mail is not available."}`),
+so ids cannot be probed; a denied attempt by a signed-in person leaves an `ops_mail_denied` audit line. An empty, control-character or
+longer-than-500-character id is `400` (checked before anything touches the disk). Done / Reopen refuse (`403`) when the page is somebody
+else's (`?as=<user>`); opening and downloading use the viewer's own rights and never the viewed person's.
+
+`state` of a copy: `ready` (preview and `.msg` saved), `too_large` (preview only; open it in Outlook), `preparing` (the mail is assigned or,
+with the default scope, still pending, but the collector has not saved it yet; `can.prepare` is true), `unavailable` (nothing saved and
+nothing planned, e.g. a replied mail nobody holds). Without a saved copy the answer falls back to what the scan knows (`source: "snapshot"`,
+the first 300 characters of the text, `truncated: true`). `can` = `{download, prepare, done, reopen}` for this person on this mail.
+
+Done / Reopen: Done writes `done_at, done_by, done_by_id, done_note` into the assignment (note <= 300 characters), Reopen removes them; both
+are idempotent (`already: true`, 200, no second audit line or notification); Reopen of a mail the assignee answered in Outlook is `409` (the reply
+cannot be taken back). Re-assigning to another person, or unassigning, clears the mark; a new note for the same person keeps it.
+
+### 7.2 Notifications
+
+`GET /notifications?since=<ts>` returns `{unread, items (the 30 newest), ts, seen_ts}`, or `{unchanged: true, unread, ts}` when `since` is the
+`ts` the person already has (`ts` changes on every write to their file: a new item or a read mark). The file is the caller's own - the id
+comes from the session, there is no parameter for another person. `POST /notifications/read` marks `ids` (<= 200) or `"all"` read.
+
+| event | told | title | link |
+|---|---|---|---|
+| assigned (a different person than before) | the assignee, if an account with that mailbox exists | New e-mail assigned to you | `/my?mail=<id>` |
+| unassigned / reassigned | the previous assignee | Assignment removed | `/my?mail=<id>` |
+| done by the assignee | whoever assigned it + every active manager whose teams include the mail's team (an administrator only as the assigner); never the actor, nobody twice | `<name> marked an e-mail as done` | `/email?tab=pending&open=<id>` |
+| done by a manager for the assignee | the assignee | `<name> marked an e-mail as done` | `/my?mail=<id>` |
+| reopened | the other side (assignee -> assigner + managers; manager -> assignee) | E-mail reopened | per recipient |
+| replied (the assignee answered in Outlook) | assigner + team managers, once (`replied_notified`) | `<name> replied to an assigned e-mail` | `/email?tab=pending&open=<id>` |
+
+The collector only writes snapshots, so the *replied* notification is created by the web app: every notification poll checks (memoised on
+the snapshot and the assignments, so almost always free) for rows that are Replied by their assignee and not yet announced; the flag is
+set under the assignments lock, so concurrent polls and several servers announce a reply once. Items never hold a mail body; title and text are
+cut to 200 characters. A notification that fails to be written is logged and never undoes the action that caused it.
 
 ## 8. Pages
 
@@ -320,6 +395,14 @@ style attributes**; everything from `static/*.js|css`. All scraped / e-mail text
 
 See `calllog/ops/settings.py` for the authoritative defaults and validation. Lists of e-mail addresses are stored lower-case,
 de-duplicated, sorted. Unknown keys are preserved, invalid values are rejected with a message naming the key.
+
+`email.mail_copies` - the saved copies of mails (section 4, docs/FEATURES-V2.md B1):
+`{"scope": "assigned_and_pending" | "assigned" | "off", "max_per_scan": 40, "max_msg_mb": 25, "keep_days": 21}`. The `email` job saves, at
+the end of each scan, a copy of the assigned mails and (default scope) of the mails still waiting for a reply: assigned and not done first, then
+the oldest pending first, at most `max_per_scan` new copies per scan, nothing that already has its two files. Each mail is fetched again by
+EntryID (with its store id) *one at a time* and released at once - the scan never keeps a live COM object, because whether a mail is pending is only known
+after reply matching, which is after the walk through the folders. A mail bigger than `max_msg_mb` gets a preview only. A COM failure on one mail is
+logged (never with its subject) and skipped. Pin it per machine in `collector_config.json` like any other key.
 
 ## 10. Credentials and `collector_config.json`
 
@@ -375,7 +458,11 @@ keep private state in `ctx.store.read_state/write_state`, and never write snapsh
 ## 13. Demo data
 
 `calllog/ops/demo.py` writes contract-valid snapshots, history and heartbeats into an `OpsStore`
-(`python manage.py seed-demo`), used by tests, screenshots and for trying the pages before any collector runs.
+(`python manage.py seed-demo`), used by tests, screenshots and for trying the pages before any collector runs. It also seeds the
+assigned-mail workflow: for employee 1001 two open assignments, one marked Done (still waiting for a reply) and one answered in Outlook
+(done by itself); one open assignment for 1002 with no saved copy yet (state `preparing`); saved copies for them and for six pending
+mails (fake `.msg` bytes that are NOT real Outlook messages, a preview with Arabic and English bodies and attachment names, one
+"too large" preview-only mail); and 4 notifications each for 1001 and for the manager `mgr.flex`, telling that story.
 
 ## 14. Performance budget - 60 people at the same time
 
@@ -394,6 +481,10 @@ What keeps it cheap, and what every endpoint must respect:
   (rows by assigned e-mail / replier e-mail / security name built once per snapshot). Large JSON answers are cached serialised and gzipped.
 * Employees only ever get their own rows (small answers). Admin answers are the big ones; they are cached per scope.
 * Browsers poll with a random start offset, back off on errors, stop while the tab is hidden, and never poll faster than the numbers above.
+* The bell (`/notifications`, every 30 s per person) reads ONE small file per person through the store's cached read; those files are not
+  followed by the 1 s refresher (60 of them would be 60 share round trips a second), a poll looks at its own file once its 1 s cache time is up.
+  Measured with the Flask test client, 60 people, a 5 ms delay on every file operation and no cache: `?since=` unchanged p95 ~6 ms, full answer
+  p95 ~7 ms (without the delay ~1 ms). Saved mail previews are read straight from disk (a few dozen KB, only when somebody opens a mail).
 * Targets on the reference demo data (500 e-mail rows, 300 SLA requests): `?since=` unchanged < 5 ms, full e-mail answer p95 < 150 ms,
   `/my` p95 < 100 ms, `/shared` < 20 ms, with 60 simulated users and an extra 5 ms delay on every file operation. `tools/loadtest_hub.py`
   measures this and its result is quoted in the README.
@@ -424,7 +515,9 @@ Rules for 24/7 safety:
 * **Heartbeat stamps carry epoch seconds** (`updated_ts`) next to the local ISO time, and online / stale decisions use the epoch, so daylight-saving
   changes (Egypt uses DST) and small clock differences between the PCs (tolerance 2 minutes) cannot make a collector look offline.
 * **Housekeeping once a day** (runner, outside business hours): prune history (60 days), events (30), reports (60 days / 30 copies), debug dumps (7),
-  job logs (rotation), stale run requests (> 1 day), and write the result to the job log. Nothing under `records/` or `logs/audit-*` is touched.
+  job logs (rotation), stale run requests (> 1 day), saved mail copies (a copy goes `keep_days` days after its mail left the assigned / pending set;
+  a `.msg` without its preview, or a preview that promises a missing `.msg`, once an hour old; temp files; the countdown is kept in
+  `ops/state/mail-copies.json`), notifications older than 30 days, and write the result to the job log. Nothing under `records/` or `logs/audit-*` is touched.
 * **Midnight / weekend**: scans outside the active window are skipped but the heartbeat keeps ticking, so "online" stays true and the pages show
   "Outside working hours - showing the last scan from <time>" instead of an alarm. Settings can make the schedule all-day (`active_hours: ""`, every
   `work_days`) for real 24/7 scanning.

@@ -50,6 +50,8 @@ class OpsStore:
         self.logs_dir = self.jobs_dir / "logs"
         self.reports_dir = self.root / "reports"
         self.locks_dir = self.root / "locks"
+        self.mail_dir = self.root / "mail"                  # saved copies of mails: <key>.msg + <key>.json (mailbox.py)
+        self.notifications_dir = self.root / "notifications"   # one file per person (notifications.py)
         self.settings_path = self.root / "settings.json"
         self._cache = {}                        # path -> (size/mtime signature, parsed data or _MISSING, time checked)
         self._used = {}                         # path -> time of the last request for it
@@ -64,7 +66,8 @@ class OpsStore:
     def init(self):
         try:
             for d in (self.snapshots_dir, self.history_dir, self.overrides_dir, self.state_dir, self.events_dir, self.heartbeat_dir,
-                      self.requests_dir, self.logs_dir, self.reports_dir, self.locks_dir):
+                      self.requests_dir, self.logs_dir, self.reports_dir, self.locks_dir, self.mail_dir,
+                      self.notifications_dir):
                 d.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise StorageError(f"Cannot use the data folder '{self.root}': {exc}") from exc
@@ -105,18 +108,23 @@ class OpsStore:
         finally:
             lock._thread_lock.release()
 
-    def read_json(self, path, default=None):
+    def read_json(self, path, default=None, watch=True):
         """Parsed JSON file (cached, re-read when its size/mtime changed). Treat as read-only.
 
         A file is re-checked on the share at most every ``TTL`` seconds - or, while the background refresher runs
         (``start_refresher``), by the refresher only, so a page request never waits for the share. A file that does not
-        exist is remembered too (``default`` is returned) instead of being asked for again and again."""
+        exist is remembered too (``default`` is returned) instead of being asked for again and again.
+
+        ``watch=False`` is for files there are MANY of (one per person): the refresher does not follow them (that would be
+        one share round trip per file per second); a request re-checks the file itself once ``TTL`` has passed."""
         path = Path(path)
         key, now = str(path), time.monotonic()
         with self._cache_lock:
             hit = self._cache.get(key)
-            self._used[key] = now
-            if hit and (now - hit[2] < self.TTL or (now - hit[2] < self.STALE_LIMIT and self._refresher_alive(now))):
+            if watch:
+                self._used[key] = now
+            if hit and (now - hit[2] < self.TTL
+                        or (watch and now - hit[2] < self.STALE_LIMIT and self._refresher_alive(now))):
                 return default if hit[1] is _MISSING else hit[1]
         return self._load(key, path, hit, now, default)
 

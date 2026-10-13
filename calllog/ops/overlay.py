@@ -322,13 +322,35 @@ def _unmark_no_action(row, now):
     row["escalated"] = waiting > limit
 
 
+def replied_by_address(row, address):
+    """Did the person with this mailbox write the first or the last reply of the row?"""
+    return bool(address) and row.get("status") == schemas.EMAIL_REPLIED and address in (
+        normalize_email(row.get("first_reply_email")), normalize_email(row.get("last_reply_email")))
+
+
 def _apply_assignment(row, entry):
+    """Assignment and Done fields of a row. Done is the assignee's statement "I handled it": a mark set on the page
+    (``done_at`` ...) or, with no mark, an answer the assignee wrote in Outlook (``done_auto``). It never changes the reply
+    status or the SLA numbers - a Done mail nobody replied to is still Pending Reply."""
     entry = entry or {}
     row["assigned_to_email"] = normalize_email(entry.get("assigned_to_email"))
     row["assigned_to_name"] = entry.get("assigned_to_name", "") if entry else ""
     row["assigned_note"] = entry.get("note", "") if entry else ""
     row["assigned_by"] = entry.get("marked_by", "") if entry else ""
     row["assigned_at"] = entry.get("marked_at", "") if entry else ""
+    manual = bool(row["assigned_to_email"]) and bool(entry.get("done_at"))
+    auto = not manual and replied_by_address(row, row["assigned_to_email"])
+    row["assignment_done"] = manual or auto
+    row["done_auto"] = auto
+    row["done_by"] = str(entry.get("done_by") or "") if manual else ""
+    row["done_note"] = str(entry.get("done_note") or "") if manual else ""
+    if manual:
+        row["done_at"] = str(entry.get("done_at") or "")
+    elif auto:
+        first = normalize_email(row.get("first_reply_email")) == row["assigned_to_email"]
+        row["done_at"] = str((row.get("first_reply_time") if first else row.get("last_reply_time")) or "")
+    else:
+        row["done_at"] = ""
 
 
 def _apply_quality(row, entry):
@@ -467,7 +489,8 @@ def recount(rows, stats):
 
     carry = [r for r in rows if r.get("is_carryover")]
     out.update(carryover_count=len(carry), carryover_oldest_days=max((r.get("age_days") or 0 for r in carry), default=0),
-               assigned_count=sum(1 for r in rows if r.get("assigned_to_email")))
+               assigned_count=sum(1 for r in rows if r.get("assigned_to_email")),
+               assigned_done_count=sum(1 for r in rows if r.get("assigned_to_email") and r.get("assignment_done")))
     out["quality"] = _quality_block(rows, out.get("quality"))
     out["team_stats"] = _team_stats(rows, out.get("team_stats"))
     return out
@@ -565,7 +588,7 @@ def view_email_data(data, overrides, scope_team=None, now=None, rows=None, hide_
 TEAM_MAIL_LIMIT = 300
 TEAM_MAIL_FIELDS = ("row_id", "message_id", "subject", "customer_name", "team", "status", "received_time",
                     "current_waiting_time", "sla_status", "escalated", "is_carryover", "first_reply_by",
-                    "first_reply_time", "assigned_to_name", "detected_systems")
+                    "first_reply_time", "assigned_to_name", "assignment_done", "detected_systems")
 
 
 def _team_mail_item(row):
@@ -576,7 +599,8 @@ def _team_mail_item(row):
             "current_waiting_time": row.get("current_waiting_time", ""), "sla_status": row.get("sla_status", ""),
             "escalated": bool(row.get("escalated")), "is_carryover": bool(row.get("is_carryover")),
             "first_reply_by": row.get("first_reply_by", ""), "first_reply_time": row.get("first_reply_time"),
-            "assigned_to_name": row.get("assigned_to_name", ""), "detected_systems": row.get("detected_systems", "")}
+            "assigned_to_name": row.get("assigned_to_name", ""),
+            "assignment_done": bool(row.get("assignment_done")), "detected_systems": row.get("detected_systems", "")}
 
 
 def team_summary_numbers(rows):

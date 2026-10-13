@@ -162,7 +162,8 @@ def test_my_view_follows_overrides_made_after_the_scan(admin, alice, work):
     assert admin.post("/api/ops/email/assign", {"message_id": "<x1>", "assigned_to_email": ALICE}).status_code == 200
     assert admin.post("/api/ops/email/no-action", {"message_id": "<a1>"}).status_code == 200
     mail = alice.get("/api/ops/my").get_json()["email"]
-    assert mail["assigned"]["pending"] == 1 and mail["assigned"]["done"] == 1
+    # "done" means marked done or answered by me; a mail the manager said needs no action is neither open nor done
+    assert (mail["assigned"]["pending"], mail["assigned"]["done"], mail["assigned"]["other"]) == (1, 0, 1)
     by_subject = {i["subject"]: i for i in mail["assigned"]["items"]}
     assert by_subject["Nobody's mail"]["status"] == "Pending Reply" and by_subject["Alice pending task"]["status"] == "No Action Needed"
 

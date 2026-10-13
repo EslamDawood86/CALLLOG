@@ -9,7 +9,7 @@ import json
 
 from flask import Blueprint, current_app, g, jsonify, request
 
-from . import auth, branches as branch_list, overview as overview_data, stats
+from . import auth, branches as branch_list, ip_phones, overview as overview_data, stats
 from .ops import settings as hub_settings
 from .ops.overlay import (UNCLASSIFIED, legacy_team, normalize_email, split_teams, user_teams,
                           valid_email)
@@ -112,6 +112,41 @@ def list_branches():
     return resp.make_conditional(request)
 
 
+# ------------------------------------------------------------- IP phone directory
+def _same_branch(branch, entry):
+    """Is the branch fields ``branch`` (code / name / region of a call) the directory's ``entry`` (a branch dict or None)?"""
+    return bool(entry and branch.get("branch")) and (
+        (entry["code"], entry["name"], entry["region"]) == (branch["branch"], branch["branch_name"], branch["region"]))
+
+
+def ip_unit_of(ip_phone):
+    """The branch / department the directory gives for ``ip_phone`` (looked up here - a page's own claim is never believed)
+    and the branch it maps to. ('', None) when the number is not in the directory."""
+    hit = auth.store().ip_directory().lookup(ip_phone)
+    if not hit:
+        return "", None
+    return hit["unit"][:ip_phones.MAX_UNIT_CHARS], hit["branch"]
+
+
+def ip_unit_auto(requested, branch, mapped):
+    """May the call say its branch was filled in automatically? Only when the page said so *and* the saved branch really
+    is the one the directory gives for the number."""
+    return requested is True and _same_branch(branch, mapped)
+
+
+@bp.get("/ip-phones/<number>")
+@auth.login_required
+def ip_phone_lookup(number):
+    """Branch / department of an IP phone number (the call form asks while the employee types). Cheap: a dictionary read."""
+    clean = ip_phones.normalize_lookup_number(number[:40])
+    if not clean:
+        raise ApiError("IP phone must be digits only, for example 75942.")
+    hit = auth.store().ip_directory().lookup(clean)
+    if not hit:
+        return jsonify(found=False, number=clean)
+    return jsonify(found=True, number=hit["number"], unit=hit["unit"], alternatives=hit["alternatives"], branch=hit["branch"])
+
+
 @bp.get("/records")
 @auth.login_required
 def my_records():
@@ -131,6 +166,8 @@ def create_record():
     reason = clean_reason(body.get("reason"))
     note = clean_note(body.get("note"))
     branch = branch_fields(body.get("branch"))
+    unit, mapped = ip_unit_of(ip_phone)
+    auto = ip_unit_auto(body.get("ip_unit_auto"), branch, mapped)
     stamp = auth.now().replace(microsecond=0)
     day = stamp.date().isoformat()
     rec = {
@@ -139,9 +176,14 @@ def create_record():
         "reason": reason, "note": note, **branch, "created_at": iso_now(stamp),
         "updated_at": None, "updated_by": None,
     }
+    if unit:
+        rec["ip_unit"] = unit
+    if auto:
+        rec["ip_unit_auto"] = True
     auth.store().add_record(rec)
     auth.audit("record_created", target=rec["id"],
-               details={"ip_phone": ip_phone, "reason": reason, "note": note, "branch": branch_label(rec)})
+               details={"ip_phone": ip_phone, "reason": reason, "note": note, "branch": branch_label(rec),
+                        **({"ip_unit": unit} if unit else {}), **({"branch_auto": True} if auto else {})})
     return jsonify(record=decorate(rec, auth.store().users(), reasons_by_key())), 201
 
 
@@ -183,16 +225,37 @@ def update_record(rid):
     changes = {k: v for k, v in changes.items() if current.get(k, "") != v}
     if not changes:
         return jsonify(record=decorate(current, auth.store().users(), reasons_by_key()))
+    changes.update(_ip_changes(current, changes, body))
     result = auth.store().update_record(rid, {
         **changes, "updated_at": iso_now(auth.now()), "updated_by": g.user["user_id"]})
     if not result:
         raise ApiError("Record not found.", 404)
     before, after = result
-    audit_keys = {("branch" if k in ("branch", "branch_name", "region") else k) for k in changes}
+    audit_keys = {("branch" if k in ("branch", "branch_name", "region") else k) for k in changes} - {"ip_unit_auto"}
     view = lambda rec: {k: (branch_label(rec) if k == "branch" else rec.get(k)) for k in audit_keys}
     auth.audit("record_updated", target=rid, details={
         "owner": owner, "before": view(before), "after": view(after)})
     return jsonify(record=decorate(after, auth.store().users(), reasons_by_key()))
+
+
+def _ip_changes(current, changes, body):
+    """The IP-phone fields an edit changes. The unit is looked up again only when the IP phone itself changed (a call keeps
+    the unit it had when it was made); 'filled automatically' is re-checked when the IP phone or the branch changed, against
+    the branch of the unit the call carries."""
+    out = {}
+    if "ip_phone" not in changes and not any(k in changes for k in ("branch", "branch_name", "region")):
+        return out
+    if "ip_phone" in changes:
+        unit, mapped = ip_unit_of(changes["ip_phone"])
+        if unit != current.get("ip_unit", ""):
+            out["ip_unit"] = unit
+    else:
+        unit = current.get("ip_unit", "")
+        mapped = auth.store().ip_directory().branch_for(unit) if unit else None
+    branch = {k: changes.get(k, current.get(k, "")) for k in ("branch", "branch_name", "region")}
+    if ip_unit_auto(body.get("ip_unit_auto"), branch, mapped) != bool(current.get("ip_unit_auto")):
+        out["ip_unit_auto"] = not bool(current.get("ip_unit_auto"))
+    return out
 
 
 @bp.delete("/records/<rid>")
@@ -204,7 +267,8 @@ def delete_record(rid):
         raise ApiError("Record not found.", 404)
     auth.audit("record_deleted", target=rid, details={
         "owner": owner, "branch": branch_label(removed), **{k: removed.get(k) for k in
-                                                           ("date", "time", "ip_phone", "reason", "note")}})
+                                                           ("date", "time", "ip_phone", "reason", "note")},
+        **({"ip_unit": removed["ip_unit"]} if removed.get("ip_unit") else {})})
     return jsonify(ok=True)
 
 
@@ -547,6 +611,42 @@ def import_branches():
     auth.store().replace_branches(entries)
     auth.audit("branches_imported", details={"count": len(entries), "previous": previous, **report})
     return jsonify(count=len(entries), previous=previous, **report)
+
+
+# ------------------------------------------------------- IP phone directory import
+def ip_phone_status():
+    """What the administrator's card shows: how many numbers / units, when and by whom, and the last import's counts."""
+    directory = auth.store().ip_directory(strict=True)
+    status = directory.status()
+    meta = directory.meta
+    return {**status, "imported_at": meta.get("imported_at") or "", "imported_by": meta.get("imported_by") or "",
+            "source_name": meta.get("source_name") or "", "report": meta.get("report") or {},
+            "has_previous": auth.store().ip_phones_previous_path.is_file()}
+
+
+@bp.get("/admin/ip-phones")
+@auth.admin_required
+def ip_phones_status():
+    return jsonify(**ip_phone_status())
+
+
+@bp.post("/admin/ip-phones/import")
+@auth.admin_required
+def import_ip_phones():
+    """Replace the IP phone directory with an uploaded Excel / CSV export (20 MB at most - see ``app.LARGE_UPLOADS``).
+    Only the number and the branch / department are kept: the person's name column is never stored or logged."""
+    upload = request.files.get("file")
+    if not upload:
+        raise ApiError("Choose a file to import.")
+    try:
+        data = ip_phones.build_from_bytes(upload.read(), upload.filename, imported_by=g.user["user_id"],
+                                          now=iso_now(auth.now()))             # the slow part: no lock is held
+    except ip_phones.IpPhoneError as exc:
+        raise ApiError(str(exc))
+    previous = auth.store().ip_directory().status()["numbers"]
+    auth.store().replace_ip_phones(data)
+    auth.audit("ip_phones_imported", target=data["source_name"], details={**data["report"], "previous": previous})
+    return jsonify(**ip_phone_status(), previous=previous)
 
 
 # ======================================================================== audit
