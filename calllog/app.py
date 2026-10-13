@@ -1,17 +1,35 @@
 """Application factory."""
+import importlib.util
 import secrets
 from datetime import datetime, timedelta
 
-from flask import Flask, g, jsonify, render_template, request, session
+from flask import Flask, Request, g, jsonify, render_template, request, session
 
 from . import auth
 from .config import APP_DIR, load_config
 from .queries import ApiError, api_error_response
+from .ops.store import OpsStore
 from .security import generate_password, hash_password
 from .storage import StorageError, Store, iso_now
 
 # Pages the user may still reach while a password change is being forced.
 _ALLOWED_WHEN_PASSWORD_DUE = {"pages.password", "pages.logout", "static"}
+
+DEFAULT_UPLOAD_LIMIT = 2 * 1024 * 1024
+# The IP phone directory export (~42,000 rows) is bigger than the 2 MB every other request may carry: this route only.
+LARGE_UPLOADS = {("POST", "/api/admin/ip-phones/import"): 20 * 1024 * 1024}
+
+
+class AppRequest(Request):
+    """The normal request, except that the routes in ``LARGE_UPLOADS`` may carry a bigger body (works with Flask 3.0 and 3.1)."""
+
+    @property
+    def max_content_length(self):
+        return LARGE_UPLOADS.get((self.method, self.path)) or super().max_content_length
+
+    @max_content_length.setter
+    def max_content_length(self, value):
+        self._max_content_length = value
 
 
 def _secret_key():
@@ -44,11 +62,38 @@ def bootstrap_admin(store, clock):
     return password
 
 
+def start_refresher(app, interval=1.0):
+    """Keep the files and shared results that pages keep asking for fresh in the background, so a request is answered
+    from memory and never waits for the shared folder (60 people, one slow share). ``run.py`` calls this once the app
+    exists; tests and one-off scripts simply do not. Everything is read once before the first visitor arrives."""
+    from .ops import api as ops_api, schemas
+
+    def warm():
+        with app.app_context():
+            ops_api.hub_cfg()
+            ops_api.job_states()
+            ops_api.current_overrides()
+            email, _ = ops_api.read_snapshot("email")
+            for module in schemas.MODULES:
+                ops_api.read_snapshot(module)
+            if email:
+                ovr, rev = ops_api.current_overrides()
+                ops_api.email_view(email, None, ovr, False, rev)                 # the administrators' view of the mails
+            ops_api.calls_totals(app.config["CLOCK"]().date().isoformat())
+
+    try:
+        warm()
+    except Exception as exc:                                                       # noqa: BLE001 - warming is optional
+        app.logger.warning("warm-up skipped: %s", exc)
+    app.extensions["ops"].start_refresher(interval, warm=warm)
+
+
 def create_app(overrides=None):
     cfg = load_config()
     cfg.update(overrides or {})
 
     app = Flask(__name__)
+    app.request_class = AppRequest
     app.json.ensure_ascii = False
     app.config.update(
         SECRET_KEY=cfg.get("secret_key") or _secret_key(),
@@ -56,7 +101,7 @@ def create_app(overrides=None):
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
         PERMANENT_SESSION_LIFETIME=timedelta(hours=cfg["session_hours"]),
-        MAX_CONTENT_LENGTH=2 * 1024 * 1024,
+        MAX_CONTENT_LENGTH=DEFAULT_UPLOAD_LIMIT,
         CLOCK=cfg.get("clock") or datetime.now,
         USER_EDIT_DAYS=cfg["user_edit_days"],
         IP_PHONE_REGEX=cfg["ip_phone_regex"],
@@ -66,13 +111,22 @@ def create_app(overrides=None):
     store = Store(cfg["data_dir"])
     store.init()
     app.extensions["store"] = store
+    # Operations Hub files (snapshots, overrides, settings...) live in <data_dir>/ops, next to the Call Log data
+    app.extensions["ops"] = OpsStore(cfg["data_dir"]).init()
     app.extensions["throttles"] = auth.make_throttles()
     app.config["INITIAL_ADMIN_PASSWORD"] = bootstrap_admin(store, app.config["CLOCK"])
 
     from . import api, exports, views
+    from .ops import api as ops_api, exports as ops_exports
     app.register_blueprint(views.bp)
     app.register_blueprint(api.bp, url_prefix="/api")
     app.register_blueprint(exports.bp, url_prefix="/export")
+    app.register_blueprint(ops_api.bp, url_prefix="/api/ops")
+    app.register_blueprint(ops_exports.bp, url_prefix="/export/ops")
+    # The Hub pages (/hub /my /email /sla /itsm /system) are a separate module; registered once it exists.
+    if importlib.util.find_spec("calllog.ops.views"):
+        from .ops import views as ops_views
+        app.register_blueprint(ops_views.bp)         # that module must expose `bp`
 
     @app.before_request
     def load_user_and_check_csrf():
@@ -114,6 +168,21 @@ def create_app(overrides=None):
 
     app.register_error_handler(ApiError, api_error_response)
 
+    @app.get("/healthz")
+    def healthz():
+        """For a monitoring tool or a quick look in the browser: no sign-in, no names, nothing but yes/no and the time."""
+        from .ops import health as ops_health, settings as hub_settings
+        ops = app.extensions["ops"]
+        now = app.config["CLOCK"]()
+        try:
+            store.users()                                              # the data folder can be read
+            states = ops_health.job_states(ops, hub_settings.load(ops), now)
+        except Exception as exc:                                       # noqa: BLE001 - this page must always answer
+            app.logger.error("healthz: %s", exc)
+            return jsonify(ok=False, time=now.isoformat(timespec="seconds"), collectors={}), 503
+        return jsonify(ok=True, time=now.isoformat(timespec="seconds"),
+                       collectors={job: bool(state.get("online")) for job, state in states.items()})
+
     @app.errorhandler(StorageError)
     def storage_error(exc):
         app.logger.error("Storage problem: %s", exc)
@@ -131,6 +200,7 @@ def create_app(overrides=None):
 
     @app.errorhandler(413)
     def too_large(exc):
-        return jsonify(error="That file is too large (limit 2 MB)."), 413
+        limit = request.max_content_length or DEFAULT_UPLOAD_LIMIT
+        return jsonify(error=f"That file is too large (limit {limit // (1024 * 1024)} MB)."), 413
 
     return app

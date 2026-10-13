@@ -1,0 +1,11 @@
+# Python packages for collector.py (the PC that has Outlook and Chrome / Edge). The first start of
+#     python collector.py
+# installs them into the Python that runs it and restarts itself once (internet needed, nothing else to do by hand).
+# The web server PC does not need this file - it uses requirements.txt.
+Flask>=3.0,<4
+openpyxl>=3.1,<4
+keyring>=24
+pywin32>=306; sys_platform == "win32"
+
+# Optional, installed on a best-effort basis: charts inside the e-mail report. The report is sent without them if this fails.
+#     matplotlib>=3.7

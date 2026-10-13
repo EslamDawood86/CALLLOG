@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}ITSM · NBE Operations Hub{% endblock %}
+{% block body %}
+{% include "_topbar.html" %}
+<main class="page op-page" id="itsm-page" data-role="{{ current_user.role }}">
+  <noscript><p class="form-error">This page needs JavaScript.</p></noscript>
+  <p class="empty" id="pageLoading">Loading the ITSM requests…</p>
+</main>
+<div id="toast" role="status" aria-live="polite"></div>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='common.js') }}"></script>
+<script src="{{ url_for('static', filename='ops-common.js') }}"></script>
+<script src="{{ url_for('static', filename='itsm.js') }}"></script>
+{% endblock %}

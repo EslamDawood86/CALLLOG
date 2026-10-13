@@ -12,7 +12,8 @@ bp = Blueprint("pages", __name__)
 def index():
     if not g.user:
         return redirect(url_for("pages.login"))
-    return redirect(url_for("pages.admin" if g.user["role"] == "admin" else "pages.dashboard"))
+    # Hub pages are written in calllog/ops/views.py; plain paths so this works whichever blueprint serves them
+    return redirect("/hub" if g.user["role"] in auth.OPS_ROLES else "/my")
 
 
 @bp.route("/login", methods=["GET", "POST"])
@@ -98,6 +99,8 @@ def password():
 def dashboard():
     if g.user["role"] == "admin":
         return redirect(url_for("pages.admin"))
+    if g.user["role"] == "manager":      # managers do not log calls: their home is the dashboard
+        return redirect("/hub")
     return render_template("user.html")
 
 

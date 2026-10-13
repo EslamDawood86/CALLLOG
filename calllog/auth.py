@@ -8,6 +8,7 @@ from functools import wraps
 
 from flask import current_app, g, jsonify, redirect, request, session, url_for
 
+from .ops import overlay
 from .storage import iso_now
 
 UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
@@ -116,12 +117,46 @@ def login_required(view):
     return wrapper
 
 
-def admin_required(view):
-    @wraps(view)
-    def wrapper(*args, **kwargs):
-        if not g.user:
-            return _deny(401)
-        if g.user["role"] != "admin":
-            return _deny(403)
-        return view(*args, **kwargs)
-    return wrapper
+def roles_required(*roles):
+    """Allow only signed-in users whose role is in ``roles`` (401 when anonymous, 403 otherwise)."""
+    def decorator(view):
+        @wraps(view)
+        def wrapper(*args, **kwargs):
+            if not g.user:
+                return _deny(401)
+            if g.user["role"] not in roles:
+                return _deny(403)
+            return view(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+admin_required = roles_required("admin")
+
+# Operations Hub: administrators and managers see the module pages and act on e-mails; the
+# difference between them (settings, users, a manager's team) is checked where it matters.
+OPS_ROLES = ("admin", "manager")
+ops_view_required = roles_required(*OPS_ROLES)
+ops_act_required = roles_required(*OPS_ROLES)
+
+
+# ------------------------------------------------------------ team scope
+def team_scope(user=None):
+    """What ``user`` (default: the signed-in one) may see of the e-mail data: ``None`` = every team, otherwise a tuple of
+    team names (names are compared ignoring case; an empty tuple = nothing).
+
+    * administrators: every team;
+    * managers: the teams on their account; none or the all-teams marker means every team;
+    * employees: the teams on their account, never "Unclassified" (none = nothing).
+    Always test ``scope is None`` - an empty scope is falsy but means *nothing*, not *everything*."""
+    return overlay.scope_for_user(user if user is not None else g.get("user"))
+
+
+def may_act_on_team(team, user=None):
+    """May ``user`` act on something that belongs to ``team``? True when any team of their scope matches."""
+    return overlay.team_in(team_scope(user), team)
+
+
+def scope_email_rows(rows, user=None):
+    """E-mail rows ``user`` may see (a manager with teams sees those teams' rows only; an employee only their teams')."""
+    return overlay.scope_rows(rows, user if user is not None else g.get("user"))

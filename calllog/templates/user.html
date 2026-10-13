@@ -24,6 +24,7 @@
       <input id="ipInput" class="ip-input" inputmode="numeric" autocomplete="off" maxlength="10"
              placeholder="e.g. 75942" autofocus aria-describedby="ipHelp">
       <p class="field-error" id="ipHelp" role="alert" hidden></p>
+      <div id="ipUnit" aria-label="Branch or department of the IP phone"></div>
       <p class="field big" id="branchLabel">Branch <span class="hint">(only if the caller is a branch — otherwise leave empty)</span></p>
       <div id="branchHost" role="group" aria-labelledby="branchLabel"></div>
       <p class="field-error" id="branchHelp" role="alert" hidden></p>
@@ -61,7 +62,7 @@
   <section class="card">
     <div class="card-head">
       <h2 id="recordsTitle">Today's calls</h2>
-      <input type="search" id="searchInput" class="search" placeholder="Search IP phone or note" aria-label="Search calls">
+      <input type="search" id="searchInput" class="search" placeholder="Search IP phone, location or note" aria-label="Search calls">
       <span class="grow"></span>
       <label class="inline-field">Download
         <select id="dlScope" aria-label="Download range">

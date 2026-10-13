@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}System · NBE Operations Hub{% endblock %}
+{% block body %}
+{% include "_topbar.html" %}
+<nav class="tabs" role="tablist" aria-label="System sections" id="sysTabs">
+  <button role="tab" data-tab="health" type="button">Health</button>
+  <button role="tab" data-tab="collectors" type="button">Collectors</button>
+  <button role="tab" data-tab="settings" type="button">Settings</button>
+  <button role="tab" data-tab="logs" type="button">Logs</button>
+  <button role="tab" data-tab="reports" type="button">Reports</button>
+  <span class="grow"></span>
+  <span class="live" id="live" role="status"><i class="live-dot"></i><span id="liveText">Connecting…</span></span>
+</nav>
+<main class="page op-page" id="system-page" data-role="{{ current_user.role }}">
+  <section id="tab-health" class="tab-panel" role="tabpanel" hidden></section>
+  <section id="tab-collectors" class="tab-panel" role="tabpanel" hidden></section>
+  <section id="tab-settings" class="tab-panel" role="tabpanel" hidden></section>
+  <section id="tab-logs" class="tab-panel" role="tabpanel" hidden></section>
+  <section id="tab-reports" class="tab-panel" role="tabpanel" hidden></section>
+</main>
+<div id="toast" role="status" aria-live="polite"></div>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='common.js') }}"></script>
+<script src="{{ url_for('static', filename='ops-common.js') }}"></script>
+<script src="{{ url_for('static', filename='system.js') }}"></script>
+{% endblock %}

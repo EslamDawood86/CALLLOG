@@ -5,6 +5,7 @@ from datetime import date
 from flask import current_app, jsonify, request
 
 from . import auth
+from .ip_phones import fold
 from .storage import STATUS_LABELS, norm_uid, valid_date
 
 ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
@@ -85,6 +86,7 @@ def decorate(rec, users, reasons):
     status = reason.get("status", "other")
     return {
         "branch": "", "branch_name": "", "region": "",   # calls from a sector / other caller have no branch
+        "ip_unit": "", "ip_unit_auto": False,            # branch / department of the IP phone (older calls have none)
         **rec,
         "name": user.get("name", rec["user_id"]),
         "department": user.get("department", ""),
@@ -96,6 +98,14 @@ def decorate(rec, users, reasons):
     }
 
 
+def _unit_matches(rec, q, q_folded):
+    """Does the call's IP-phone location (branch / department) contain the search text?"""
+    unit = rec.get("ip_unit")
+    if not unit:
+        return False
+    return q in unit.lower() or bool(q_folded) and q_folded in fold(unit)
+
+
 def filtered_raw(d_from, d_to, args):
     """Raw records in range, newest first, narrowed by user / department / reason / region / q.
 
@@ -105,6 +115,7 @@ def filtered_raw(d_from, d_to, args):
     reason = args.get("reason") or ""
     region = (args.get("region") or "").strip()
     q = (args.get("q") or "").strip().lower()
+    q_folded = fold(q) if q and not q.isascii() else ""      # Arabic search: ignore taa marbuta / alef spelling
 
     def compute():
         users = auth.store().users()
@@ -119,7 +130,8 @@ def filtered_raw(d_from, d_to, args):
                 continue
             if q and not (q in rec["ip_phone"] or q in (rec.get("note") or "").lower()
                           or q in user.get("name", "").lower() or q in rec["user_id"]
-                          or q in rec.get("branch", "") or q in rec.get("branch_name", "")):
+                          or q in rec.get("branch", "") or q in rec.get("branch_name", "")
+                          or _unit_matches(rec, q, q_folded)):
                 continue
             out.append(rec)
         out.reverse()                     # equal seconds: later-saved call first (the sort below is stable)

@@ -223,6 +223,7 @@ def main():
 
     from waitress import serve
     from calllog import create_app
+    from calllog.app import start_refresher
     from calllog.config import load_config
     from calllog.storage import StorageError
 
@@ -235,6 +236,7 @@ def main():
         app = create_app()
     except StorageError as exc:
         sys.exit(f"\nERROR: {exc}\n")
+    start_refresher(app)        # pages are answered from memory; this thread keeps it fresh (see calllog/app.py)
 
     first_password = app.config["INITIAL_ADMIN_PASSWORD"]
     local_url = f"http://localhost:{port}"

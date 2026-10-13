@@ -15,6 +15,7 @@
     plus: "M12 5v14M5 12h14",
     key: "M21 2l-9.6 9.6M15.5 7.5l3 3L22 7l-3-3M7.5 11.5a5.5 5.5 0 1 0 0 11 5.5 5.5 0 0 0 0-11z",
     check: "M20 6L9 17l-5-5",
+    pin: "M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0zM12 7a3 3 0 1 0 0 6 3 3 0 0 0 0-6z",
   };
 
   // ------------------------------------------------------------------ DOM
@@ -197,7 +198,9 @@
   const branchText = (b) => `${b.code} · ${b.name}`;
   let pickerSeq = 0;
 
-  /** Search-as-you-type branch chooser. Optional: leave it empty for callers that are not branches. */
+  /** Search-as-you-type branch chooser. Optional: leave it empty for callers that are not branches.
+   *  A branch can be filled in for the employee (``setAuto``, from the IP phone directory): a small note then says so, and it
+   *  stops being "automatic" as soon as the employee types, picks or clears something themselves. */
   function branchPicker(branches) {
     const index = branches.map((b) => ({ b, n: normAr(`${b.code} ${b.name} ${b.region}`), name: normAr(b.name) }));
     const id = `bp${++pickerSeq}`;
@@ -206,8 +209,11 @@
       placeholder: "Branch number or name" });
     const list = h("ul", { class: "bp-list", id: `${id}-list`, role: "listbox", hidden: true });
     const clearBtn = h("button", { type: "button", class: "bp-clear", "aria-label": "Clear branch", hidden: true, tabindex: "-1" }, "×");
-    const el = h("div", { class: "bp" }, input, clearBtn, list);
-    let selected = null, unchanged = false, matches = [], active = -1;
+    const box = h("div", { class: "bp" }, input, clearBtn, list);
+    const autoNote = h("p", { class: "bp-auto" }, icon("check"), h("span", {}, "Filled from the IP phone"));
+    const el = h("div", { class: "bp-wrap" }, box, autoNote);
+    let selected = null, unchanged = false, matches = [], active = -1, auto = false;
+    const showAuto = () => autoNote.classList.toggle("on", auto && !!selected);
 
     function search(query) {
       const q = normAr(query).trim();
@@ -222,20 +228,20 @@
     function close() { list.hidden = true; input.setAttribute("aria-expanded", "false"); input.removeAttribute("aria-activedescendant"); active = -1; }
     function render() {
       list.replaceChildren(...matches.map((b, i) => h("li", { id: `${id}-o${i}`, role: "option", "aria-selected": String(i === active), class: i === active ? "active" : "",
-        onmousedown: (ev) => { ev.preventDefault(); choose(b); } },
+        onmousedown: (ev) => { ev.preventDefault(); choose(b, false); } },
         h("span", { class: "bp-main" }, h("strong", {}, b.code), " ", bidi(b.name)), h("span", { class: "hint" }, [b.region, b.type].filter(Boolean).join(" · ")))));
       if (!matches.length) list.replaceChildren(h("li", { class: "bp-none", role: "presentation" }, "No branch matches. Leave it empty if the caller is not a branch."));
       list.hidden = false; input.setAttribute("aria-expanded", "true");
       if (active >= 0) { input.setAttribute("aria-activedescendant", `${id}-o${active}`); list.children[active].scrollIntoView({ block: "nearest" }); }
     }
-    function choose(b) {
-      selected = b; unchanged = false; input.value = branchText(b); input.setAttribute("aria-invalid", "false");
-      clearBtn.hidden = false; close();
+    function choose(b, automatic) {
+      selected = b; unchanged = false; auto = !!automatic; input.value = branchText(b); input.setAttribute("aria-invalid", "false");
+      clearBtn.hidden = false; close(); showAuto();
     }
-    function clear() { selected = null; unchanged = false; input.value = ""; clearBtn.hidden = true; close(); input.removeAttribute("aria-invalid"); }
+    function clear() { selected = null; unchanged = false; auto = false; input.value = ""; clearBtn.hidden = true; close(); input.removeAttribute("aria-invalid"); showAuto(); }
 
     input.addEventListener("input", () => {
-      selected = null; unchanged = false; clearBtn.hidden = !input.value; input.removeAttribute("aria-invalid");
+      selected = null; unchanged = false; auto = false; showAuto(); clearBtn.hidden = !input.value; input.removeAttribute("aria-invalid");
       matches = search(input.value); active = matches.length ? 0 : -1;
       input.value ? render() : close();
     });
@@ -246,11 +252,11 @@
         active = (active + (ev.key === "ArrowDown" ? 1 : -1) + matches.length) % matches.length;
         render();
       } else if (ev.key === "Enter" && !list.hidden && matches.length) {
-        ev.preventDefault(); choose(matches[Math.max(active, 0)]);
+        ev.preventDefault(); choose(matches[Math.max(active, 0)], false);
       } else if (ev.key === "Escape" && !list.hidden) {
         ev.preventDefault(); ev.stopPropagation(); close();
       } else if (ev.key === "Tab" && !selected && input.value && matches.length) {
-        choose(matches[Math.max(active, 0)]);          // typed "100" then Tab: take the best match and move on
+        choose(matches[Math.max(active, 0)], false);   // typed "100" then Tab: take the best match and move on
       }
     });
     input.addEventListener("blur", () => close());
@@ -264,12 +270,111 @@
       problem: () => (input.value.trim() && !selected && !unchanged
         ? "Choose the branch from the list, or clear the field if the caller is not a branch." : ""),
       markInvalid: () => input.setAttribute("aria-invalid", "true"),
+      /** Nothing typed and nothing chosen. */
+      isEmpty: () => !input.value.trim() && !selected && !unchanged,
+      /** The branch in the box was filled in from the IP phone directory and not touched since. */
+      isAuto: () => auto && !!selected,
+      /** Select ``b`` as an automatic choice (the note "Filled from the IP phone" shows next to the picker). */
+      setAuto: (b) => choose(b, true),
       setFromRecord(rec) {
         if (!rec.branch) return clear();
         const hit = branches.find((b) => b.code === rec.branch && b.name === rec.branch_name && b.region === rec.region);
-        if (hit) return choose(hit);
-        selected = null; unchanged = true; input.value = `${rec.branch} · ${rec.branch_name}`; clearBtn.hidden = false;   // branch was removed from the list
+        if (hit) return choose(hit, !!rec.ip_unit_auto);
+        selected = null; unchanged = true; auto = false; input.value = `${rec.branch} · ${rec.branch_name}`; clearBtn.hidden = false; showAuto();   // branch was removed from the list
       },
+    };
+  }
+
+  // ------------------------------------------------------ IP phone lookup
+  const IP_DIGITS = "٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹";
+  /** The IP phone as the server reads it: no spaces, Arabic-Indic / Persian digits as 0-9. */
+  function normalizeIp(value) {
+    return String(value || "").replace(/\s+/g, "").replace(/[٠-٩۰-۹]/g, (c) => String(IP_DIGITS.indexOf(c) % 10));
+  }
+  const ipAnswers = new Map();        // number -> the directory's answer, kept while the page stays open
+
+  /**
+   * Shows the branch / department of the IP phone typed in ``input`` in ``host`` (a block under the field, its height is
+   * always reserved so nothing moves when the answer appears) and, when ``picker`` is given and the unit is a Call Log
+   * branch, selects that branch - but only when the picker is empty or was filled this way before. Asks 250 ms after the
+   * last key and from 3 digits; answers that arrive out of order are dropped; it never takes the focus and a failed
+   * request is silent (the call can always be saved). Everything the server sent goes in with textContent.
+   */
+  function ipLookup({ input, host, picker, branches, delay = 250 }) {
+    host.classList.add("ip-unit");
+    host.setAttribute("role", "status");
+    host.setAttribute("aria-live", "polite");
+    let seq = 0, timer = 0, inflight = null, shown = "";
+    const list = branches || [];
+
+    const paint = (state, ...kids) => {
+      host.dataset.state = state;
+      host.replaceChildren(icon("pin"), h("span", { class: "ip-unit-body" }, kids));
+    };
+    const idle = () => { shown = ""; host.removeAttribute("title"); paint("idle", h("span", { class: "ip-unit-hint", "aria-hidden": "true" }, "Branch / department appears here")); };   // not read out on every key
+    const stored = (unit) => {          // the unit saved with an existing call (edit dialog)
+      host.title = `${unit} · recorded with this call`;
+      paint("found", h("span", { class: "bidi ip-unit-name", dir: "auto" }, unit), h("span", { class: "ip-unit-meta" }, "recorded with this call"));
+    };
+    const none = () => { host.removeAttribute("title"); paint("none", h("span", { class: "ip-unit-none" }, "No branch / department found for this number")); };
+    const found = (ans) => {
+      const others = ans.alternatives || [];
+      host.title = [ans.unit, "from the IP phone directory", ...(others.length ? [`also used by: ${others.join(", ")}`] : [])].join(" · ");   // the whole text, for a name that was clamped
+      // the hint gives way to "also used by" so the line never needs more than one row
+      const meta = others.length
+        ? ["also used by: ", others.map((o, i) => [i ? " · " : null, h("bdi", {}, o)])]
+        : "from the IP phone directory";
+      paint("found", h("span", { class: "bidi ip-unit-name", dir: "auto" }, ans.unit), h("span", { class: "ip-unit-meta" }, meta));
+    };
+    const dropAuto = () => { if (picker && picker.isAuto()) picker.clear(); };
+
+    function apply(number, ans) {
+      shown = number;
+      if (!ans) return idle();                                     // the request failed: say nothing, saving still works
+      if (!ans.found) { none(); dropAuto(); return; }
+      found(ans);
+      const branch = ans.branch && list.find((b) => b.id === ans.branch.id);
+      if (picker && branch && (picker.isEmpty() || picker.isAuto())) picker.setAuto(branch);
+      else if (picker && !branch) dropAuto();                      // a department: the unit line is all that is shown
+    }
+
+    function ask(number) {
+      const mine = ++seq;
+      const run = api("GET", `/api/ip-phones/${encodeURIComponent(number)}`).then((ans) => { ipAnswers.set(number, ans); return ans; }, () => null)
+        .then((ans) => { if (mine === seq && normalizeIp(input.value) === number) apply(number, ans); })
+        .then(() => { if (inflight === run) inflight = null; });
+      inflight = run;
+    }
+
+    function onInput() {
+      const number = normalizeIp(input.value);
+      seq++;
+      clearTimeout(timer);
+      timer = 0;
+      if (!/^\d{3,15}$/.test(number)) { idle(); dropAuto(); return; }
+      const cached = ipAnswers.get(number);
+      if (cached) { apply(number, cached); return; }
+      if (shown !== number) idle();                               // do not leave the previous number's unit under the new number
+      timer = setTimeout(() => { timer = 0; ask(number); }, delay);
+    }
+    input.addEventListener("input", onInput);
+
+    function flush() {
+      if (!timer) return;
+      clearTimeout(timer);
+      timer = 0;
+      ask(normalizeIp(input.value));
+    }
+    idle();
+    return {
+      flush,
+      /** Resolves when the answer for what is typed has been applied (at most 1.5 s): call before reading the picker. */
+      async ready() {
+        flush();
+        if (inflight) await Promise.race([inflight, new Promise((resolve) => setTimeout(resolve, 1500))]);
+      },
+      reset() { seq++; clearTimeout(timer); timer = 0; idle(); },
+      showStored: stored,
     };
   }
 
@@ -306,19 +411,25 @@
       h("span", { class: "rl-text" }, bidi(reasonName(r)), h("span", { class: "hint" }, r.label_en))));
     const picker = branchPicker(branches || []);
     picker.setFromRecord(rec);
+    const where = h("div", { id: "editIpUnit" });
+    const lookup = ipLookup({ input: ip, host: where, picker, branches: branches || [] });
+    if (rec.ip_unit) lookup.showStored(rec.ip_unit);          // the location the call was saved with; typing another number looks it up again
     const body = h("div", { class: "dlg-body" },
       h("label", { class: "field" }, "IP phone", ip),
+      where,
       h("div", { class: "field" }, h("span", {}, "Branch ", h("span", { class: "hint" }, "(only if the caller is a branch)")), picker.el),
       h("div", { class: "field" }, "Reason for the call", h("div", { class: "radio-list" }, radios)),
       h("label", { class: "field" }, "Note", note),
       h("p", { class: "hint" }, `${fmtDay(rec.date)} · ${hhmm(rec.time)}`, rec.name && rec.user_id ? [" · ", h("bdi", {}, rec.name)] : null));
+    ip.addEventListener("keydown", (ev) => { if (ev.key === "Enter") lookup.flush(); });
     return modal({
       title: "Edit call", body, submitLabel: "Save changes",
       onSubmit: async () => {
         const reason = body.querySelector("input[name=reason]:checked");
+        await lookup.ready();                                  // an answer still on its way may fill in the branch
         const problem = picker.problem();
         if (problem) { picker.markInvalid(); throw new Error(problem); }
-        const payload = { ip_phone: ip.value, reason: reason && reason.value, note: note.value };
+        const payload = { ip_phone: ip.value, reason: reason && reason.value, note: note.value, ip_unit_auto: picker.isAuto() };
         if (picker.value() !== undefined) payload.branch = picker.value();
         await api("PUT", `/api/records/${encodeURIComponent(rec.id)}`, payload);
         toast("Changes saved");
@@ -492,6 +603,6 @@
   }
 
   window.CL = { h, $, svgEl, icon, api, csrf, toast, modal, confirmDialog, editRecord, deleteRecord, rowActions, statusChip,
-    reasonName, bidi, reasonBars, barRows, branchPicker, branchText, normAr, trimHours, drawChart, legend, chartWithToggle, fmtNum, hhmm, fmtDay, isoDate, addDays, parseISODate, pct, agoText,
+    reasonName, bidi, reasonBars, barRows, branchPicker, branchText, normAr, normalizeIp, ipLookup, trimHours, drawChart, legend, chartWithToggle, fmtNum, hhmm, fmtDay, isoDate, addDays, parseISODate, pct, agoText,
     STATUSES, STATUS_NAMES };
 })();

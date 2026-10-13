@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}E-mail · NBE Operations Hub{% endblock %}
+{% block body %}
+{% include "_topbar.html" %}
+<main class="page op-page" id="email-page" data-role="{{ current_user.role }}" data-team="{{ current_user.team or '' }}" data-teams="{{ (current_user.teams or ([current_user.team] if current_user.team else []))|join('; ') }}" data-user-email="{{ current_user.email or '' }}">
+  <noscript><p class="form-error">This page needs JavaScript.</p></noscript>
+  <p class="empty" id="pageLoading">Loading the e-mail dashboard…</p>
+</main>
+<div id="toast" role="status" aria-live="polite"></div>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='common.js') }}"></script>
+<script src="{{ url_for('static', filename='ops-common.js') }}"></script>
+<script src="{{ url_for('static', filename='email.js') }}"></script>
+{% endblock %}

@@ -14,8 +14,16 @@
     login: "Signed in", logout: "Signed out", login_failed: "Failed sign-in", login_blocked: "Sign-in blocked (too many attempts)",
     password_changed: "Changed own password", record_created: "Logged a call", record_updated: "Edited a call",
     record_deleted: "Deleted a call", user_created: "Created user", user_updated: "Updated user",
-    password_reset: "Reset a password", users_imported: "Imported users", branches_imported: "Imported the branch list", export: "Exported data",
+    password_reset: "Reset a password", users_imported: "Imported users", branches_imported: "Imported the branch list",
+    ip_phones_imported: "Imported the IP phone directory", export: "Exported data",
+    ops_assign: "Assigned an e-mail", ops_unassign: "Removed an e-mail assignment", ops_no_action: "Marked an e-mail: no action needed",
+    ops_no_action_undo: "Undid a no-action mark", ops_team: "Changed the team of an e-mail", ops_quality: "Rated a reply",
+    ops_quality_appeal: "Appealed a rating", ops_quality_decision: "Decided a rating appeal",
+    ops_classification_rule: "Changed a classification rule", ops_run_job: "Started a collector job (Run now)",
+    ops_settings_saved: "Saved the Hub settings", ops_view_as: "Opened an employee's page", ops_export: "Exported Hub data",
+    ops_report_download: "Downloaded a report",
   };
+  const ROLE_NAMES = { admin: "Admin", manager: "Manager", user: "Employee" };
   const panel = (name) => $(`#tab-${name}`);
 
   // ------------------------------------------------------------- utilities
@@ -233,7 +241,7 @@
         h("td", { class: "nowrap" }, single ? hhmm(r.time) : `${r.date} ${hhmm(r.time)}`, h("span", { class: "hint" }, r.time.slice(5))),
         h("td", {}, bidi(r.name), h("span", { class: "hint" }, `  ${r.user_id}`)),
         h("td", {}, bidi(r.department)),
-        h("td", { class: "ip" }, r.ip_phone),
+        h("td", { class: "ip" }, r.ip_phone, r.ip_unit ? h("div", { class: "ip-where", dir: "auto", title: r.ip_unit }, r.ip_unit) : null),
         h("td", { class: "branch-cell" }, r.branch ? [h("strong", {}, r.branch), bidi(r.branch_name), h("div", { class: "hint" }, r.region)] : h("span", { class: "branch-none" }, "—")),
         h("td", {}, statusChip(r.status, r.reason_ar)),
         h("td", { class: "note" }, bidi(r.note || ""), r.edited ? h("span", { class: "edited-mark", title: `Edited ${r.updated_at} by ${r.updated_by}` }, "edited") : null),
@@ -260,11 +268,31 @@
     return new Date().toTimeString().slice(0, 8).padStart(19, " ");
   }
 
+  const ALL_TEAMS = "__all__";
+  const sameName = (a, b) => String(a).trim().toLowerCase() === String(b).trim().toLowerCase();
+  /** The teams of an account as the list shows them: comma-separated; “All teams” for the all-teams marker. */
+  function teamsText(teams) {
+    return (teams || []).map((t) => (t === ALL_TEAMS ? "All teams" : t)).join(", ");
+  }
+  function teamsCell(u) {
+    const teams = Array.isArray(u.teams) ? u.teams : (u.team ? [u.team] : []);
+    if (teams.length) return teamsText(teams);
+    if (u.role === "admin") return h("span", { class: "hint" }, "All teams");
+    return h("span", { class: "hint" }, u.role === "manager" ? "All teams (not set)" : "No team");
+  }
+  /** Audit text for a value that may be a list (teams) or empty. */
+  function auditValue(v) {
+    if (Array.isArray(v)) return v.length ? teamsText(v) : "—";
+    return v == null || v === "" ? "—" : String(v);
+  }
+
   function renderEmployees(users) {
     const me = window.CL_ME;
     const rows = users.map((u) => h("tr", { class: u.active ? "" : "zero" },
       h("td", { class: "ip" }, u.user_id), h("td", {}, bidi(u.name)), h("td", {}, bidi(u.department)),
-      h("td", {}, u.role === "admin" ? h("span", { class: "pill" }, "Admin") : "Employee"),
+      h("td", {}, u.role === "user" ? ROLE_NAMES.user : h("span", { class: "pill" }, ROLE_NAMES[u.role] || u.role)),
+      h("td", { class: "ip", dir: "ltr" }, u.email || h("span", { class: "hint" }, "—")),
+      h("td", {}, teamsCell(u)),
       h("td", {}, u.active ? h("span", { class: "pill on" }, "Active") : h("span", { class: "pill off" }, "Disabled"),
         u.must_change_password ? h("span", { class: "hint" }, "  must change password") : null),
       h("td", { class: "nowrap" }, u.last_login ? u.last_login.slice(0, 16) : h("span", { class: "hint" }, "never")),
@@ -275,9 +303,9 @@
     panel("employees").replaceChildren(h("div", { class: "card" },
       h("div", { class: "card-head" }, h("h2", {}, `${users.length} accounts`), h("span", { class: "grow" }),
         h("button", { class: "btn btn-ghost", type: "button", onclick: importUsers }, icon("upload"), "Import from Excel / CSV"),
-        h("button", { class: "btn btn-primary", type: "button", onclick: () => userForm(null) }, icon("plus"), "Add employee")),
+        h("button", { class: "btn btn-primary", type: "button", onclick: () => userForm(null) }, icon("plus"), "Add account")),
       h("div", { class: "table-wrap" }, h("table", { class: "data" },
-        h("thead", {}, h("tr", {}, ["User ID", "Name", "Department", "Role", "Status", "Last sign-in"].map((c) => h("th", {}, c)), h("th", { class: "actions-col" }, h("span", { class: "sr-only" }, "Actions")))),
+        h("thead", {}, h("tr", {}, ["User ID", "Name", "Department", "Role", "E-mail", "Teams", "Status", "Last sign-in"].map((c) => h("th", {}, c)), h("th", { class: "actions-col" }, h("span", { class: "sr-only" }, "Actions")))),
         h("tbody", {}, rows)))));
   }
 
@@ -289,30 +317,106 @@
       h("p", { class: "hint" }, "This password is shown only once. The employee will be asked to choose their own at first sign-in.")) });
   }
 
+  /** Teams of the Hub settings for the account form (an empty list if the settings cannot be read). */
+  async function hubTeams() {
+    try {
+      const d = await api("GET", "/api/ops/settings");
+      return d.settings.email.teams || [];
+    } catch (e) { return []; }
+  }
+
+  /**
+   * Check-box list of the Hub teams for the account form. An account can hold several teams. Managers also get “All teams”
+   * (stands alone: it clears and locks the other boxes). Employees cannot be put in “Unclassified” (that bucket is for
+   * managers) and cannot follow every team. A team the account already holds stays in the list even when the settings no
+   * longer have it, so editing the account never silently drops it.
+   */
+  function teamPicker(known, held) {
+    const heldNames = (held || []).filter((t) => t !== ALL_TEAMS);
+    const names = known.slice();
+    for (const t of heldNames) if (!names.some((n) => sameName(n, t))) names.push(t);
+    const rows = names.map((name) => {
+      const input = h("input", { type: "checkbox", value: name, checked: heldNames.some((t) => sameName(t, name)), "aria-label": name });
+      const gone = !known.some((n) => sameName(n, name));
+      const label = h("label", {}, input,
+        h("span", { class: "rl-text" }, h("span", { dir: "auto" }, name), gone ? h("span", { class: "hint" }, "not in the settings any more") : null));
+      return { name, input, label, unclassified: sameName(name, "Unclassified"), held: heldNames.some((t) => sameName(t, name)) };
+    });
+    const allInput = h("input", { type: "checkbox", value: ALL_TEAMS, checked: (held || []).includes(ALL_TEAMS), "aria-label": "All teams" });
+    const allLabel = h("label", {}, allInput, h("span", { class: "rl-text" }, "All teams",
+      h("span", { class: "hint" }, "follows every team, now and in the future")));
+    const hint = h("span", { class: "hint" });
+    const list = h("div", { class: "radio-list", role: "group", "aria-label": "Teams" }, allLabel, rows.map((r) => r.label));
+    let role = "user";
+    function sync() {
+      const manager = role === "manager", admin = role === "admin";
+      allLabel.hidden = !manager;
+      if (!manager) allInput.checked = false;
+      for (const r of rows) {
+        // an employee cannot be put in “Unclassified” (unless the account already is: nothing is removed behind the admin's back)
+        r.label.hidden = r.unclassified && role === "user" && !r.held;
+        r.input.disabled = admin || (manager && allInput.checked);
+        if (manager && allInput.checked) r.input.checked = false;
+      }
+      list.hidden = admin;
+      hint.textContent = admin ? "Administrators see every team."
+        : manager ? "A manager acts on the e-mails of the ticked teams. Tick “All teams”, or none, to follow every team."
+          : "An employee sees only the e-mails of the ticked teams (never the Unclassified ones) and can belong to several. None ticked = no team e-mails.";
+    }
+    allInput.addEventListener("change", sync);
+    return {
+      el: h("div", { class: "field" }, "Teams", list, hint),
+      /** Call when the role selector changes. */
+      setRole(next) { role = next; sync(); },
+      /** What to send: the ticked names, ["__all__"], or undefined for an administrator (teams do not apply). */
+      value() {
+        if (role === "admin") return undefined;
+        if (role === "manager" && allInput.checked) return [ALL_TEAMS];
+        return rows.filter((r) => r.input.checked && !r.label.hidden).map((r) => r.name);
+      },
+    };
+  }
+
   async function userForm(user) {
     const editing = !!user;
+    const teams = await hubTeams();
+    const picker = teamPicker(teams, user ? (Array.isArray(user.teams) ? user.teams : user.team ? [user.team] : []) : []);
     const f = {
       id: h("input", { value: user ? user.user_id : "", disabled: editing, autocomplete: "off", spellcheck: "false", "aria-label": "User ID" }),
       name: h("input", { value: user ? user.name : "", autocomplete: "off", maxlength: "80", dir: "auto", "aria-label": "Name" }),
       dept: h("input", { value: user ? user.department : "", autocomplete: "off", maxlength: "80", dir: "auto", "aria-label": "Department", list: "deptList" }),
-      role: h("select", { "aria-label": "Role" }, h("option", { value: "user" }, "Employee (logs calls)"), h("option", { value: "admin" }, "Administrator")),
+      role: h("select", { "aria-label": "Role" }, h("option", { value: "user" }, "Employee (logs calls, sees own work)"),
+        h("option", { value: "manager" }, "Manager (follows teams, no call logging)"), h("option", { value: "admin" }, "Administrator")),
+      email: h("input", { type: "email", value: user ? user.email || "" : "", autocomplete: "off", maxlength: "120", dir: "ltr", spellcheck: "false", "aria-label": "E-mail" }),
+      secname: h("input", { value: user ? user.security_name || "" : "", autocomplete: "off", maxlength: "120", dir: "auto", "aria-label": "Name in the security portal" }),
       pw: h("input", { type: "text", autocomplete: "off", placeholder: "Leave empty to generate one", "aria-label": "Initial password" }),
     };
     f.role.value = user ? user.role : "user";
+    picker.setRole(f.role.value);
+    f.role.addEventListener("change", () => picker.setRole(f.role.value));
     const depts = h("datalist", { id: "deptList" }, (state.departments || []).map((d) => h("option", { value: d })));
     const body = h("div", { class: "dlg-body" },
       h("label", { class: "field" }, "User ID (employee number)", f.id), h("label", { class: "field" }, "Full name", f.name),
       h("label", { class: "field" }, "Department", f.dept, depts), h("label", { class: "field" }, "Role", f.role),
+      h("label", { class: "field" }, "Work e-mail", f.email, h("span", { class: "hint" }, "Links this account to the e-mails assigned to or answered by this person.")),
+      picker.el,
+      h("label", { class: "field" }, "Name in the security portal", f.secname, h("span", { class: "hint" }, "Exactly as in the portal's “مستخدم السرية” column; shows this person their security requests.")),
       editing ? null : h("label", { class: "field" }, "Initial password", f.pw));
+    const profile = () => {
+      const out = { name: f.name.value, department: f.dept.value, role: f.role.value, email: f.email.value, security_name: f.secname.value };
+      const picked = picker.value();
+      if (picked !== undefined) out.teams = picked;
+      return out;
+    };
     const result = await modal({
-      title: editing ? `Edit ${user.name}` : "Add employee", body, submitLabel: editing ? "Save changes" : "Create account",
+      title: editing ? `Edit ${user.name}` : "Add account", body, submitLabel: editing ? "Save changes" : "Create account",
       onSubmit: async () => {
         if (editing) {
-          await api("PUT", `/api/admin/users/${encodeURIComponent(user.user_id)}`, { name: f.name.value, department: f.dept.value, role: f.role.value });
+          await api("PUT", `/api/admin/users/${encodeURIComponent(user.user_id)}`, profile());
           toast("Account updated");
           return { updated: true };
         }
-        return api("POST", "/api/admin/users", { user_id: f.id.value, name: f.name.value, department: f.dept.value, role: f.role.value, password: f.pw.value });
+        return api("POST", "/api/admin/users", { user_id: f.id.value, ...profile(), password: f.pw.value });
       },
     });
     if (result && result.temp_password) {
@@ -347,7 +451,8 @@
     const file = h("input", { type: "file", accept: ".csv,.xlsx", "aria-label": "File to import" });
     const body = h("div", { class: "dlg-body" },
       h("p", { class: "muted" }, "Choose an Excel (.xlsx) or CSV file. The first row must contain column titles:"),
-      h("p", {}, h("code", {}, "user_id, name, department"), " and optionally ", h("code", {}, "password")),
+      h("p", {}, h("code", {}, "user_id, name, department"), " and optionally ", h("code", {}, "password"), ", ", h("code", {}, "role"),
+        " (user or manager), ", h("code", {}, "email"), ", ", h("code", {}, "teams"), " (one or more team names separated by ; for example ", h("code", {}, "Flex Cube; Card Management"), "), ", h("code", {}, "security_name")),
       h("p", { class: "hint" }, "Employees without a password get a generated one. You can download the list of passwords right after the import."),
       file);
     let report = null;
@@ -380,7 +485,13 @@
     const d = await api("GET", "/api/branches");
     state.branches = d.branches;
     fillRegions();
-    if (force || changed("branches", { n: d.branches.length, first: d.branches[0], last: d.branches[d.branches.length - 1] })) renderBranches();
+    try {
+      state.ipStatus = await api("GET", "/api/admin/ip-phones");
+    } catch (e) {
+      if (e.network) throw e;
+      state.ipStatus = { error: e.message };
+    }
+    if (force || changed("branches", { n: d.branches.length, first: d.branches[0], last: d.branches[d.branches.length - 1], ip: state.ipStatus })) renderBranches();
     return new Date().toTimeString().slice(0, 8).padStart(19, " ");
   }
 
@@ -397,13 +508,82 @@
       note.textContent = hits.length > 200 ? `Showing the first 200 of ${hits.length} — type to narrow the list.` : `${hits.length} shown`;
     };
     search.addEventListener("input", debounce(draw, 150));
-    panel("branches").replaceChildren(h("div", { class: "card" },
+    panel("branches").replaceChildren(ipPhonesCard(), h("div", { class: "card" },
       h("div", { class: "card-head" }, h("h2", {}, `${state.branches.length} branches in ${regions} regions`), search, h("span", { class: "grow" }),
         h("button", { class: "btn btn-primary", type: "button", onclick: importBranches }, icon("upload"), "Import from Excel")),
       h("p", { class: "hint" }, "Employees choose from this list when the caller is a branch. Importing replaces the whole list; calls already logged keep the branch they were logged with."),
       h("div", { class: "table-wrap" }, h("table", { class: "data" },
         h("thead", {}, h("tr", {}, ["Number", "Branch", "Region", "Type"].map((c) => h("th", {}, c)))), body)), note));
     draw();
+  }
+
+  // ------------------------------------------------------ IP phone directory
+  /** The "IP phones" card of the Branches tab: what the directory holds and the import button. */
+  function ipPhonesCard() {
+    const s = state.ipStatus || {};
+    const stat = (value, label) => h("div", { class: "tile" }, h("strong", {}, fmtNum(value)), h("span", { class: "tile-sub" }, label));
+    let status;
+    if (s.error) status = h("p", { class: "form-error", role: "alert" }, `The IP phone directory could not be read: ${s.error}`);
+    else if (!s.imported) status = h("p", { class: "muted" }, "No IP phone directory has been imported yet. Until then the call form simply shows no location for a phone number.");
+    else {
+      status = h("div", { class: "ip-stats" }, stat(s.numbers, "IP phone numbers"), stat(s.units, "branches / departments"),
+        stat(s.branch_units, "of them are in the branch list"), stat(s.ambiguous, "numbers used by more than one unit"));
+    }
+    const when = s.imported ? h("p", { class: "hint" },
+      `Imported ${s.imported_at ? s.imported_at.slice(0, 16) : ""}${s.imported_by ? ` by ${s.imported_by}` : ""}${s.source_name ? ` from ${s.source_name}` : ""}.`,
+      s.has_previous ? " The directory before it is kept as ip_phones.previous.json until the next import." : "") : null;
+    return h("div", { class: "card", id: "ipPhonesCard" },
+      h("div", { class: "card-head" }, h("h2", {}, "IP phones"), h("span", { class: "grow" }),
+        h("button", { class: "btn btn-primary", type: "button", id: "importIpPhones", onclick: importIpPhones }, icon("upload"), "Import IP phones")),
+      h("p", { class: "hint" }, "While an employee types the IP phone of a call, the form shows the branch or department of that phone and selects the branch when the name is in the branch list. Only the number and the branch / department are kept - the people's names in the file are ignored."),
+      status, when);
+  }
+
+  async function importIpPhones() {
+    const file = h("input", { type: "file", accept: ".xlsx,.csv", "aria-label": "IP phone directory file" });
+    const drop = h("div", { class: "dropzone" }, h("span", {}, "Drop the file here, or choose it:"), file);
+    drop.addEventListener("dragover", (ev) => { ev.preventDefault(); drop.classList.add("over"); });
+    drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+    drop.addEventListener("drop", (ev) => {
+      ev.preventDefault();
+      drop.classList.remove("over");
+      if (ev.dataTransfer && ev.dataTransfer.files.length) file.files = ev.dataTransfer.files;
+    });
+    const busy = h("p", { class: "hint", role: "status", hidden: true }, "Reading the file - a 40,000-row export takes a few seconds.");
+    let report = null;
+    await modal({
+      title: "Import the IP phone directory", submitLabel: "Replace the directory",
+      body: h("div", { class: "dlg-body" },
+        h("p", { class: "muted" }, "Choose the Excel (.xlsx) or CSV export of the IP phones. The first row must have the column titles:"),
+        h("p", {}, h("code", {}, "telephoneNumber"), " (the IP phone), ", h("code", {}, "msExchExtensionAttribute27"), " (branch / department) and ", h("code", {}, "displayName"),
+          " - the last one is ignored and never stored. Phone, branch, department or unit work as titles too."),
+        h("p", { class: "hint" }, `The current directory (${fmtNum((state.ipStatus || {}).numbers || 0)} numbers) will be replaced. For a very large file you can run  python manage.py import-ip-phones PATH  on the server instead.`),
+        drop, busy),
+      onSubmit: async () => {
+        if (!file.files[0]) throw new Error("Choose a file first.");
+        const fd = new FormData();
+        fd.append("file", file.files[0]);
+        busy.hidden = false;
+        try {
+          report = await api("POST", "/api/admin/ip-phones/import", fd);
+        } finally {
+          busy.hidden = true;
+        }
+      },
+    });
+    if (!report) return;
+    const r = report.report, skipped = r.no_number + r.bad_number + r.no_unit;
+    const line = (label, value, hint) => h("li", {}, h("strong", {}, fmtNum(value)), " ", label, hint ? h("span", { class: "hint" }, `  ${hint}`) : null);
+    await modal({
+      title: "IP phone directory imported",
+      body: h("div", { class: "dlg-body", id: "ipImportResult" }, h("ul", { class: "import-result" },
+        line("rows read", r.rows),
+        line("IP phone numbers kept", r.numbers, `${fmtNum(r.units)} branches / departments, ${fmtNum(report.branch_units)} of them in the branch list`),
+        line("numbers used by more than one unit", r.ambiguous, "the most frequent unit is shown first"),
+        line("rows skipped", skipped, `no number ${fmtNum(r.no_number)} · no branch / department ${fmtNum(r.no_unit)} · not a phone number ${fmtNum(r.bad_number)}`))),
+    });
+    toast(`IP phone directory updated: ${fmtNum(r.numbers)} numbers`);
+    refresh(true);
   }
 
   async function importBranches() {
@@ -433,14 +613,28 @@
     const d = e.details || {}, who = (o) => (o && o !== e.actor ? ` (employee ${o})` : "");
     const reason = (k) => reasonLabel(k);
     switch (e.action) {
-      case "record_created": return `IP ${d.ip_phone} · ${reason(d.reason)}` + (d.branch ? ` · ${d.branch}` : "") + (d.note ? ` · “${d.note}”` : "");
+      case "record_created": return `IP ${d.ip_phone}` + (d.ip_unit ? ` (${d.ip_unit})` : "") + ` · ${reason(d.reason)}` + (d.branch ? ` · ${d.branch}${d.branch_auto ? " (from the IP phone)" : ""}` : "") + (d.note ? ` · “${d.note}”` : "");
       case "record_updated": return Object.keys(d.after || {}).map((k) => `${k.replace("_", " ")}: ${k === "reason" ? reason(d.before[k]) : d.before[k] || "—"} → ${k === "reason" ? reason(d.after[k]) : d.after[k] || "—"}`).join(" · ") + who(d.owner);
-      case "record_deleted": return `${d.date} ${hhmm(d.time || "")} · IP ${d.ip_phone} · ${reason(d.reason)}` + (d.branch ? ` · ${d.branch}` : "") + who(d.owner);
-      case "user_created": return `${d.name} (${d.role})`;
-      case "user_updated": return Object.entries(d).map(([k, v]) => `${k}: ${v.from} → ${v.to}`).join(" · ");
+      case "record_deleted": return `${d.date} ${hhmm(d.time || "")} · IP ${d.ip_phone}` + (d.ip_unit ? ` (${d.ip_unit})` : "") + ` · ${reason(d.reason)}` + (d.branch ? ` · ${d.branch}` : "") + who(d.owner);
+      case "user_created": {
+        const teams = Array.isArray(d.teams) ? d.teams : d.team ? [d.team] : [];          // older entries have one `team`
+        return `${d.name} (${d.role})` + (teams.length ? ` · ${teams.length > 1 ? "teams" : "team"} ${teamsText(teams)}` : "") + (d.email ? ` · ${d.email}` : "");
+      }
+      case "ops_assign": return `→ ${d.to}` + (d.note ? ` · “${d.note}”` : "") + (d.subject ? ` · ${d.subject}` : "");
+      case "ops_unassign": case "ops_no_action": case "ops_no_action_undo": case "ops_quality_appeal": return d.subject || "";
+      case "ops_team": return `${d.from || "—"} → ${d.to}` + (d.subject ? ` · ${d.subject}` : "");
+      case "ops_quality": return d.rating + (d.reasons ? ` · ${d.reasons}` : "") + (d.subject ? ` · ${d.subject}` : "");
+      case "ops_quality_decision": return d.decision + (d.subject ? ` · ${d.subject}` : "");
+      case "ops_classification_rule": return `${d.op === "remove" ? "removed" : "added"} “${e.target}” → ${d.team}`;
+      case "ops_run_job": return `job ${e.target}`;
+      case "ops_settings_saved": return `${d.count} setting(s): ${(d.changed || []).slice(0, 6).join(", ")}${(d.changed || []).length > 6 ? "…" : ""}`;
+      case "ops_view_as": return `employee ${e.target}`;
+      case "ops_export": case "ops_report_download": return e.target + (d.rows != null ? ` · ${fmtNum(d.rows)} rows` : "");
+      case "user_updated": return Object.entries(d).map(([k, v]) => `${k}: ${auditValue(v.from)} → ${auditValue(v.to)}`).join(" · ");
       case "export": return `${e.target} · ${d.from} → ${d.to} · ${fmtNum(d.rows)} rows`;
       case "users_imported": return `${d.created} created, ${d.skipped} skipped`;
       case "branches_imported": return `${d.count} branches (was ${d.previous}), ${d.duplicates_merged} duplicates merged`;
+      case "ip_phones_imported": return `${fmtNum(d.numbers)} numbers, ${fmtNum(d.units)} units (was ${fmtNum(d.previous)} numbers), ${fmtNum(d.no_number + d.bad_number + d.no_unit)} rows skipped` + (e.target ? ` · ${e.target}` : "");
       case "login_failed": return d.reason === "disabled" ? "account is disabled" : "";
       default: return "";
     }
@@ -461,7 +655,7 @@
       h("thead", {}, h("tr", {}, ["Time", "User", "Action", "Details", "From"].map((c) => h("th", {}, c)))),
       h("tbody", {}, d.items.map((e) => h("tr", {},
         h("td", { class: "nowrap" }, e.ts), h("td", {}, bidi(e.actor_name || e.actor || "—"), e.actor_name ? h("span", { class: "hint" }, `  ${e.actor}`) : null),
-        h("td", { class: "nowrap" }, AUDIT_LABELS[e.action] || e.action), h("td", { class: "note" }, bidi(auditDetails(e)), e.target && !e.action.startsWith("export") && !e.action.startsWith("record") ? h("span", { class: "hint" }, ` ${e.target}`) : null),
+        h("td", { class: "nowrap" }, AUDIT_LABELS[e.action] || e.action), h("td", { class: "note" }, bidi(auditDetails(e)), e.target && !e.action.startsWith("export") && !e.action.startsWith("record") && !e.action.startsWith("ops_") ? h("span", { class: "hint" }, ` ${e.target}`) : null),
         h("td", { class: "nowrap hint" }, e.ip || "")))))) : h("p", { class: "empty" }, "No log entries match.");
     panel("audit").replaceChildren(h("div", { class: "card" },
       h("div", { class: "card-head" }, h("h2", {}, "Audit log"), h("span", { class: "hint" }, "every sign-in, edit, delete, account change and export"), h("span", { class: "grow" }),

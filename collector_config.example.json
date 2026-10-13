@@ -1,0 +1,22 @@
+{
+  "_help": "Copy this file to collector_config.json (same folder as collector.py) and fill it in with Notepad. Keys starting with _ are comments. Only the collector reads this file - never the web server. Do not e-mail it or put it in git. Anything written here wins over the same setting on the System page (the page shows it as pinned).",
+
+  "sla": {
+    "_username": "The user number you sign in to the portal with.",
+    "username": "",
+    "_password": "Either write it here, or leave it empty and run: python collector.py --set-password sla  (kept in Windows Credential Manager). The environment variable NBE_SSO_PASSWORD wins over both.",
+    "password": ""
+  },
+  "itsm": {
+    "username": "",
+    "_password": "Same idea: write it here, or run: python collector.py --set-password itsm  (the environment variable ITSM_PASS wins over both).",
+    "password": ""
+  },
+  "email": {
+    "_target_archive_name": "The Outlook archive / root folder to scan, e.g. 2026_Part3. Empty = the default mailbox.",
+    "target_archive_name": ""
+  },
+
+  "_data_dir": "Optional. The shared data folder when this PC should not use the one from config.json, e.g. \\\\10.104.46.34\\calllog\\data (backslashes are doubled in JSON). Remove the leading underscore to use it.",
+  "_data_dir_example": "\\\\10.104.46.34\\calllog\\data"
+}

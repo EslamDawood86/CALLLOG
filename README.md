@@ -1,3 +1,73 @@
+# NBE Operations Hub
+
+One application that follows the whole sector from one place: **Calls** (this Call Log), **Email** (team reply analytics),
+**SLA** (security requests waiting at the security user) and **ITSM** (implementation / rollback requests).
+It runs from the shared folder `\\10.104.46.34\calllog`, 24/7, for about 60 people at the same time.
+The design and every data format are in [`docs/HUB-DESIGN.md`](docs/HUB-DESIGN.md).
+
+| who | home page | sees |
+|---|---|---|
+| **Administrator** | `/hub` (Admin dashboard) | everything and the current state: the four modules, a timeline of what happened today, collector health, system health, all teams |
+| **Manager** | `/hub` | the same dashboards for **their team(s)**; assigns e-mails, marks "no action", reviews reply quality; no settings or user management |
+| **Employee** | `/my` (My work) | only what is theirs: their calls, the e-mails assigned to / answered by them, their security requests, and **the e-mails of their own team(s)** (an employee can be in several teams; **Unclassified e-mails are never shown to an employee**). Call logging stays on `/dashboard`. |
+
+Admin and employee pages share one **Team status** strip (counts only: calls today, e-mails pending, security requests, ITSM totals, how fresh the data is).
+
+## How the parts fit
+
+```
+ PC with Outlook + Chrome                shared folder  \\10.104.46.34\calllog                 server PC
+ python collector.py   ──writes──▶   data\ops\snapshots, history, events   ◀──reads──   python run.py --service  ──▶ browsers
+ (e-mail, SLA, ITSM jobs)  ◀─reads──   settings, overrides, "Run now" requests ──writes──▶  (Flask pages and API)
+```
+
+* The **collector** is the only program that touches Outlook, the SSO portal and ITSM. It runs on a Windows PC that stays **logged in**
+  (a locked screen is fine; Outlook automation needs the user session - do not run it as "whether user is logged on or not").
+* The **web app** (`run.py`) never talks to Outlook or the portals. It reads the snapshots, lets people act, and shows collector health.
+* Everything is plain files under `data\ops\` (written atomically under a lock). No database, **no `.bat` / `.vbs` / `.ps1` files anywhere** - everything starts with `python run.py` or `python collector.py`.
+
+## Quick start
+
+1. Copy the program files into `\\10.104.46.34\calllog` and start the web app as described in *Setup* below (`python run.py --share`, or Task Scheduler with `--service`).
+2. On the Outlook PC copy `collector_config.example.json` to `collector_config.json` (same folder as `collector.py`) and fill in the **user names and passwords** of the SSO portal and ITSM and the **Outlook archive name**:
+
+   ```json
+   {
+     "sla":   {"username": "...", "password": "..."},
+     "itsm":  {"username": "...", "password": "..."},
+     "email": {"target_archive_name": "2026_Part3"}
+   }
+   ```
+
+   Anything written here wins over the same setting saved from the web page. Only the collector reads this file (never the web server); it is not part of the ZIP and not in git.
+
+   The SLA and ITSM jobs drive the browser the PC already has (Microsoft **Edge** or Google **Chrome**) over the DevTools protocol — **no Playwright, no Node.js and no browser download, so no internet is needed for them**. The collector finds Edge/Chrome in the usual place automatically; if it is installed somewhere else, add its full path: `"sla": {"browser_executable": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"}` (and the same under `"itsm"`).
+   Prefer not to keep a password in a file? Leave it out and run `python collector.py --set-password sla` (and `itsm`): it goes to Windows Credential Manager.
+3. `python collector.py --check` tells you what is configured and what is missing (it never prints a password).
+4. Bring your old settings over once: `python manage.py import-legacy --email <old e-mail script> --sla <old SLA script> --itsm <old ITSM script>`
+   (reads the old scripts without running them; writes the settings and a ready `collector_config.json`).
+5. `python collector.py --once sla --no-email` tries one job; `python collector.py` runs all jobs in the foreground;
+   `python collector.py --start` runs it in the background, `--install-autostart` starts it at every Windows log-in, `--status` / `--stop` manage it,
+   `--service` is a small supervisor that restarts it if it ever stops.
+6. Sign in as `admin` -> **System**: Collectors (online? last scan, next run, *Run now*), Settings (teams, recipients, schedule, SLA and ITSM options, **Classification**), Logs, Reports, Health.
+
+## The Unclassified e-mails
+
+An e-mail that no team could be assigned to is *Unclassified*. Tune it in **System -> Settings -> Classification** (or from the Unclassified panel on the Email page):
+keyword -> team rules, "sent to this mailbox -> team" rules, a default team for everything else, extra "no reply needed" phrases.
+Precedence: a manual team change > mailbox rule > system words (your keyword rules win over the built-in list) > default team > Unclassified.
+
+## 24/7 operation
+
+* The web app is supervised by Task Scheduler + `--service` (restarts itself, picks up updated files). `GET /healthz` answers without sign-in for your monitoring tool.
+* The collector runs every job as a separate process with a time limit, so a stuck Outlook call or browser can never freeze it; a wrong password pauses that job's scheduled runs
+  instead of hammering the login (protects the account from a lock-out) until the password changes or an administrator presses *Run now*.
+* Scheduled scans follow `general.work_days` / `active_hours` / `holidays` (default Sun-Thu 08:00-17:00 as in the old scripts); outside them the pages say "outside working hours - showing the last scan".
+  Set `active_hours` to empty and all days for round-the-clock scanning.
+* A daily housekeeping step prunes old history, events, reports and debug files. Calls and the audit log are never touched.
+
+---
+
 # NBE Call Log
 
 A small web app that replaces the per-employee Excel sheet *"Incoming Calls Registration Log"*.

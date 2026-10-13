@@ -2,13 +2,12 @@
 /* Employee dashboard: log a call (IP phone + reason), see today's numbers, edit/delete own calls. */
 (function () {
   const { h, $, api, toast, icon, editRecord, deleteRecord, rowActions, statusChip, reasonName, trimHours, drawChart,
-    legend, chartWithToggle, bidi, reasonBars, branchPicker, fmtNum, hhmm, fmtDay, addDays, pct, STATUS_NAMES } = CL;
+    legend, chartWithToggle, bidi, reasonBars, branchPicker, ipLookup, normalizeIp, normAr, fmtNum, hhmm, fmtDay, addDays, pct, STATUS_NAMES } = CL;
 
-  const state = { me: null, reasons: [], branches: [], picker: null, today: "", day: "", data: null, saving: false, dialogOpen: false };
-  const ARABIC_DIGITS = "٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹";
+  const state = { me: null, reasons: [], branches: [], picker: null, lookup: null, today: "", day: "", data: null, saving: false, dialogOpen: false };
 
   const el = {
-    ip: $("#ipInput"), ipHelp: $("#ipHelp"), note: $("#noteInput"), reasons: $("#reasons"), entry: $("#entryCard"),
+    ip: $("#ipInput"), ipHelp: $("#ipHelp"), ipUnit: $("#ipUnit"), note: $("#noteInput"), reasons: $("#reasons"), entry: $("#entryCard"),
     dayInput: $("#dayInput"), search: $("#searchInput"), body: $("#recordsBody"), empty: $("#emptyMsg"),
   };
 
@@ -53,13 +52,14 @@
   function renderRecords(flashId) {
     const { records, date } = state.data;
     const q = el.search.value.trim().toLowerCase();
+    const qn = normAr(q);
     const rows = records.filter((r) => !q || r.ip_phone.includes(q) || (r.note || "").toLowerCase().includes(q)
-      || r.branch.includes(q) || r.branch_name.includes(q));
+      || r.branch.includes(q) || r.branch_name.includes(q) || (r.ip_unit && normAr(r.ip_unit).includes(qn)));
     $("#recordsTitle").textContent = date === state.today ? "Today's calls" : `Calls on ${fmtDay(date)}`;
     el.body.replaceChildren(...rows.map((r) => {
       const tr = h("tr", { class: r.id === flashId ? "flash" : "" },
         h("td", { class: "nowrap" }, hhmm(r.time), h("span", { class: "hint" }, r.time.slice(5))),
-        h("td", { class: "ip" }, r.ip_phone),
+        h("td", { class: "ip" }, r.ip_phone, r.ip_unit ? h("div", { class: "ip-where", dir: "auto", title: r.ip_unit }, r.ip_unit) : null),
         h("td", { class: "branch-cell" }, r.branch
           ? [h("strong", {}, r.branch), bidi(r.branch_name), h("div", { class: "hint" }, r.region)]
           : h("span", { class: "branch-none" }, "—")),
@@ -125,10 +125,6 @@
   }
 
   // -------------------------------------------------------------- actions
-  function normalizeIp(value) {
-    return value.replace(/\s+/g, "").replace(/[٠-٩۰-۹]/g, (c) => String(ARABIC_DIGITS.indexOf(c) % 10));
-  }
-
   function showIpError(msg) {
     el.ipHelp.textContent = msg || "";
     el.ipHelp.hidden = !msg;
@@ -144,25 +140,29 @@
       return;
     }
     showIpError("");
-    const branchProblem = state.picker.problem();
-    $("#branchHelp").textContent = branchProblem;
-    $("#branchHelp").hidden = !branchProblem;
-    if (branchProblem) { state.picker.markInvalid(); state.picker.focus(); return; }
     state.saving = true;
     el.reasons.querySelectorAll("button").forEach((b) => (b.disabled = true));
     try {
-      const { record } = await api("POST", "/api/records", { ip_phone: ip, reason: reasonKey, note: el.note.value, branch: state.picker.value() });
+      await state.lookup.ready();                  // an answer still on its way may fill in the branch: wait for it (1.5 s at most)
+      const branchProblem = state.picker.problem();
+      $("#branchHelp").textContent = branchProblem;
+      $("#branchHelp").hidden = !branchProblem;
+      if (branchProblem) { state.picker.markInvalid(); state.picker.focus(); return; }
+      const { record } = await api("POST", "/api/records", { ip_phone: ip, reason: reasonKey, note: el.note.value,
+        branch: state.picker.value(), ip_unit_auto: state.picker.isAuto() });
       el.ip.value = "";
       el.note.value = "";
       state.picker.clear();
+      state.lookup.reset();
       toast(`Saved · ${record.ip_phone} · ${record.reason_en}`);
       await loadDay(record.id);
+      el.ip.focus();
     } catch (e) {
       toast(e.message, "error");
+      el.ip.focus();
     } finally {
       state.saving = false;
       el.reasons.querySelectorAll("button").forEach((b) => (b.disabled = false));
-      el.ip.focus();
     }
   }
 
@@ -199,6 +199,7 @@
     }
     state.picker = branchPicker(state.branches);
     $("#branchHost").append(state.picker.el);
+    state.lookup = ipLookup({ input: el.ip, host: el.ipUnit, picker: state.picker, branches: state.branches });
     state.today = state.day = state.me.today;
     renderProfile();
     renderReasons();
@@ -212,6 +213,7 @@
     el.ip.addEventListener("keydown", (ev) => {
       if (ev.key === "Enter") {          // Enter moves on to the branch box, so the whole flow works from the keyboard
         ev.preventDefault();
+        state.lookup.flush();            // ask for the unit now instead of waiting for the pause
         state.picker.focus();
       }
     });

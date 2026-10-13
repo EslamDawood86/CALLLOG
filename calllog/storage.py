@@ -4,6 +4,8 @@ Layout inside the data folder::
 
     users.json                     all accounts
     reasons.json                   the list of call reasons (editable in Notepad)
+    branches.json                  the branch list offered in the call form
+    ip_phones.json                 IP phone number -> branch / department name (no personal names; see ip_phones.py)
     records/2026-10-11/230966.json one file per employee per day (list of calls)
     logs/audit-2026-10-11.jsonl    append-only audit log, one JSON object per line
 
@@ -24,9 +26,11 @@ Speed rules (60 people use this at once over a network share):
 """
 import contextlib
 import json
+import logging
 import os
 import re
 import secrets
+import shutil
 import threading
 import time
 import uuid
@@ -36,7 +40,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from pathlib import Path
 
-from . import branches as branch_list
+from . import branches as branch_list, ip_phones
 
 try:  # Windows
     import msvcrt
@@ -153,13 +157,7 @@ class _WriteLock:
             fcntl.flock(fd, fcntl.LOCK_UN)
 
 
-def _atomic_write_json(path, data):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=1)
-        f.flush()
-        os.fsync(f.fileno())
+def _swap_in(tmp, path):
     for attempt in range(8):
         try:
             os.replace(tmp, path)
@@ -169,6 +167,27 @@ def _atomic_write_json(path, data):
     os.replace(tmp, path)
 
 
+def _atomic_write_json(path, data, compact=False):
+    """Write ``data`` next to ``path`` and swap it in. ``compact``: no indentation (big machine-made files)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        if compact:
+            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+        else:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    _swap_in(tmp, path)
+
+
+def _atomic_copy(src, dst):
+    """Copy a file so that ``dst`` is always either the old or the new complete file."""
+    tmp = dst.with_name(f".{dst.name}.{uuid.uuid4().hex[:8]}.tmp")
+    shutil.copyfile(src, tmp)
+    _swap_in(tmp, dst)
+
+
 class Store:
     CACHE_LIMIT = 2500          # parsed day-files kept in memory
     TTL_TODAY = 3.0             # seconds before today's files are re-checked on the share
@@ -176,6 +195,7 @@ class Store:
     TTL_SMALL = 2.0             # users.json
     TTL_LISTS = 10.0            # reasons.json, branches.json
     SHARE_TTL = 2.0             # how long a computed admin result is shared
+    STALE_FACTOR = 10           # ... and how long (x SHARE_TTL) it may still be served while another request re-computes it
     ROLLUP_TTL_OLD = 300.0      # a past day's summary is re-built at most every 5 minutes (edits here: at once)
     IO_THREADS = 16             # parallel reads when a lot of files are needed
 
@@ -184,6 +204,8 @@ class Store:
         self.users_path = self.root / "users.json"
         self.reasons_path = self.root / "reasons.json"
         self.branches_path = self.root / "branches.json"
+        self.ip_phones_path = self.root / "ip_phones.json"
+        self.ip_phones_previous_path = self.root / "ip_phones.previous.json"
         self.records_dir = self.root / "records"
         self.logs_dir = self.root / "logs"
         self.locks_dir = self.root / ".locks"
@@ -194,6 +216,8 @@ class Store:
         self._range = OrderedDict()        # (from, to, uid) -> (computed_at, records)
         self._memo = OrderedDict()         # key -> (computed_at, value)
         self._rollups = OrderedDict()      # (day, version) -> (computed_at, summary)
+        self._ip_directory = None          # (parsed file, branch list, IpDirectory): rebuilt when either is reloaded
+        self._ip_broken_until = 0.0        # a damaged ip_phones.json is not re-read on every request
         self._pool = ThreadPoolExecutor(max_workers=self.IO_THREADS, thread_name_prefix="calllog-io")
         self._cache_lock = threading.Lock()
         self._compute_lock = threading.RLock()   # re-entrant: one shared result may be built from another
@@ -300,12 +324,19 @@ class Store:
                     del self._rollups[k]
 
     def memo(self, key, compute, ttl=None):
-        """Compute ``compute()`` once and share the result for a moment (heavy admin aggregates)."""
+        """Compute ``compute()`` once and share the result for a moment (heavy admin aggregates).
+
+        While somebody else is already re-computing an expired result, a request that holds the previous one (younger
+        than ``STALE_FACTOR`` x the sharing time) uses it instead of waiting - nobody queues behind a slow share."""
         ttl = self.SHARE_TTL if ttl is None else ttl
         with self._cache_lock:
             hit = self._memo.get(key)
             if hit and time.monotonic() - hit[0] < ttl:
                 return hit[1]
+        if hit and time.monotonic() - hit[0] < ttl * self.STALE_FACTOR:
+            if not self._compute_lock.acquire(blocking=False):
+                return hit[1]
+            self._compute_lock.release()
         with self._compute_lock:      # everybody else waits for the first one, then reuses its result
             with self._cache_lock:
                 hit = self._memo.get(key)
@@ -337,6 +368,40 @@ class Store:
     def replace_branches(self, entries):
         with self._lock("branches")():
             self._write_json(self.branches_path, entries)
+
+    # ---------------------------------------------------------- IP phone directory
+    def ip_directory(self, strict=False):
+        """The IP phone directory (number -> branch / department) matched against the branch list.
+
+        The file is parsed once and re-checked on the share like the other lists (every ``TTL_LISTS`` seconds), so a look-up
+        is a dictionary read. Never raises unless ``strict``: a missing or damaged file means "no directory", because
+        saving a call must not depend on it."""
+        data = None
+        if strict or time.monotonic() >= self._ip_broken_until:
+            try:
+                data = self._read_json(self.ip_phones_path, None, ttl=self.TTL_LISTS)
+            except (StorageError, OSError) as exc:
+                if strict:
+                    raise
+                self._ip_broken_until = time.monotonic() + self.TTL_LISTS
+                logging.getLogger(__name__).warning("IP phone directory ignored: %s", exc)
+        branches = self.branches()
+        cached = self._ip_directory
+        if cached is None or cached[0] is not data or cached[1] is not branches:
+            cached = self._ip_directory = (data, branches, ip_phones.IpDirectory(data, branches))
+        return cached[2]
+
+    def replace_ip_phones(self, data):
+        """Swap in a directory that is already parsed (nothing slow happens under the lock). The file it replaces stays
+        as ``ip_phones.previous.json`` until the next import."""
+        with self._lock("ip_phones")():
+            if self.ip_phones_path.is_file():
+                _atomic_copy(self.ip_phones_path, self.ip_phones_previous_path)
+            _atomic_write_json(self.ip_phones_path, data, compact=True)
+            with self._cache_lock:
+                self._cache.pop(str(self.ip_phones_path), None)
+                self._ip_directory = None
+                self._ip_broken_until = 0.0
 
     # ------------------------------------------------------------------ users
     def users(self):
