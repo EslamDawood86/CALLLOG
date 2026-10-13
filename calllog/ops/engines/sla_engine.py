@@ -307,13 +307,40 @@ def install_chromium(log):
     return proc.returncode
 
 
+# Where Edge / Chrome normally live on a Windows PC. Used directly (executable_path) so the collector works with the
+# browser the bank already has, WITHOUT Playwright having to download its own Chromium (no internet needed).
+WINDOWS_BROWSERS = (
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+    os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe"),
+)
+
+
+def installed_browsers():
+    """Full paths of a Chrome / Edge that is actually installed on this PC (Windows standard locations), newest-looking first."""
+    seen, out = set(), []
+    for path in WINDOWS_BROWSERS:
+        try:
+            if path and path.lower() not in seen and os.path.isfile(path):
+                seen.add(path.lower())
+                out.append(path)
+        except OSError:
+            pass
+    return out
+
+
 def launch_browser(pw, cfg, headed=False, log=print, install=None):
-    """Start the configured browser, else Chrome, else Edge, else Playwright's own Chromium (downloaded once, only when
-    nothing else is found). Returns (browser, name)."""
+    """Start the configured browser, else Chrome/Edge installed on the PC (by path, no download), else the ``chrome``/``msedge``
+    channels, and only if nothing is found Playwright's own Chromium (downloaded once, needs internet). Returns (browser, name)."""
     opts = {"headless": not headed}
     attempts = []
     if cfg.get("browser_executable"):
         attempts.append((cfg["browser_executable"], {"executable_path": cfg["browser_executable"]}))
+    for path in installed_browsers():                       # the Edge/Chrome the bank already has - works offline
+        attempts.append((os.path.basename(path), {"executable_path": path}))
     for channel in dict.fromkeys([cfg.get("browser_channel"), "chrome", "msedge"]):
         if channel:
             attempts.append((channel, {"channel": channel}))
@@ -341,7 +368,11 @@ def launch_browser(pw, cfg, headed=False, log=print, install=None):
             return pw.chromium.launch(**opts), "playwright chromium"
         except Exception as e:
             errors.append(f"playwright chromium (after download): {first_line(e)}")
-    raise PortalError("Could not start a browser (Chrome / Edge). " + " | ".join(errors))
+    hint = ("Could not start a browser. If this PC has Microsoft Edge or Google Chrome, set sla.browser_executable in "
+            "collector_config.json to its full path, e.g. "
+            r'"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"'
+            " - then no internet is needed. ")
+    raise PortalError(hint + "Tried: " + " | ".join(errors))
 
 
 def wait_for_app_page(context, fragment, timeout_s):
